@@ -10559,11 +10559,24 @@ int music_entry(void *a0, void *a1) {
              * clear of the edge zone are entirely unaffected. */
             int edge_zone_ambiguous = touch_x < EDGE_ZONE && !edge_active &&
                                        abs(live_x - touch_x) >= abs(live_y - touch_y);
+            /* R80 follow-up: reported live -- swiping up from the bottom
+             * edge scrolled the list AND navigated home, both at once.
+             * home_edge_active only excludes list_dragging from the tick it
+             * latches on (a few px of dominant vertical travel); before
+             * that this is the exact same ambiguous-window gap the back
+             * gesture's own edge_zone_ambiguous already exists to close,
+             * just rotated -- a touch that started in HOME_EDGE_ZONE with
+             * vertical travel not yet behind horizontal could still become
+             * a home swipe, so list_dragging holds off rather than reading
+             * a human hand's incidental sideways wobble as a real scroll. */
+            int home_edge_zone_ambiguous = touch_y > FB_H - HOME_EDGE_ZONE && !home_edge_active &&
+                                            abs(live_y - touch_y) >= abs(live_x - touch_x);
             int was = list_dragging;
             list_dragging = touch_down && scrollable && !index_active &&
                             !scrub_active && !qs_open && !queue_drag_active && !queue_swipe_active &&
                             !playlist_drag_active && !playlist_swipe_active && !pod_swipe_active &&
-                            touch_y >= drag_top && !edge_active && !edge_zone_ambiguous;
+                            touch_y >= drag_top && !edge_active && !edge_zone_ambiguous &&
+                            !home_edge_active && !home_edge_zone_ambiguous;
             if (list_dragging && !was) {
                 /* A raw drag on the list itself is free browsing, not bound
                  * by wherever the index last landed — otherwise a stale
