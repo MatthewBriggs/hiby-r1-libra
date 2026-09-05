@@ -4076,9 +4076,9 @@ static void draw_mini(uint16_t *fb) {
      * Radio has no meaningful duration, so it draws nothing here rather
      * than a bar that can never move. Drawn *after* the art thumbnail
      * above (BG55's flush-bottom art reaches this same row on its left
-     * side), so it's never the art that ends up covering the bar -- 2px
-     * thick, not the original 1, so it survives sitting this close to the
-     * bezel. */
+     * side), so it's never the art that ends up covering the bar -- 6px
+     * thick (R79: 3x the original bump to 2px), so it survives sitting
+     * this close to the bezel and reads at a glance. */
     if (!radio_mode && cur_track >= 0 && cur_track < queue_n) {
         lib_track_t *t = &queue[cur_track];
         int pos, dur;
@@ -4113,7 +4113,7 @@ static void draw_mini(uint16_t *fb) {
         if (dur > 0) {
             int w = FB_W * pos / dur;
             if (w > FB_W) w = FB_W;
-            if (w > 0) fill_rect(fb, 0, FB_H - 2, w, 2, COL_ACCENT);
+            if (w > 0) fill_rect(fb, 0, FB_H - 6, w, 6, COL_ACCENT);
         }
     }
 
