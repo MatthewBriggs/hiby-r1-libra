@@ -1992,7 +1992,17 @@ static void reset_scroll(void) {
     row_n = 0;
     index_cache_reset();
 }
-static lib_track_t tracks[PAGE_MAX * 8];
+/* BG111: was PAGE_MAX*8 (256) -- a real 515-chapter audiobook (one .m4b,
+ * embedded chapter track) hit this exactly, silently dropping everything
+ * past chapter 256 since ab_load_book()'s own copy loop stops at
+ * sizeof(tracks)/sizeof(tracks[0]) same as any other overflow guard would.
+ * Raised alongside AB_MAX_CHAPTERS (audiobook.h) to the same 1024 headroom;
+ * queue[] and the two playlist paths[] scratch buffers below have to move
+ * in lockstep (queue[] is memcpy()'d straight from tracks[] at whatever
+ * track_n currently is, and both paths[] buffers read back into tracks[]
+ * the same way -- any one of the four smaller than the others reintroduces
+ * a silent truncation at whatever the smallest one's capacity is). */
+static lib_track_t tracks[PAGE_MAX * 32];
 static int track_n;
 
 /* What is playing has to survive browsing away from it: open another album and
@@ -2496,7 +2506,7 @@ static int         mseb_on;
  * sliders rather than eq_dragging's fixed handful of named ones. */
 static int         mseb_dragging = -1;
 
-static lib_track_t queue[PAGE_MAX * 8];
+static lib_track_t queue[PAGE_MAX * 32];   /* BG111: kept in lockstep with tracks[] -- see its own comment */
 static int  queue_n;
 static char q_artist[LIB_NAME_LEN];
 static char q_album[LIB_NAME_LEN];
@@ -2630,7 +2640,7 @@ static int cur_playlist_path(char *out, size_t outsz) {
 static void playlist_persist(void) {
     char path[LIB_PATH_LEN];
     if (!cur_playlist_path(path, sizeof(path))) return;
-    static char paths[PAGE_MAX * 8][LIB_PATH_LEN];
+    static char paths[PAGE_MAX * 32][LIB_PATH_LEN];   /* BG111: kept in lockstep with tracks[] */
     int n = track_n < (int)(sizeof(paths) / sizeof(paths[0])) ?
             track_n : (int)(sizeof(paths) / sizeof(paths[0]));
     for (int i = 0; i < n; i++)
@@ -9777,7 +9787,7 @@ int music_entry(void *a0, void *a1) {
                     kb_open("Playlist name", KB_PURPOSE_NEW_PLAYLIST_NAME, "");
                 } else if (screen == SC_PLAYLISTS && smooth_row - 1 < playlist_n) {
                     int pi = smooth_row - 1;   /* R71: row 0 is "New Playlist", not playlists[0] */
-                    static char paths[PAGE_MAX * 8][LIB_PATH_LEN];
+                    static char paths[PAGE_MAX * 32][LIB_PATH_LEN];   /* BG111: kept in lockstep with tracks[] */
                     int want = (int)(sizeof(paths) / sizeof(paths[0]));
                     int got = pl_read(playlists[pi].path, paths, want);
                     track_n = 0;

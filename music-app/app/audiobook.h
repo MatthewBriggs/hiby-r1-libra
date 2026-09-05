@@ -16,7 +16,14 @@
 #define AB_PATH_LEN     LIB_PATH_LEN
 #define AB_MAX_BOOKS    256
 #define AB_MAX_FILES    64
-#define AB_MAX_CHAPTERS 256
+/* BG111: a real 515-chapter audiobook hit this exactly -- was 256, silently
+ * truncating (mp4_chapters() respects `max`, so nothing overflowed, the
+ * book just stopped existing past chapter 256 as far as this app could
+ * see). Both this and g_embedded/chap[] below are file-scope statics, not
+ * stack (see g_embedded's own comment), so there is no stack-overflow
+ * concern in raising it -- just BSS size, and a few hundred KB of that is
+ * nothing on this device. */
+#define AB_MAX_CHAPTERS 1024
 
 /* One folder under /Audiobooks that directly contains audio files. Nested
  * layouts (Author/Book) work: a folder with no audio files of its own is
