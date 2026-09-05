@@ -7241,6 +7241,12 @@ static int      power_release_outcome;
  * screen while poweroff's own shutdown sequence (not instant) runs its
  * course underneath it. */
 static int      power_shutdown_kind;   /* 0 = none, 1 = graceful, 2 = forced */
+/* BG112: a clean copy of the screen from the instant before the countdown
+ * overlay first appears -- resume_save() (called from the graceful path,
+ * once the overlay has been on screen for anywhere up to two seconds) must
+ * not capture the overlay itself. Same size as one framebuffer page; taken
+ * once per hold, at the same 0->1 transition that first shows the overlay. */
+static uint16_t power_pre_hold_fb[FB_W * FB_H];
 
 /* Same visual language as draw_sheet()'s own modal: dim everything behind,
  * a solid panel in front -- centered here rather than bottom-anchored,
@@ -9973,6 +9979,13 @@ int music_entry(void *a0, void *a1) {
         if (power_key_down && !power_hard_fired) {
             long elapsed_ms = (long)((us_now() - power_key_down_us) / 1000);
             if (!power_hold_ui_shown && elapsed_ms >= POWER_HOLD_UI_MS) {
+                /* BG112: captured here, the one moment the currently-visible
+                 * page is guaranteed still clean -- this tick's own draw_ui()
+                 * call (below, later in the loop) is what first paints the
+                 * overlay, and dirty is only being set to 1 a few lines down
+                 * from here, for that same not-yet-run call. */
+                memcpy(power_pre_hold_fb, base + (size_t)(page ^ 1) * page_px,
+                       page_px * sizeof(uint16_t));
                 power_hold_ui_shown = 1;
                 power_key_pending_lock = 0;   /* becoming a hold, not a tap -- the deferred lock never fires */
                 /* button_locked's whole point is that a stray pocket press
@@ -10001,12 +10014,14 @@ int music_entry(void *a0, void *a1) {
             mlog("[music] power held -- graceful shutdown, saving first\n");
             ab_save_current_pos();
             pod_save_current_pos();
-            /* Same "either page holds the last drawn frame" reasoning as
-             * the auto-shutdown path's own identical call -- nothing has
-             * been drawn since dirty last cleared, and the mirror below the
-             * main draw block keeps both pages identical whenever a drag
-             * isn't in progress. */
-            resume_save(base + (size_t)(page ^ 1) * page_px);
+            /* BG112: NOT "either page holds the last drawn frame" the way
+             * the auto-shutdown path's own identical-looking call can rely
+             * on -- the countdown overlay has been the last thing drawn for
+             * up to two seconds by the time release gets here, on both
+             * pages (the per-frame mirror below keeps them identical). The
+             * clean copy taken the instant before the overlay first
+             * appeared is what a resume should actually show. */
+            resume_save(power_pre_hold_fb);
             power_shutdown_kind = 1;
             dirty = 1;
             if (system("/sbin/poweroff") == -1) { }
