@@ -4478,7 +4478,7 @@ static void draw_screen(uint16_t *fb) {
         fill_rect(fb, 0, 0, FB_W, CONTENT_Y, COL_HEADER);
     }
 
-    const char *title = "Main Menu";
+    const char *title = "Home";   /* R80: renamed from "Main Menu" */
     /* R?? follow-up: Main Menu had no "back" to offer even in the hooked
      * build (go_back() here just hands control to hiby_player's launcher,
      * which the edge swipe already does identically), and in standalone it
@@ -6265,15 +6265,30 @@ static void draw_screen(uint16_t *fb) {
 #define FAST_DRAG_MIN 30
 
 /* 1 = tap, 2 = vertical drag (*oy carries the distance), 3 = swipe in from the
- * left edge (back), 4 = press and hold. The edge test is on where the finger went down,
- * so a horizontal drag started mid-screen is not mistaken for it. */
+ * left edge (back), 4 = press and hold (handled entirely outside this
+ * function, via touch_down/live_x/live_y and hold_fired -- not actually
+ * returned from here, but grouped into this list since it's a gesture of
+ * the same kind), 5 = swipe up from the bottom edge (R80: home, always).
+ * The edge test is on where the finger went down, so a horizontal or
+ * vertical drag started mid-screen is not mistaken for either edge
+ * gesture. */
 #define EDGE_ZONE  100
 #define EDGE_TRAVEL 60
 #define HOLD_MS     550
+/* R80: deliberately much narrower than EDGE_ZONE -- a normal scroll to the
+ * end of a list with nothing playing (mini_visible() false, so a list can
+ * genuinely reach the very bottom row) is also an upward drag, and could
+ * start anywhere the last row happens to sit. Narrow enough that only a
+ * swipe starting right at the physical bezel reaches it, the same
+ * distinction a phone's own system home-gesture strip relies on. */
+#define HOME_EDGE_ZONE   40
+#define HOME_EDGE_TRAVEL 60
 
 /* Live state for the back gesture, so the UI can show it happening rather than
  * only reacting once the finger is lifted. */
 static int edge_active, edge_travel, edge_y;
+/* Same, for the bottom-edge home swipe. */
+static int home_edge_active, home_edge_travel, home_edge_x;
 
 /* Live state for the press-and-hold. Timing the press from when the *release*
  * is read does not work: both can arrive in the same polling pass and the hold
@@ -6375,6 +6390,7 @@ static int read_gesture(int fd, int *ox, int *oy) {
             if (ev.value == 1) {
                 down_x = x; down_y = y; moved = 0; have_down = 1;
                 edge_active = 0; edge_travel = 0;
+                home_edge_active = 0; home_edge_travel = 0;
                 touch_down = 1; touch_x = x; touch_y = y;
                 touch_moved = 0; hold_fired = 0;
                 skip_hold_dir = 0;   /* R59: nothing armed yet this touch */
@@ -6383,6 +6399,7 @@ static int read_gesture(int fd, int *ox, int *oy) {
             else if (have_down) {
                 have_down = 0;
                 edge_active = 0;
+                home_edge_active = 0;
                 touch_down = 0;
                 int dx = x - down_x, dy = y - down_y;
                 /* Not while scrubbing, and not with quick settings open. The
@@ -6399,6 +6416,14 @@ static int read_gesture(int fd, int *ox, int *oy) {
                 if (!scrub_active && !qs_open && !eq_dragging && !title_dragging && down_x >= 0 && down_x < EDGE_ZONE &&
                     dx > EDGE_TRAVEL && dx > abs(dy)) {
                     out = 3;
+                /* R80: same exclusions as the back gesture, for the same
+                 * reasons -- the scrub bar and every slider that starts at
+                 * y near the bottom of their own screens would otherwise be
+                 * indistinguishable from a swipe starting at the bezel. */
+                } else if (!scrub_active && !qs_open && !eq_dragging && !title_dragging &&
+                           down_y >= 0 && down_y > FB_H - HOME_EDGE_ZONE &&
+                           (down_y - y) > HOME_EDGE_TRAVEL && (down_y - y) > abs(dx)) {
+                    out = 5;
                 } else if (moved) {
                     out = 2; *oy = dy;
                 } else if (hold_fired) {
@@ -6421,6 +6446,17 @@ static int read_gesture(int fd, int *ox, int *oy) {
                 edge_active = 1;
                 edge_travel = edx;
                 edge_y = y;
+            }
+        }
+        /* R80: same live-preview reasoning as the back gesture just above,
+         * for the bottom-edge home swipe. */
+        if (!scrub_active && !qs_open && !eq_dragging && !title_dragging &&
+            have_down && down_y >= 0 && down_y > FB_H - HOME_EDGE_ZONE) {
+            int up = down_y - y;
+            if (up > 4 && up > abs(x - down_x)) {
+                home_edge_active = 1;
+                home_edge_travel = up;
+                home_edge_x = x;
             }
         }
     }
@@ -6876,6 +6912,29 @@ static void draw_back_hint(uint16_t *fb) {
     }
 }
 
+/* R80: same idea as draw_back_hint(), rotated -- a sliver at the bottom edge
+ * that grows and warms as the finger travels up, centred on where it went
+ * down rather than following it live (HINT_H is wide enough that chasing
+ * the finger reads as jittery for a mostly-vertical swipe; the back hint
+ * gets away with following because its own axis is the travel axis). */
+static void draw_home_hint(uint16_t *fb) {
+    int t = home_edge_travel * 256 / HOME_EDGE_TRAVEL;
+    if (t > 256) t = 256;
+    int h = HINT_MAX_W * t / 256;
+    if (h < 2) h = 2;
+
+    int left = home_edge_x - HINT_H / 2;
+    if (left < 0) left = 0;
+    if (left + HINT_H > FB_W) left = FB_W - HINT_H;
+
+    uint16_t c = mix565(COL_LINE, COL_ACCENT, t * t / 256);
+    for (int i = 0; i < HINT_H; i++) {
+        int d = i < HINT_H / 2 ? i : HINT_H - 1 - i;
+        int hh = d < 24 ? h * d / 24 : h;
+        if (hh > 0) fill_rect(fb, left + i, FB_H - hh, 1, hh, c);
+    }
+}
+
 #define SHEET_HEAD 46
 
 static int sheet_rows(void) {
@@ -7323,6 +7382,7 @@ static void draw_ui(uint16_t *fb) {
     else if (vol_ticks > 0) draw_volume(fb);
     else if (screen == SC_PLAYING && seek_toast_ticks > 0) draw_seek_toast(fb);
     if (edge_active) draw_back_hint(fb);
+    if (home_edge_active) draw_home_hint(fb);
     if (power_hold_ui_shown) draw_power_hold(fb);   /* R77: on top of everything else */
 
     uint64_t dt = us_now() - t0;
@@ -8918,6 +8978,16 @@ int music_entry(void *a0, void *a1) {
              * notes first when they're open, rather than leaving the player
              * under them -- see its own comment. */
             if (!go_back()) running = 0;
+            dirty = 1; idle = 0;
+        } else if (g == 5) {
+            /* R80: swipe up from the bottom edge, always home -- a direct
+             * jump, not go_back() repeated until it happens to land on
+             * SC_MENU. Playback, whatever's playing, is untouched (the mini
+             * player is still right there to get back to it); only the
+             * screen and whatever modal happened to be open change. */
+            sheet_open = 0;
+            qs_open = 0;
+            screen = SC_MENU; reset_scroll();
             dirty = 1; idle = 0;
         } else if (index_visible() && touch_x >= FB_W - INDEX_TOUCH_W &&
                    touch_y >= CONTENT_Y && touch_y < index_bottom()) {
@@ -10856,6 +10926,11 @@ int music_entry(void *a0, void *a1) {
             static int hint_was;
             if (edge_active || hint_was) dirty = 1;
             hint_was = edge_active;
+        }
+        {   /* R80: same, for the home-swipe hint */
+            static int home_hint_was;
+            if (home_edge_active || home_hint_was) dirty = 1;
+            home_hint_was = home_edge_active;
         }
         {
             int sec = audio_is_active() ? audio_pos_ms() / 1000 : -1;
