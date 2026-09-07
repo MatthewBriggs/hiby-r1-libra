@@ -55,8 +55,16 @@ class Iso:
         cur = self.root
         for part in [p for p in path.strip("/").split("/") if p]:
             kids = self.listdir(cur)
-            match = next((k for k in kids
-                          if k["name"].split(";")[0].upper() == part.upper()), None)
+            # Match the version suffix exactly when the caller supplied one.
+            # Two chunks can share an 8.3 base name and be distinguished only
+            # by ;1 / ;2; matching on the base alone always returned the first
+            # record, so the second chunk was unreachable.
+            if ";" in part:
+                match = next((k for k in kids
+                              if k["name"].upper() == part.upper()), None)
+            else:
+                match = next((k for k in kids
+                              if k["name"].split(";")[0].upper() == part.upper()), None)
             if match is None:
                 raise FileNotFoundError(f"{path} (at {part})")
             cur = match
@@ -73,7 +81,12 @@ def main():
     print("top level:", [k["name"] for k in root_kids])
 
     ota = iso.find("/OTA_V0")
-    names = [k["name"].split(";")[0] for k in iso.listdir(ota)]
+    # Keep the ISO version suffix (;1, ;2, ...). patch_firmware bumps it when
+    # two chunks collide on an 8.3 name -- only 3 hex chars of suffix, ~70
+    # chunks, so collisions are routine rather than rare. Stripping the version
+    # collapsed both records onto one name, so the second chunk was never read
+    # and its digest went missing from the index.
+    names = [k["name"] for k in iso.listdir(ota)]
     print(f"OTA_V0 holds {len(names)} entries")
 
     manifest = iso.read("/OTA_V0/OTA_UPDA.IN").decode("latin-1")
@@ -85,7 +98,7 @@ def main():
     # content, not by filename (the names encode a verification chain instead).
     chunks = {}
     for n in names:
-        if n.startswith("ROOTFS_S.") or n.startswith("XIMAGE_0."):
+        if n.split(";")[0].startswith(("ROOTFS_S.", "XIMAGE_0.")):
             d = iso.read(f"/OTA_V0/{n}")
             chunks[hashlib.md5(d).hexdigest()] = d
     print(f"indexed {len(chunks)} chunks")

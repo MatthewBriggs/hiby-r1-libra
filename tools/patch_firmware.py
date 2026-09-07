@@ -192,7 +192,7 @@ def patch_bt_init(text):
 # The rfkill wait is also what makes backgrounding cywdhd safe: with
 # defer_wifi_module in play, rfkill0 may not exist yet when this script runs.
 
-BT_WAIT_HELPER = '# bt_wait <max_seconds> "<shell test>" -- poll every 50ms until true.\n# Replaces the fixed sleeps this script used to use; see patch_firmware.py.\nbt_wait() {\n    _n=$(( $1 * 20 )); _c="$2"; _i=0\n    while [ "$_i" -lt "$_n" ]; do\n        eval "$_c" >/dev/null 2>&1 && return 0\n        usleep 50000 2>/dev/null || sleep 1\n        _i=$(( _i + 1 ))\n    done\n    return 1\n}\n\nrm /var/run/messagebus.pid -rf'
+BT_WAIT_HELPER = '# bt_wait <max_seconds> "<shell test>" -- poll every 50ms until true.\n# 50ms, NOT tighter. Tried 10ms on the theory that the granularity was ~0.2s\n# of free rounding; it is not free. Process spawn costs 4.3ms on this device\n# and most of these conditions spawn -- hciconfig|grep is two spawns, so a\n# 10ms tick is 8.6ms of work, ~86% of a single core, precisely while\n# brcm_patchram_plus is servicing 746 UART reads. Measured 1 boot in 7 where\n# hci0 never appeared and bt_init limped to 47s. At 50ms the same poll is 17%.\n# Replaces the fixed sleeps this script used to use; see patch_firmware.py.\nbt_wait() {\n    _n=$(( $1 * 20 )); _c="$2"; _i=0\n    while [ "$_i" -lt "$_n" ]; do\n        eval "$_c" >/dev/null 2>&1 && return 0\n        usleep 50000 2>/dev/null || sleep 1\n        _i=$(( _i + 1 ))\n    done\n    return 1\n}\n\nrm /var/run/messagebus.pid -rf'
 
 # (anchor, replacement, description) -- each must match exactly once.
 BT_TIMING_EDITS = (
@@ -231,7 +231,7 @@ BT_TIMING_EDITS = (
      "bt-agent (-2s)"),
 
     ("# add hibylink serial port\nsleep 1",
-     "# add hibylink serial port\nbt_wait 5 'bt-adapter --list'",
+     "# add hibylink serial port\n# was: bt_wait 5 'bt-adapter --list' -- that spawns bt-adapter (~0.17s\n# measured); the same readiness question costs ~0.03s over dbus.\nbt_wait 5 'dbus-send --system --print-reply --dest=org.bluez / org.freedesktop.DBus.Peer.Ping'",
      "hibylink SP (-1s)"),
 )
 
@@ -1319,6 +1319,367 @@ echo "$(cat /proc/uptime | cut -d\" \" -f1) BT_REG_ON=$(cat /sys/class/gpio/gpio
     return True
 
 
+
+def source_module_scripts(root):
+    """Source the per-module scripts instead of spawning a shell for each.
+
+    driver_default_init_script.sh runs "sh foo.sh" 28 times; each foo.sh then
+    execs insmod. That is 56 process spawns, and spawn costs 4.3ms on this
+    device (measured: 28 spawns = 0.120s). Sourcing runs them in the current
+    shell, so the wrapper spawn disappears -- measured 0.120s -> 0.010s for 28,
+    about 110ms. The insmod exec itself remains; only built-in modules would
+    remove that, and these are closed blobs with no source.
+
+    Safe here because none of the 28 scripts contains "exit" or uses "$0" --
+    checked on device. They are also already run in sequence, so the shared
+    shell state sourcing introduces changes nothing about ordering.
+    """
+    path = os.path.join(root, MODULE_INIT_SCRIPT)
+    if not os.path.exists(path):
+        return 0
+    with open(path) as fh:
+        lines = fh.read().splitlines()
+    n, out = 0, []
+    for l in lines:
+        st = l.strip()
+        if st.startswith("sh ") and st.endswith(".sh"):
+            out.append(l.replace("sh ", ". ./", 1)); n += 1
+        elif st.startswith("sh ") and st.endswith(".sh &"):
+            out.append(l)          # backgrounded: must stay a subshell
+        else:
+            out.append(l)
+    if n:
+        with open(path, "w") as fh:
+            fh.write("\n".join(out) + "\n")
+    return n
+
+
+
+BT_POWER_OFF_LINE = 'bt-adapter --set "Powered" "Off"\n'
+
+BT_KEEP_POWERED = """# Stock ends by switching the radio off, on the assumption Bluetooth should
+# start disabled. But library_standalone restores the user's saved state
+# moments later (music_hook.c's restore_conf -> st_bt_set), so with
+# bt_enabled=1 the radio is powered down and straight back up again. Measured
+# on hardware: adapter UP at 6.88s, DOWN, UP again at 8.96s -- 2.1s of
+# Bluetooth being taken away and given back on every boot.
+#
+# st_bt_set() is only called when the saved state differs from the live one
+# ("bt_saved != st_bt_on()"), so leaving the adapter powered here means the
+# app does nothing and the whole round trip disappears. Discoverable is set
+# because that is the other half of what bt_enable would have done.
+#
+# music.conf lives on /usr/data (internal NAND), so it is readable at this
+# point in boot -- S11amount_ubifs has already mounted it.
+if grep -qE "^[[:space:]]*bt_enabled[[:space:]]*=[[:space:]]*1" /usr/data/music.conf 2>/dev/null; then
+    bt-adapter --set "Discoverable" "On"
+else
+    bt-adapter --set "Powered" "Off"
+fi
+"""
+
+
+def bt_keep_powered_when_enabled(root):
+    """Don't power the radio down if the app is just going to power it up.
+
+    Returns True if bt_init was changed.
+    """
+    path = os.path.join(root, BT_INIT)
+    if not os.path.exists(path):
+        return False
+    with open(path) as fh:
+        t = fh.read()
+    if "bt_enabled" in t:
+        return False                     # already done
+    if t.count(BT_POWER_OFF_LINE) != 1:
+        return False
+    t = t.replace(BT_POWER_OFF_LINE, BT_KEEP_POWERED, 1)
+    with open(path, "w") as fh:
+        fh.write(t)
+    return True
+
+
+
+# brcm_patchram_plus has no read timeout. When the chip stops responding
+# mid-handshake it blocks in read(/dev/ttyS0, buf, 3) forever, waiting for a
+# 3-byte HCI event header that never arrives -- caught live on 2026-09-06:
+#
+#   patchram pid=881 state=S wchan=wait_woken
+#   syscall args: fd=0x4 (=/dev/ttyS0) buf=0x412980 count=0x3
+#
+# hci0 is only created once that handshake completes, so Bluetooth never
+# appears at all. Measured rate across 60 boots: 4-5, roughly 7%. It is not
+# something this project introduced -- it is upstream of every script change
+# here, and stock hits the same stall but hides it, since its blind "sleep 5"
+# just proceeds and bt_init finishes at ~16s with no adapter and no complaint.
+#
+# So: give patchram a watchdog. If hci0 has not appeared in PATCHRAM_WAIT
+# seconds, kill it, power-cycle the radio through rfkill (the chip needs a
+# real power cycle, not just a restart -- a stalled BT core does not recover
+# otherwise), and try again. Turns "no Bluetooth until you reboot" into "a
+# few seconds late" on the boots that stall.
+BT_HCI0_WAIT = "bt_wait 15 '[ -d /sys/class/bluetooth/hci0 ]'\n"
+
+BT_RETRY_BLOCK = """# patchram watchdog. Normal completion is ~4.3s (measured), so 8s without
+# hci0 means the chip has stopped answering, not that it is being slow.
+PATCHRAM_TRIES=3
+_try=1
+while :; do
+    bt_wait 8 '[ -d /sys/class/bluetooth/hci0 ]' && break
+    [ "$_try" -ge "$PATCHRAM_TRIES" ] && break
+    echo "bt_init: patchram stalled (try $_try), power-cycling the radio" >&2
+    killall brcm_patchram_plus 2>/dev/null
+    # The rail has to drop: a stalled BT core does not recover from a fresh
+    # patchram alone.
+    echo 0 > /sys/class/rfkill/rfkill0/state 2>/dev/null
+    usleep 200000
+    echo 1 > /sys/class/rfkill/rfkill0/state 2>/dev/null
+    usleep 200000
+    brcm_patchram_plus --enable_hci --baudrate 3000000 --no2bytes \\
+        --patchram /lib/firmware/bt_bcm/$firmware /dev/ttyS0 \\
+        --tosleep=50000 --use_baudrate_for_download --enable_lpm \\
+        --bd_addr $bt_addr &
+    _try=$(( _try + 1 ))
+done
+"""
+
+
+def bt_patchram_retry(text):
+    """Retry a stalled brcm_patchram_plus instead of waiting on it forever.
+
+    brcm_patchram_plus has no read timeout. When the chip stops responding
+    mid-handshake it blocks in read(/dev/ttyS0, buf, 3) forever, waiting for a
+    3-byte HCI event header that never arrives -- caught live 2026-09-06:
+
+        patchram pid=881 state=S wchan=wait_woken
+        syscall args: fd=0x4 (=/dev/ttyS0) buf=0x412980 count=0x3
+
+    hci0 is only created once that handshake finishes, so Bluetooth never
+    appears at all. Measured across 60 boots: 4-5 of them, roughly 7%. Not
+    something this project introduced -- it is upstream of every script change
+    here, and stock hits the same stall but hides it: its blind "sleep 5" just
+    proceeds, and bt_init finishes at ~16s with no adapter and no complaint.
+    The ~32s boots recorded earlier were this, not slow boots -- 15+5+5+5 is
+    exactly bt_init's timeout cascade with no hci0.
+
+    Only the hci0 wait is replaced; the launch line and the D-Bus block that
+    now sits between them are left alone. Returns the new text, or None.
+    Must run AFTER patch_bt_init_timing(), which creates the bt_wait this
+    depends on, and inside the same in-memory chain -- writing the file
+    directly here would be clobbered by the single write at the end.
+    """
+    if "PATCHRAM_TRIES" in text:
+        return None                      # already done
+    if text.count(BT_HCI0_WAIT) != 1:
+        return None
+    return text.replace(BT_HCI0_WAIT, BT_RETRY_BLOCK, 1)
+
+
+
+
+BT_POWERED_ON_LINE = 'bt-adapter --set "Powered" "On"\n'
+
+# Start the connect the moment bluez has the adapter powered, rather than at
+# the end of the script. Measured 2026-09-07 with the working bluetoothctl
+# connect: the connect itself costs 0.35s and succeeds on the first attempt
+# every time (how=ours tries=1), so all remaining latency was the 8.4s of
+# bt_init ahead of it. Between this line and bt_init_ok sit the Alias, a D-Bus
+# ping wait, sdptool add HIBYLINK_SP and the Discoverable call -- about 1.4s
+# the connect does not depend on. Backgrounded, so it overlaps them.
+#
+# An earlier attempt to move it here (LEAN_4u) appeared to make things worse,
+# 15s -> 19s. That result was void: the connect command in use at the time
+# (bt-device --connect) never worked at all, so what was being timed was the
+# headset's own inbound paging, which the btconn.log shows varying between 24s
+# and 70s. Nothing was learned from it either way.
+BT_CONNECT_BLOCK = BT_POWERED_ON_LINE + """
+(
+  if grep -qE "^[[:space:]]*bt_enabled[[:space:]]*=[[:space:]]*1" /usr/data/music.conf 2>/dev/null; then
+    _mac=$(grep -oE "([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}" /usr/data/bt_lastused.txt 2>/dev/null | tail -1)
+    if [ -n "$_mac" ]; then
+      # Use the EXACT command the Settings tap runs -- bt_pair() in
+      # app/status.c pipes an agent registration and a connect into
+      # bluetoothctl. That path is known to work every time by hand, so the
+      # boot path should not invent its own mechanism; two earlier attempts
+      # did, and both were wrong:
+      #   bt-device --connect  -- legacy bluez API, fails instantly (rc=1, 0s)
+      #                           with org.bluez.Error.AlreadyExists on an
+      #                           already-paired device, attempting nothing.
+      #                           Every "retry" was a no-op plus a sleep, which
+      #                           is why tuning the cadence never moved anything.
+      #   Device1.Connect      -- works when invoked by hand, but did not
+      #                           connect at boot.
+      # The likely difference is the agent: bluetoothctl registers one inside
+      # its own session. Verified on hardware 2026-09-07: cleared ACL, ran this
+      # pipe, live ACL back in under 1s, direction "<" (outgoing, i.e. ours).
+      # Self-measuring: record when the link came up, how many attempts it
+      # took, and -- crucially -- WHO established it. "incoming" means the
+      # headset paged us before our attempt landed, "ours" means Device1.Connect
+      # won. Without this the two are indistinguishable after the fact: there is
+      # no logread on this device, nothing in /var/log, and the bt_lastused
+      # recorder only writes when the MAC changes, so a reconnect to the same
+      # headset leaves no trace at all. Inferring it from hcitool's </> column
+      # is not good enough to build on.
+      _t0=$(cut -d" " -f1 /proc/uptime)
+      _try=0; _how=timeout
+      # Window widened to ~60s: 6 tries over ~21s was giving up while the
+      # headset was still coming up.
+      for _gap in 1 2 3 5 5 5 10 10 10 10; do
+        if hcitool con 2>/dev/null | grep -qi "$_mac"; then _how=incoming; break; fi
+        _try=$((_try + 1))
+        printf "agent NoInputNoOutput\ndefault-agent\nconnect $_mac\nquit\n" \
+          | bluetoothctl >/dev/null 2>&1
+        if hcitool con 2>/dev/null | grep -qi "$_mac"; then _how=ours; break; fi
+        sleep $_gap
+      done
+      _t1=$(cut -d" " -f1 /proc/uptime)
+      echo "$(date -u "+%Y-%m-%d %H:%M:%S") mac=$_mac how=$_how tries=$_try from=${_t0}s to=${_t1}s" \
+        >> /usr/data/btconn.log
+      if [ "$(wc -l < /usr/data/btconn.log 2>/dev/null || echo 0)" -gt 200 ]; then
+        tail -100 /usr/data/btconn.log > /usr/data/btconn.log.tmp \
+          && mv /usr/data/btconn.log.tmp /usr/data/btconn.log
+      fi
+    fi
+  fi
+) &
+"""
+
+BT_OK_LINE = "echo   > /tmp/bt_init_ok\n"
+
+BT_RECONNECT_BLOCK = """echo   > /tmp/bt_init_ok
+
+# --- keep bt_lastused.txt current, and reconnect to what it names ------------
+# Two problems, one fix.
+#
+# 1. bt_lastused.txt is HiBy's own record of which headset was last used, and
+#    it is written by hiby_player -- which RP1 replaced with
+#    library_standalone. So it froze: observed newest entry 2026-08-23 while a
+#    different headset was actually connected. Anything reading it has been
+#    working from stale data ever since. The recorder below keeps it current,
+#    in HiBy's own "MAC YYYY-MM-DD HH:MM:SS GMT" format, so the file means
+#    again what it claims to mean.
+#
+# 2. The R1 never pages out. PSCAN is on and every paired device is
+#    Trusted=true, so an incoming page is accepted, but bluez's [Policy]
+#    section is empty and its reconnect logic only re-establishes a link that
+#    just dropped. A headset switched on before or during boot pages, gets no
+#    answer, exhausts its attempts and gives up -- which is why the R1 had to
+#    be turned on first. The reconnect below pages the last-used device
+#    instead of waiting to be found.
+BT_LASTUSED=/usr/data/bt_lastused.txt
+
+(
+  while :; do
+    _cur=$(hcitool con 2>/dev/null | grep -oE "([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}" | head -1)
+    if [ -n "$_cur" ]; then
+      # 3. Keep alsa.conf pointed at the device that is actually connected.
+      #    Stock hiby_player rewrote this per device; library_standalone does
+      #    not reference the file at all, so it froze holding whichever MAC was
+      #    connected when hiby_player last ran. ALSA then routes to a headset
+      #    that is not there -- silent failure, no error anywhere. Only the MAC
+      #    is substituted, so the codec/eqmid settings in the file are kept.
+      if [ -f /usr/data/alsa.conf ]; then
+        _old=$(grep -oE "([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}" /usr/data/alsa.conf 2>/dev/null | head -1)
+        if [ -n "$_old" ] && [ "$_old" != "$_cur" ]; then
+          sed "s/$_old/$_cur/g" /usr/data/alsa.conf > /usr/data/alsa.conf.tmp 2>/dev/null \
+            && mv /usr/data/alsa.conf.tmp /usr/data/alsa.conf
+        fi
+      fi
+      _prev=$(grep -oE "([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}" $BT_LASTUSED 2>/dev/null | tail -1)
+      if [ "$_cur" != "$_prev" ]; then
+        echo "$_cur $(date -u "+%Y-%m-%d %H:%M:%S") GMT" >> $BT_LASTUSED
+        # keep it bounded; it is a log, not an archive
+        if [ "$(wc -l < $BT_LASTUSED 2>/dev/null || echo 0)" -gt 200 ]; then
+          tail -100 $BT_LASTUSED > $BT_LASTUSED.tmp && mv $BT_LASTUSED.tmp $BT_LASTUSED
+        fi
+      fi
+    fi
+    sleep 10
+  done
+) &
+
+
+"""
+
+
+def bt_reconnect_last_device(text):
+    """Keep bt_lastused.txt current, and page that device at boot.
+
+    Fixes HiBy's own record rather than inventing a parallel one, so anything
+    else reading it works again too. Returns the new text, or None.
+    """
+    if "BT_LASTUSED=" in text:
+        return None
+    if text.count(BT_OK_LINE) != 1 or text.count(BT_POWERED_ON_LINE) != 1:
+        return None
+    text = text.replace(BT_POWERED_ON_LINE, BT_CONNECT_BLOCK, 1)
+    return text.replace(BT_OK_LINE, BT_RECONNECT_BLOCK, 1)
+
+
+
+def trace_bt_steps(text):
+    """Stamp /proc/uptime after each bring-up milestone in bt_init.
+
+    The connect is now 0.35s and lands first try, and patchram's 4.34s plus
+    the 0.86s rfkill are chip-side and fixed. What is left unaccounted for is
+    the ~1.1s between hci0 appearing and the adapter being powered -- eight
+    steps, each followed by a bt_wait poll. Some of that is real daemon
+    startup and some is poll granularity waiting on something already ready,
+    and guessing which has gone badly twice today (the "1.4s" between Powered
+    On and bt_init_ok turned out to be 0.35s). So measure it rather than
+    reason about it: one echo plus a /proc/uptime read per step, ~35ms total.
+
+    Returns the new text, or None if the anchors do not match exactly.
+    """
+    if "bt_stamp" in text:
+        return None
+
+    helper = ('BTSTEPS=/usr/data/btsteps.log\n'
+              'bt_stamp() { echo "$1 $(cut -d\' \' -f1 /proc/uptime)" >> $BTSTEPS; }\n')
+
+    # Anchor the helper right after bt_wait's definition, so every later call
+    # is in scope.
+    marker = "\nhciconfig hci0 up\n"
+    if text.count(marker) != 1:
+        return None
+    text = text.replace(marker, "\n" + helper + "\n: > $BTSTEPS\nbt_stamp hci0_present\n"
+                        + "hciconfig hci0 up\n", 1)
+
+    # (line, occurrence index, label) -- the UP RUNNING wait appears twice, so
+    # occurrences are counted rather than replaced blindly.
+    stamps = [
+        ("bt_wait 5 'hciconfig hci0 | grep -q \"UP RUNNING\"'", 0, "hci0_up"),
+        ("/usr/libexec/bluetooth/bluetoothd -E -C &", 0, "bluetoothd_spawned"),
+        ("bt_wait 5 'dbus-send --system --print-reply --dest=org.bluez / "
+         "org.freedesktop.DBus.Peer.Ping'", 0, "bluez_dbus_ready"),
+        ("hciconfig hci0 reset", 0, "reset_issued"),
+        ("bt_wait 5 'hciconfig hci0 | grep -q \"UP RUNNING\"'", 1, "reset_done"),
+        ("bt_wait 5 'pidof bt-agent'", 0, "agent_ready"),
+        ("bt_wait 5 'pidof bluealsa'", 0, "bluealsa_ready"),
+    ]
+
+    # Keyed by (anchor, occurrence): the "UP RUNNING" wait appears twice and
+    # both occurrences are stamped, so a flat scan that stops at the first
+    # matching anchor silently loses the second one.
+    want = {(a, i): label for a, i, label in stamps}
+    seen = {}
+    out = []
+    for ln in text.split("\n"):
+        out.append(ln)
+        key = ln.strip()
+        n = seen.get(key)
+        n = 0 if n is None else n
+        label = want.get((key, n))
+        if label is not None:
+            out.append("bt_stamp " + label)
+        if any(key == a for a, _, _ in stamps):
+            seen[key] = n + 1
+    text = "\n".join(out)
+
+    if text.count("bt_stamp ") != len(stamps) + 1:
+        return None
+    return text
+
 def hasten_bt_init(root):
     """Move bt_init from S80 to S22, so its fixed cost overlaps the rest of boot.
 
@@ -1906,7 +2267,11 @@ def main():
                 print(f"patched {BT_INIT} (MAC lookup moved ahead of the "
                       f"rfkill0 wait: ~0.8s)")
 
-            nt = trace_bt_init(root)
+            # NOT enabled by default: trace_bt_init() inserts a stamp between
+            # "bt-agent ... &" and its "sleep 2", which breaks the anchor
+            # patch_bt_init_timing() needs -- the sleep then survives, costing
+            # 2s. Diagnostic use only.
+            nt = trace_bt_init(root) if os.environ.get("R1_TRACE_BT") else None
             if args.bt_gpio_test and bt_gpio_power_test(root):
                 print("EXPERIMENT: bt_init drives PB04 directly; cywdhd deferred "
                       "to the end of the module script")
@@ -1915,10 +2280,30 @@ def main():
                 print(f"instrumented {BT_INIT} with {nt} boot-time stamps "
                       f"-> /usr/data/btboot.log")
 
+            if bt_keep_powered_when_enabled(root):
+                print(f"patched {BT_INIT} (keep the radio powered when "
+                      f"bt_enabled=1: ~2.1s of off-then-on removed)")
+
             early = start_patchram_earlier(root)
             if early:
                 print("reordered init so patchram starts before the module "
                       "script: " + "; ".join(early))
+
+            # After the reorder: this rewrites "sh foo.sh" to ". ./foo.sh",
+            # which would otherwise break start_patchram_earlier()'s anchors.
+            # DISABLED: sourcing broke boot. The 28 scripts then share one
+            # shell, and while none contains "exit" or "$0" (checked), that was
+            # the wrong risk list -- a "cd" or "set -e" in any of them changes
+            # the environment every later ". ./foo.sh" depends on, and
+            # soc_msc.sh alone is 57 lines. Worth ~110ms (0.120s -> 0.010s for
+            # 28 spawns, measured); not worth an unbootable device.
+            if os.environ.get("R1_SOURCE_MODULES"):
+                ns = source_module_scripts(root)
+                if ns:
+                    print(f"module init: {ns} scripts sourced instead of "
+                          f"spawned (~{ns * 4.3:.0f}ms) -- EXPERIMENTAL, "
+                          f"has broken boot before")
+
 
             hb = hasten_bt_init(root)
             if hb:
@@ -1969,7 +2354,39 @@ def main():
                 print(f"patched {BT_INIT} (sleep -> poll: {', '.join(applied)})")
                 bpatched = btext
 
-            # Start the radio before the D-Bus preamble rather than after it.
+            # Maintain bt_lastused.txt and page that headset once the
+            # adapter is powered (BG119).
+            recon = bt_reconnect_last_device(btext)
+            if recon is None:
+                print(f"note: {BT_INIT} reconnect block not added — already "
+                      f"present, or the bt_init_ok line has moved")
+            else:
+                btext = recon
+                bpatched = btext
+                print(f"patched {BT_INIT} (reconnect to the last-used headset, "
+                      f"6 tries over ~30s, backgrounded)")
+
+            retried = bt_patchram_retry(btext)
+            if retried is None:
+                print(f"note: {BT_INIT} patchram watchdog not added — already "
+                      f"present, or the hci0 wait has moved")
+            else:
+                btext = retried
+                bpatched = btext
+                print(f"patched {BT_INIT} (patchram watchdog: retry with an "
+                      f"rfkill power-cycle if hci0 does not appear in 8s)")
+
+            # Must run after the watchdog: that patch rewrites the hci0 wait
+            # this one anchors just below.
+            traced = trace_bt_steps(btext)
+            if traced is None:
+                print(f"note: {BT_INIT} step timing not added — already "
+                      f"present, or a bring-up anchor did not match")
+            else:
+                btext = traced
+                bpatched = btext
+                print(f"patched {BT_INIT} (step timing -> /usr/data/btsteps.log)")
+
             reordered = reorder_bt_init_radio_first(btext)
             if reordered is None:
                 print(f"note: {BT_INIT} radio/D-Bus order unchanged — already "
