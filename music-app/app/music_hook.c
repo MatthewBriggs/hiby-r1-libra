@@ -419,6 +419,16 @@ static void mlog(const char *fmt, ...) {
  * milliseconds, and the transport must stay live throughout. The UI draws a
  * plain panel until the bitmap appears. */
 #define ART_PX FB_W   /* Now Playing art runs edge-to-edge, like stock */
+/* R83: requested live as "down by 5mm", for the transport row (play/pause
+ * and its neighbours) on all three playing screens that have one -- music/
+ * podcast and audiobook, not radio, which nobody asked to move. This
+ * panel's own physical size isn't stated anywhere in this repo (checked);
+ * ~15px/mm falls out of the R1's commonly cited 2.45" diagonal against this
+ * screen's actual 480x800 (sqrt(480^2+800^2)/2.45in), a suspiciously round
+ * number that's some real confirmation it's in the right neighbourhood
+ * rather than a bare guess. Worth revisiting if that spec is ever found
+ * written down somewhere more authoritative than a review page. */
+#define CTRL_NUDGE_PX 75
 /* BG104: a Last.fm/Spotify cover comes back at whatever resolution the host
  * chose to publish, sometimes well over a thousand pixels a side -- fine to
  * store, but confirmed live to cause a visible flicker on this device's
@@ -4924,7 +4934,7 @@ static void draw_screen(uint16_t *fb) {
                 if (scrub_active) fill_circle(fb, 24 + w, cby + 3, 13, COL_ACCENT);
             }
 
-            int cyy = cby + 58;
+            int cyy = cby + 58 + CTRL_NUDGE_PX;
             int mid = FB_W / 2;
 
             /* -10s / +10s, not the regular player's prev/next glyphs: a
@@ -4969,57 +4979,11 @@ static void draw_screen(uint16_t *fb) {
             int sw = text_width(buf, TEXT_PX_SMALL);
             draw_text(fb, scx - sw / 2, scy - TEXT_PX_SMALL / 2 + 2, buf, COL_TEXT, TEXT_PX_SMALL, FB_W);
 
+            /* R83: the route/battery readout and the format/kbps line that
+             * used to sit either side of this row both moved to the quick-
+             * settings top bar (qs_format_info()) -- visible from wherever
+             * quick settings is pulled down, not just this one screen. */
             draw_queue_icon(fb, FB_W - 24 - 26, FB_H - 32, COL_DIM);
-            /* Same device-battery-in-the-route-line treatment as the regular
-             * player -- see the matching comment there, including that the
-             * icon replaces the connection-kind word rather than sitting
-             * beside it. */
-            const char *route_kind = audio_output();
-            int devpct = st_battery_pct();
-            const icon_t *ric = !strcmp(route_kind, "Bluetooth") ? &icon_bt_sm
-                               : !strcmp(route_kind, "USB")      ? &icon_usb_sm : NULL;
-            char routebuf[64];
-            if (ric && devpct >= 0)
-                snprintf(routebuf, sizeof(routebuf), "%d%%", devpct);
-            else if (ric)
-                routebuf[0] = '\0';
-            else if (devpct >= 0)
-                snprintf(routebuf, sizeof(routebuf), "%s \xc2\xb7 %d%%", route_kind, devpct);
-            else
-                snprintf(routebuf, sizeof(routebuf), "%s", route_kind);
-            const char *route = routebuf;
-            int ow = text_width(route, TEXT_PX_SMALL);
-            int riw = ric ? ric->w + 6 : 0;
-            int biw = (devpct >= 0) ? 34 : 0;   /* 8px gap + 26px icon, BG34 */
-            int route_x = FB_W - 62 - biw - ow;
-            if (route[0])
-                draw_text(fb, route_x, FB_H - 34, route, COL_DIM, TEXT_PX_SMALL, FB_W);
-            if (ric)
-                draw_icon(fb, FB_W, FB_H, route_x - riw,
-                          FB_H - 34 + TEXT_PX_SMALL / 2 - ric->h / 2, ric, COL_DIM);
-            if (devpct >= 0)
-                draw_battery(fb, FB_W - 62 - 26, FB_H - 34 + TEXT_PX_SMALL / 2 - 6,
-                            devpct, st_charging());
-            /* Format from the extension, not lib_format_name(t->format):
-             * chapters come from a folder walk, never the SQL index, so
-             * t->format is never populated (see audiobook.h) and showing its
-             * default would just be a wrong-looking "?". Bitrate likewise has
-             * no tag to read -- computed from the file actually on disk. */
-            char ext[16];
-            const char *dot = strrchr(t->path, '.');
-            snprintf(ext, sizeof(ext), "%s", dot && dot[1] ? dot + 1 : "");
-            for (char *p2 = ext; *p2; p2++) *p2 = (char)toupper((unsigned char)*p2);
-            /* The file's own duration, not the chapter's and not the book's:
-             * a single-file book's chapter is far shorter than the file, and
-             * a multi-file book's total spans files other than this one --
-             * only file_n==1 makes the book total equal to this file. */
-            int64_t file_dur = (ab_book.file_n == 1) ? ab_book.total_ms
-                                                      : (ch ? ch->dur_ms : 0);
-            int kbps = ab_file_bitrate_kbps(t->path, file_dur);
-            if (kbps > 0) snprintf(buf, sizeof(buf), "%s  %d kbps", ext, kbps);
-            else          snprintf(buf, sizeof(buf), "%s", ext);
-            draw_text(fb, 24, FB_H - 34, buf, COL_ACCENT, TEXT_PX_SMALL,
-                      FB_W - 62 - ow - riw - 36);
             return;
         }
         if (radio_mode) {
@@ -5135,7 +5099,7 @@ static void draw_screen(uint16_t *fb) {
         /* BG40: was +58, tight enough against the clock row above (ends
          * around by+36) that the gap read as uneven next to the bigger one
          * below the buttons. +70 splits the difference more evenly. */
-        int cyy = by + 70;                       /* centre line of the transport */
+        int cyy = by + 70 + CTRL_NUDGE_PX;        /* centre line of the transport (R83) */
         int mid = FB_W / 2;
 
         if (podcast_mode) {
@@ -5230,84 +5194,11 @@ static void draw_screen(uint16_t *fb) {
             fill_rect(fb, mid + 5,  cyy - 18, 10, 36, COL_BG);
         }
 
-        /* Three things on one line, right to left: the queue control owns the
-         * corner, the route sits inside it, and the format gets whatever is
-         * left. Run together as one string the route fell off the end. */
+        /* R83: the route/battery readout and the format/kbps line that used
+         * to run either side of this row both moved to the quick-settings
+         * top bar (qs_format_info()) -- visible from wherever quick
+         * settings is pulled down, not just this one screen. */
         draw_queue_icon(fb, FB_W - 24 - 26, FB_H - 32, COL_DIM);
-        /* The Bluetooth codec and headset battery that used to live here moved
-         * to the quick-settings Bluetooth row instead -- this line shows the
-         * device's own battery now, in the same slot. */
-        const char *route_kind = audio_output();   /* "3.5 mm" / "USB" / "Bluetooth" */
-        int devpct = st_battery_pct();
-        /* The icon already says the connection kind -- printing the word next
-         * to it said the same thing twice. Where there's an icon, the text is
-         * just the battery percentage (or nothing); "3.5 mm" has no Font
-         * Awesome asset in this set, so that route keeps the plain word, as
-         * it always has. */
-        const icon_t *ric = !strcmp(route_kind, "Bluetooth") ? &icon_bt_sm
-                           : !strcmp(route_kind, "USB")      ? &icon_usb_sm : NULL;
-        char routebuf[64];
-        if (ric && devpct >= 0)
-            snprintf(routebuf, sizeof(routebuf), "%d%%", devpct);
-        else if (ric)
-            routebuf[0] = '\0';
-        else if (devpct >= 0)
-            snprintf(routebuf, sizeof(routebuf), "%s \xc2\xb7 %d%%", route_kind, devpct);
-        else
-            snprintf(routebuf, sizeof(routebuf), "%s", route_kind);
-        const char *route = routebuf;
-        int ow = text_width(route, TEXT_PX_SMALL);
-        int riw = ric ? ric->w + 6 : 0;
-        /* BG34: a glyph alongside the digits, same as the status bar's own
-         * battery reading -- text then icon, right to left. */
-        int biw = (devpct >= 0) ? 34 : 0;   /* 8px gap + 26px icon */
-        int route_x = FB_W - 62 - biw - ow;
-        if (route[0])
-            draw_text(fb, route_x, FB_H - 34, route, COL_DIM, TEXT_PX_SMALL, FB_W);
-        if (ric)
-            draw_icon(fb, FB_W, FB_H, route_x - riw,
-                      FB_H - 34 + TEXT_PX_SMALL / 2 - ric->h / 2, ric, COL_DIM);
-        if (devpct >= 0)
-            draw_battery(fb, FB_W - 62 - 26, FB_H - 34 + TEXT_PX_SMALL / 2 - 6,
-                        devpct, st_charging());
-        /* A podcast episode comes from a folder walk, never the SQL index --
-         * same reasoning as the audiobook screen's own comment here: t->
-         * format/bits/rate are never populated for one (see pod_rebuild_
-         * tracks()), so track_format_name(t) would show a meaningless
-         * "FLAC 0/0 kHz 0 kbps" rather than the extension actually on disk. */
-        if (podcast_mode) {
-            char ext[16];
-            const char *dot = strrchr(t->path, '.');
-            snprintf(ext, sizeof(ext), "%s", dot && dot[1] ? dot + 1 : "");
-            for (char *p2 = ext; *p2; p2++) *p2 = (char)toupper((unsigned char)*p2);
-            /* BG48: dur, not t->dur_ms -- t->dur_ms only ever comes from a
-             * saved resume record (see pod_rebuild_tracks()), which is 0 for
-             * any episode that has never been played before. `dur` is the
-             * same live audio_dur_ms()-with-fallback the position bar above
-             * already uses, and it's what's actually known right now. */
-            int kbps = ab_file_bitrate_kbps(t->path, dur);
-            if (kbps > 0) snprintf(buf, sizeof(buf), "%s  %d kbps", ext, kbps);
-            else          snprintf(buf, sizeof(buf), "%s", ext);
-        } else if (track_is_vbr_mp3(t->path)) {
-            /* BG106: t->bitrate is either the stock scanner's own number or
-             * this app's mp3_probe() fallback -- both, by design, are just
-             * whatever the first frame happened to carry (see mp3_probe()'s
-             * own comment), which is not a real answer for a VBR file and
-             * reads as a plainly wrong CBR-style number instead of not
-             * knowing at all. */
-            snprintf(buf, sizeof(buf), "%s  %d/%g kHz  VBR",
-                     track_format_name(t), t->bits, t->rate / 1000.0);
-        } else {
-            snprintf(buf, sizeof(buf), "%s  %d/%g kHz  %d kbps",
-                     track_format_name(t), t->bits, t->rate / 1000.0,
-                     t->bitrate / 1000);
-        }
-        /* R47: the mode button on the transport row is the state indicator
-         * now -- a first attempt also prefixed this line with "Shuffle"/
-         * "Repeat", which read as redundant/cluttered next to it and was
-         * removed per live feedback. */
-        draw_text(fb, 24, FB_H - 34, buf, COL_ACCENT, TEXT_PX_SMALL,
-                  FB_W - 62 - ow - riw - 36);
         return;
     }
 
@@ -6393,7 +6284,7 @@ static int skip_hold_amount(long held_ms) {
 static int skip_zone_at(int x, int y) {
     if (audiobook_mode) {
         int cby = ab_chapter_bar_y();
-        int cyy = cby + 58;
+        int cyy = cby + 58 + CTRL_NUDGE_PX;
         if (y <= cyy - 48 || y >= cyy + 48) return 0;
         if (x < FB_W / 3) return -1;
         if (x > 2 * FB_W / 3) return 1;
@@ -6401,7 +6292,7 @@ static int skip_zone_at(int x, int y) {
     }
     if (podcast_mode) {
         int bary = bar_y();
-        int cyy = bary + 70;
+        int cyy = bary + 70 + CTRL_NUDGE_PX;
         if (y <= cyy - 48 || y >= cyy + 48) return 0;
         int mid = FB_W / 2;
         int x10 = mid - POD_SKIP_OFF, xp30 = mid + POD_SKIP_OFF;
@@ -7114,10 +7005,83 @@ static void draw_gear_icon(uint16_t *fb, int x, int y, uint16_t c) {
 }
 
 
+/* R83: what's actually playing's own format/quality, in the same shape
+ * each mode's Now Playing screen used to compute independently at the foot
+ * of the player (see BG106/R60's own comments on the VBR and podcast/
+ * audiobook extension-plus-kbps cases this mirrors). Recomputed from
+ * scratch here rather than shared with those -- each was built from locals
+ * (t/ch/dur) only ever in scope mid-draw on that specific screen, not
+ * reachable from quick settings, which can be pulled down from anywhere.
+ * Empty string when there's nothing to show: radio (a live stream has no
+ * file-based format to read) or nothing loaded at all. */
+static void qs_format_info(char *out, size_t outsz) {
+    out[0] = '\0';
+    if (radio_mode || cur_track < 0 || cur_track >= queue_n) return;
+    lib_track_t *t = &queue[cur_track];
+    char ext[16];
+    const char *dot = strrchr(t->path, '.');
+    snprintf(ext, sizeof(ext), "%s", dot && dot[1] ? dot + 1 : "");
+    for (char *p = ext; *p; p++) *p = (char)toupper((unsigned char)*p);
+    if (audiobook_mode) {
+        const ab_chapter_t *ch = (cur_track < ab_book.chap_n) ? &ab_book.chap[cur_track] : NULL;
+        int64_t file_dur = (ab_book.file_n == 1) ? ab_book.total_ms
+                                                  : (ch ? ch->dur_ms : 0);
+        int kbps = ab_file_bitrate_kbps(t->path, file_dur);
+        if (kbps > 0) snprintf(out, outsz, "%s  %d kbps", ext, kbps);
+        else          snprintf(out, outsz, "%s", ext);
+    } else if (podcast_mode) {
+        int dur = audio_dur_ms();
+        if (dur <= 0) dur = t->dur_ms;
+        int kbps = ab_file_bitrate_kbps(t->path, dur);
+        if (kbps > 0) snprintf(out, outsz, "%s  %d kbps", ext, kbps);
+        else          snprintf(out, outsz, "%s", ext);
+    } else if (track_is_vbr_mp3(t->path)) {
+        snprintf(out, outsz, "%s  %d/%g kHz  VBR",
+                 track_format_name(t), t->bits, t->rate / 1000.0);
+    } else {
+        snprintf(out, outsz, "%s  %d/%g kHz  %d kbps",
+                 track_format_name(t), t->bits, t->rate / 1000.0, t->bitrate / 1000);
+    }
+}
+
 static void draw_quick_settings(uint16_t *fb) {
     fill_rect(fb, 0, 0, FB_W, QS_H, COL_HEADER);
     fill_rect(fb, 0, QS_H - 1, FB_W, 1, COL_LINE);
     draw_status(fb);
+
+    /* R83: route (Bluetooth/USB/3.5mm) and what's playing's own format,
+     * moved here from the foot of each mode's Now Playing screen -- visible
+     * from wherever quick settings was pulled down, not just while actually
+     * looking at Now Playing, and the accessory's own codec/battery already
+     * live in the Bluetooth row below (see its own comment) so nothing here
+     * duplicates that. Right after the volume readout draw_status() just
+     * drew, in the same top strip. */
+    {
+        const int mid = STATUS_H / 2;
+        int vol = audio_volume();
+        char volbuf[16];
+        snprintf(volbuf, sizeof(volbuf), "%d%%", vol);
+        int rx = 24 + 26 + text_width(volbuf, TEXT_PX_SMALL) + 24;
+
+        const char *route_kind = audio_output();   /* "3.5 mm" / "USB" / "Bluetooth" */
+        const icon_t *ric = !strcmp(route_kind, "Bluetooth") ? &icon_bt_sm
+                           : !strcmp(route_kind, "USB")      ? &icon_usb_sm : NULL;
+        if (ric) {
+            draw_icon(fb, FB_W, FB_H, rx, mid - ric->h / 2, ric, COL_DIM);
+            rx += ric->w + 10;
+        } else {
+            draw_text(fb, rx, mid - TEXT_PX_SMALL / 2, route_kind, COL_DIM, TEXT_PX_SMALL, FB_W);
+            rx += text_width(route_kind, TEXT_PX_SMALL) + 16;
+        }
+
+        char fmt[64];
+        qs_format_info(fmt, sizeof(fmt));
+        if (fmt[0]) {
+            int avail = FB_W - 18 - 28 - 12 - rx;   /* stop short of the battery */
+            if (avail > 0)
+                draw_text(fb, rx, mid - TEXT_PX_SMALL / 2, fmt, COL_ACCENT, TEXT_PX_SMALL, avail);
+        }
+    }
 
     draw_text(fb, 24, STATUS_H + 12, "Brightness", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
     /* R51: quick access to the full Settings menu. Dim, same weight as
@@ -9214,7 +9178,7 @@ int music_entry(void *a0, void *a1) {
                                                 (int64_t)dur * px / span));
                     }
 
-                    int cyy = cby + 58;
+                    int cyy = cby + 58 + CTRL_NUDGE_PX;
                     int mid = FB_W / 2;
                     /* Must match the skip rings' `off` in the draw code above
                      * (currently 96) -- this was left at the ring's old
@@ -9276,7 +9240,7 @@ int music_entry(void *a0, void *a1) {
                     if (dur > 0) audio_seek_ms((int)((int64_t)dur * px / span));
                 }
 
-                int cyy = bary + 70;      /* BG40: matches the draw-side offset */
+                int cyy = bary + 70 + CTRL_NUDGE_PX;      /* BG40: matches the draw-side offset (R83) */
                 if (y > cyy - 48 && y < cyy + 48) {
                     /* BG47 (revised): real hit zones under the drawn arcs/
                      * ring, not blind thirds -- boundaries are the
