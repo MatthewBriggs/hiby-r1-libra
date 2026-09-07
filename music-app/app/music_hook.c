@@ -5284,17 +5284,27 @@ static void draw_screen(uint16_t *fb) {
         if (wave_loaded) {
             int wave_top = ty + 82 + TEXT_PX_SMALL + 12;
             int wave_bot = (by + 70 + CTRL_NUDGE_PX) - 42 - 10;
-            int avail = wave_bot - wave_top;
-            if (avail < 20) avail = 20;   /* shouldn't happen at this screen's real geometry */
-            int clock_h = TEXT_PX_SMALL + 14;
+            /* R86 follow-up again: anchored to the waveform before (clock
+             * sat a fixed gap under it), so pushing the clock down and
+             * growing the waveform were two separate, easy-to-desync
+             * requests. Anchored to the bottom bound instead: the clock
+             * sits close to the transport buttons, and the waveform fills
+             * and centres in whatever is left above it, growing
+             * automatically the next time the clock moves down.
+             *
+             * The previous cut of this same idea (`wave_bot - clock_h +
+             * 6`) actually landed the clock *higher* than the version
+             * before it -- clock_h (36, TEXT_PX_SMALL+14) subtracted more
+             * than the +6 added back, a sign error going the wrong
+             * direction that was never checked against the number it
+             * replaced. Pinned hard against the bottom bound now instead
+             * (a small fixed margin off the buttons, not a size-dependent
+             * subtraction that can flip sign again). */
             int gap = 10;
-            max_h = avail - clock_h - gap;
+            clock_y = wave_bot - 6;
+            max_h = (clock_y - gap) - wave_top;
             if (max_h < 16) max_h = 16;
             wave_cy = wave_top + max_h / 2;
-            /* +10 on top of the centred position, requested live after
-             * seeing this on screen -- more separation from the waveform
-             * above it than pure centring alone gave. */
-            clock_y = wave_top + max_h + gap + 10;
         }
         /* R29: the waveform seek bar, when this track has a cached one
          * (Music only -- wave_loaded is never set for a podcast episode,
