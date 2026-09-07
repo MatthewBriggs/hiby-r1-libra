@@ -427,8 +427,10 @@ static void mlog(const char *fmt, ...) {
  * screen's actual 480x800 (sqrt(480^2+800^2)/2.45in), a suspiciously round
  * number that's some real confirmation it's in the right neighbourhood
  * rather than a bare guess. Worth revisiting if that spec is ever found
- * written down somewhere more authoritative than a review page. */
-#define CTRL_NUDGE_PX 75
+ * written down somewhere more authoritative than a review page.
+ * R83 follow-up: brought back up 10px, then another 5px, on live feedback
+ * that the 5mm push went too far. */
+#define CTRL_NUDGE_PX 60
 /* BG104: a Last.fm/Spotify cover comes back at whatever resolution the host
  * chose to publish, sometimes well over a thousand pixels a side -- fine to
  * store, but confirmed live to cause a visible flicker on this device's
@@ -7077,9 +7079,15 @@ static void draw_quick_settings(uint16_t *fb) {
         char fmt[64];
         qs_format_info(fmt, sizeof(fmt));
         if (fmt[0]) {
-            int avail = FB_W - 18 - 28 - 12 - rx;   /* stop short of the battery */
-            if (avail > 0)
-                draw_text(fb, rx, mid - TEXT_PX_SMALL / 2, fmt, COL_ACCENT, TEXT_PX_SMALL, avail);
+            /* draw_text()'s last argument is an absolute right-edge x, not
+             * a width -- passing a width here (as this first did) put the
+             * clip boundary *before* rx itself whenever rx ran past it,
+             * truncating almost immediately ("FLAC 1..." reported live).
+             * A fixed edge just short of the battery reading, same as
+             * every other right_edge argument in this file already is. */
+            int right_edge = FB_W - 18 - 28 - 12;
+            if (right_edge > rx)
+                draw_text(fb, rx, mid - TEXT_PX_SMALL / 2, fmt, COL_ACCENT, TEXT_PX_SMALL, right_edge);
         }
     }
 
