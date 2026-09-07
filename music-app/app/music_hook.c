@@ -1636,6 +1636,13 @@ static int queue_clear_x(void) {
     return header_back_x() - 40 - clear_w;
 }
 
+/* R82: same idea again, for the USB Storage Mode banner's own "Done"
+ * action -- not a header row (the banner isn't one), so right-aligned
+ * against the screen's own 24px margin rather than header_back_x(). */
+static int usb_done_x(void) {
+    return FB_W - 24 - text_width("Done", TEXT_PX_BODY);
+}
+
 /* BG47 (revised): just two skip arcs now, -10s left of play/pause and +30s
  * right of it -- not the symmetric +/-10/+/-30 four-button set this
  * started as. 96, not the original 70: matches the audiobook screen's own
@@ -4638,9 +4645,13 @@ static void draw_screen(uint16_t *fb) {
             int bh = 60;
             fill_rect(fb, 0, FB_H - bh, FB_W, bh, COL_ACCENT);
             const char *msg = "USB Storage Mode";
-            int mw = text_width(msg, TEXT_PX_BODY);
-            draw_text(fb, (FB_W - mw) / 2, FB_H - bh + (bh - TEXT_PX_BODY) / 2 - 2,
-                      msg, COL_BG, TEXT_PX_BODY, FB_W - 24);
+            int ty = FB_H - bh + (bh - TEXT_PX_BODY) / 2 - 2;
+            /* R82: "Done" switches back to ADB -- left-aligned label, since
+             * "Done" now claims the right side the centered text used to
+             * have (same left-label/right-action split header_back_x()'s
+             * own row already uses, just without an actual header here). */
+            draw_text(fb, 24, ty, msg, COL_BG, TEXT_PX_BODY, usb_done_x() - 40);
+            draw_text(fb, usb_done_x(), ty, "Done", COL_BG, TEXT_PX_BODY, FB_W - 24);
         }
         return;
     }
@@ -9781,7 +9792,15 @@ int music_entry(void *a0, void *a1) {
                     /* R81: greyed out on the draw side for exactly the same
                      * condition -- see that comment for why. */
                     int usb_storage = st_usb_mode() == 1;
-                    if (idx >= TOP_N) { /* nothing there */ }
+                    /* R82: "Done" on the banner, checked ahead of the
+                     * ordinary row math below -- the banner sits below
+                     * every real row (idx would land past TOP_N there
+                     * anyway, into "nothing there"), so this only ever
+                     * fires from an actual tap inside the banner's own
+                     * 60px strip, never shadows a real menu row above it. */
+                    if (usb_storage && y >= FB_H - 60 && x >= usb_done_x() - 24) {
+                        st_usb_mode_set(0);
+                    } else if (idx >= TOP_N) { /* nothing there */ }
                     else if (idx == TOP_MUSIC && !usb_storage) {
                         screen = SC_MUSIC_MENU; reset_scroll();
                     } else if (idx == TOP_AUDIOBOOKS && !usb_storage) {
