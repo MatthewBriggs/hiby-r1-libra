@@ -429,8 +429,9 @@ static void mlog(const char *fmt, ...) {
  * rather than a bare guess. Worth revisiting if that spec is ever found
  * written down somewhere more authoritative than a review page.
  * R83 follow-up: brought back up 10px, then another 5px, then another
- * 10px, on live feedback that the 5mm push went too far. */
-#define CTRL_NUDGE_PX 50
+ * 10px, then another 10px, on live feedback that the 5mm push went too
+ * far. */
+#define CTRL_NUDGE_PX 40
 /* BG104: a Last.fm/Spotify cover comes back at whatever resolution the host
  * chose to publish, sometimes well over a thousand pixels a side -- fine to
  * store, but confirmed live to cause a visible flicker on this device's
@@ -1785,7 +1786,7 @@ static int settings_content_rows(void) {
  * pushed by hand, not by CI against a tagged commit), so this stays a
  * literal that a human edits; the discipline is remembering to, not the
  * mechanism. */
-#define LIBRARY_VERSION "0.47"
+#define LIBRARY_VERSION "0.50"
 
 /* A custom-built kernel keeps uname()'s own release string exactly
  * "4.4.94+" on purpose -- that string is also the vermagic every one of the
