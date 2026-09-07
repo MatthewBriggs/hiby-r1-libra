@@ -662,8 +662,19 @@ static void *art_worker(void *arg) {
     }
 
     pthread_mutex_lock(&art_lock);
-    /* Discard if the user has already moved on to another track. */
-    if (strcmp(track, art_want) != 0) { free(bits); }
+    /* R84: discard only if the user has moved on to a different *album* --
+     * or, for anything with no artist/album at all (audiobooks/podcasts/
+     * radio, which pass "" -- see art_request()'s own comment), a
+     * different track, the same exact-match check this always used, since
+     * there's no album grouping to fall back to there. Comparing by album
+     * rather than by exact track path is what lets art_request() skip
+     * spawning a new worker at all for a same-album track change without
+     * a worker already in flight from the track *before* that one getting
+     * wrongly discarded here once art_want itself has moved on further. */
+    int stale = (artist[0] && album[0])
+              ? (strcmp(artist, art_want_artist) != 0 || strcmp(album, art_want_album) != 0)
+              : (strcmp(track, art_want) != 0);
+    if (stale) { free(bits); }
     else { free(art_bits); art_bits = bits; art_seq_v++; }
     pthread_mutex_unlock(&art_lock);
     return NULL;
@@ -682,13 +693,30 @@ static void art_request(const char *track, const char *artist, const char *album
     title_reset();
 if (art_thread_valid) { pthread_join(art_thread, NULL); art_thread_valid = 0; }
     pthread_mutex_lock(&art_lock);
-    free(art_bits);
-    art_bits = NULL;
-    art_seq_v++;
+    /* R84: reported live as the cover disappearing and reappearing between
+     * tracks of the same album -- not a redraw glitch, this was genuinely
+     * blanking art_bits and re-decoding/re-fetching identical artwork on
+     * every track change, same album or not. Same artist+album as the
+     * still-current request means the same cover, so art_bits (read by
+     * both Now Playing and the mini player -- see BG70's own comment)
+     * stays exactly as it is and no worker gets spawned at all. art_want
+     * (the track path) still updates either way, so a worker still in
+     * flight from the previous track -- a slow Last.fm/Spotify fetch,
+     * say -- isn't discarded by its own "has the user moved on" check
+     * once it finishes; it's fetching the same album's art regardless of
+     * which of that album's tracks is current by the time it lands. */
+    int same_album = artist && artist[0] && album && album[0] &&
+                     !strcmp(artist, art_want_artist) && !strcmp(album, art_want_album);
+    if (!same_album) {
+        free(art_bits);
+        art_bits = NULL;
+        art_seq_v++;
+    }
     snprintf(art_want, sizeof(art_want), "%s", track);
     snprintf(art_want_artist, sizeof(art_want_artist), "%s", artist ? artist : "");
     snprintf(art_want_album, sizeof(art_want_album), "%s", album ? album : "");
     pthread_mutex_unlock(&art_lock);
+    if (same_album) return;
     if (pthread_create(&art_thread, NULL, art_worker, NULL) == 0)
         art_thread_valid = 1;
 }
