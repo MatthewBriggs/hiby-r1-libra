@@ -5264,6 +5264,38 @@ static void draw_screen(uint16_t *fb) {
         int by = bar_y();      /* BG40: was its own ty+118, now the shared value */
         int bh = scrub_active ? 10 : 6;
         int byy = by - (bh - 6) / 2;
+        /* R86 follow-up: R86's first cut grew the waveform around the
+         * *plain bar's* centre (`by`) without checking what that centre
+         * actually had room for -- screenshotted live, the taller columns
+         * ran straight into the album/track-count line above ("Give Blood
+         * / 7 of 16"), only 36px above `by`. Properly centred instead, in
+         * the real space between that line and the transport buttons
+         * below -- both ends computed the same way the things they're
+         * bounded by are already positioned elsewhere in this block/file
+         * (ty+82 + one TEXT_PX_SMALL line for the top; the button row's
+         * own centre minus its 42px radius for the bottom, matching the
+         * literal `fill_circle(..., 42, ...)` below). wave_cy/max_h/
+         * clock_y computed once here and read by both the draw block just
+         * below and the clock text further down, rather than each
+         * re-deriving the same bounds a second time. Only used for
+         * wave_loaded -- the plain bar keeps using `by`/`by+14` exactly as
+         * it always has, unaffected by any of this. */
+        int wave_cy = by, max_h = 32, clock_y = by + 14;
+        if (wave_loaded) {
+            int wave_top = ty + 82 + TEXT_PX_SMALL + 12;
+            int wave_bot = (by + 70 + CTRL_NUDGE_PX) - 42 - 10;
+            int avail = wave_bot - wave_top;
+            if (avail < 20) avail = 20;   /* shouldn't happen at this screen's real geometry */
+            int clock_h = TEXT_PX_SMALL + 14;
+            int gap = 10;
+            max_h = avail - clock_h - gap;
+            if (max_h < 16) max_h = 16;
+            wave_cy = wave_top + max_h / 2;
+            /* +10 on top of the centred position, requested live after
+             * seeing this on screen -- more separation from the waveform
+             * above it than pure centring alone gave. */
+            clock_y = wave_top + max_h + gap + 10;
+        }
         /* R29: the waveform seek bar, when this track has a cached one
          * (Music only -- wave_loaded is never set for a podcast episode,
          * see play_index()'s own comment, so this always falls through to
@@ -5277,24 +5309,18 @@ static void draw_screen(uint16_t *fb) {
             int wave_w = FB_W - 48;
             int col_w = wave_w / WAVE_BUCKETS;
             if (col_w < 1) col_w = 1;
-            /* R86: requested live -- "use a bit more of the vertical space
-             * around the seek bar", once the played/remaining clock line
-             * below moves down 20px to make room (see its own comment).
-             * Was 32 (matching the plain bar's own visual weight); the
-             * waveform now fills what that push freed up. */
-            int max_h = 72;
             int played_col = dur > 0 ? WAVE_BUCKETS * pos / dur : 0;
             for (int c = 0; c < WAVE_BUCKETS; c++) {
                 int h = max_h * wave_buckets[c] / 255;
                 if (h < 2) h = 2;
                 int cx = 24 + c * wave_w / WAVE_BUCKETS;
-                fill_rect(fb, cx, by - h / 2, col_w > 1 ? col_w - 1 : col_w, h,
+                fill_rect(fb, cx, wave_cy - h / 2, col_w > 1 ? col_w - 1 : col_w, h,
                           c <= played_col ? COL_ACCENT : COL_LINE);
             }
             if (scrub_active) {
                 int w = dur > 0 ? wave_w * pos / dur : 0;
                 if (w > wave_w) w = wave_w;
-                fill_circle(fb, 24 + w, by, 13, COL_ACCENT);
+                fill_circle(fb, 24 + w, wave_cy, 13, COL_ACCENT);
             }
         } else {
             fill_rect(fb, 24, byy, FB_W - 48, bh, COL_LINE);
@@ -5306,13 +5332,8 @@ static void draw_screen(uint16_t *fb) {
                     fill_circle(fb, 24 + w, by + 3, 13, COL_ACCENT);
             }
         }
-        /* R86: pushed down 20px whenever the waveform is what's actually
-         * showing (not the plain bar) -- that's the room the taller
-         * waveform above now uses instead of sitting empty above a clock
-         * line pinned close to the old, shorter bar. */
-        int clock_dy = wave_loaded ? 20 : 0;
         snprintf(buf, sizeof(buf), "%d:%02d", pos / 60000, (pos / 1000) % 60);
-        draw_text(fb, 24, by + 14 + clock_dy, buf, COL_DIM, TEXT_PX_SMALL, FB_W);
+        draw_text(fb, 24, clock_y, buf, COL_DIM, TEXT_PX_SMALL, FB_W);
         int rem = dur - pos; if (rem < 0) rem = 0;
         /* Real-world time, not content time -- same reasoning as the
          * audiobook screen's Book/Chapter countdowns: position/duration
@@ -5323,7 +5344,7 @@ static void draw_screen(uint16_t *fb) {
         if (podcast_mode)
             rem = (int)(rem / (pod_speed_permille / 1000.0));
         snprintf(buf, sizeof(buf), "-%d:%02d", rem / 60000, (rem / 1000) % 60);
-        draw_right(fb, by + 14 + clock_dy, buf);
+        draw_right(fb, clock_y, buf);
 
         /* BG40: was +58, tight enough against the clock row above (ends
          * around by+36) that the gap read as uneven next to the bigger one
