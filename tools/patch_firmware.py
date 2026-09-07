@@ -202,11 +202,22 @@ BT_TIMING_EDITS = (
 
     ("echo 1 > /sys/class/rfkill/rfkill0/state\n"
      "sleep 1 # if invoke this script in c with system(), must sleep for a while!!!!!",
-     "# rfkill0 is registered by cywdhd (md_bcmdhd_bt_power). If that module\n"
-     "# is being loaded in the background, the node may not be there yet.\n"
-     "bt_wait 10 '[ -e /sys/class/rfkill/rfkill0/state ]'\n"
-     "echo 1 > /sys/class/rfkill/rfkill0/state",
-     "rfkill write (-1s, +wait for node)"),
+     "# Power EVERY bluetooth rfkill, not the hardcoded rfkill0.\n"
+     "#\n"
+     "# rfkill0 used to be cywdhd's (md_bcmdhd_bt_power) by position, which\n"
+     "# was always fragile and became wrong the moment a second provider\n"
+     "# existed: with bt_power_bluesleep built in, IT registers first and takes\n"
+     "# rfkill0, while cywdhd's moves to rfkill1. Measured on hardware\n"
+     "# 2026-09-07: writing our rfkill0 leaves the chip dead (hci0 only after\n"
+     "# ~32s, HCI reset 6s), writing cywdhd's brings it up in 4.62s -- its\n"
+     "# power path does more than toggle BT_REG_ON. Writing all of them costs\n"
+     "# one extra echo and does not care which driver landed where.\n"
+     "bt_wait 10 'grep -ql bluetooth /sys/class/rfkill/rfkill*/name'\n"
+     "for _rf in /sys/class/rfkill/rfkill*; do\n"
+     "    [ \"$(cat $_rf/name 2>/dev/null)\" = bluetooth ] || continue\n"
+     "    echo 1 > $_rf/state 2>/dev/null\n"
+     "done",
+     "rfkill write (-1s, all bluetooth rfkills)"),
 
     ("&\nsleep 5\n",
      "&\n# was: sleep 5 -- wait for patchram to register the adapter instead\n"
@@ -1159,7 +1170,7 @@ def trace_bt_init(root):
     if "bt_t()" in t:
         return None
     marks = (
-        ("bt_wait 10 '[ -e /sys/class/rfkill/rfkill0/state ]'", "rfkill0 present", True),
+        ("bt_wait 10 'grep -ql bluetooth /sys/class/rfkill/rfkill*/name'", "a bluetooth rfkill present", True),
         ('echo "BT_MACADDR $bt_addr"', "mac resolved", True),
         ('echo "Selected firmware: $firmware"', "firmware chosen", True),
         ("bt_wait 15 '[ -d /sys/class/bluetooth/hci0 ]'", "hci0 present", True),
@@ -1679,6 +1690,46 @@ def trace_bt_steps(text):
     if text.count("bt_stamp ") != len(stamps) + 1:
         return None
     return text
+
+
+RTC32K_SCRIPT = "module_driver/soc_utils.sh"
+
+
+def enable_rtc32k_at_boot(root):
+    """Turn the chip's 32kHz LPO on when soc_utils loads, not later.
+
+    The combo chip needs this clock to run. There are TWO rtc32k
+    implementations on this device and only one works:
+
+      * built-in  rtc32k_enable()          -- from ingenic_sdio.c, acts only
+                                              if wifi_data.pctrl is set, and
+                                              nothing ever sets it. A no-op.
+      * soc_utils ingenic_rtc32k_enable()  -- the real one. cywdhd calls this
+                                              (confirmed in its strings).
+
+    bt_power_bluesleep.c declares `extern void rtc32k_enable(void)`, so as a
+    built-in driver it links to the NO-OP. That is why BTPWR_1 and BTPWR_3
+    both left the chip half-dead: hci0 at ~32s and a 6s HCI reset, the same
+    signature as the userspace-GPIO attempt in bc4ecfe. A built-in cannot link
+    to a module's export, so calling the working one would mean building
+    bt_power as a module too.
+
+    soc_utils takes a module parameter instead, and the vendor's own script
+    passes it as 0. Setting it to 1 enables the clock at module load (~1.16s),
+    which is before bt_init writes rfkill0, so the question of who calls
+    rtc32k_enable stops mattering.
+    """
+    path = os.path.join(root, RTC32K_SCRIPT)
+    if not os.path.exists(path):
+        return False
+    with open(path) as fh:
+        t = fh.read()
+    if "rtc32k_init_on=0" not in t:
+        return False
+    t = t.replace("rtc32k_init_on=0", "rtc32k_init_on=1", 1)
+    with open(path, "w") as fh:
+        fh.write(t)
+    return True
 
 def hasten_bt_init(root):
     """Move bt_init from S80 to S22, so its fixed cost overlaps the rest of boot.
@@ -2279,6 +2330,10 @@ def main():
             if nt:
                 print(f"instrumented {BT_INIT} with {nt} boot-time stamps "
                       f"-> /usr/data/btboot.log")
+
+            if enable_rtc32k_at_boot(root):
+                print("patched module_driver/soc_utils.sh (rtc32k_init_on=1: "
+                      "enable the 32kHz LPO at module load)")
 
             if bt_keep_powered_when_enabled(root):
                 print(f"patched {BT_INIT} (keep the radio powered when "
