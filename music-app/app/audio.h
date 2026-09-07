@@ -1,6 +1,7 @@
 /* audio.h — playback. Decoders are dlopen'd from the device; see audio.c. */
 #ifndef AUDIO_H
 #define AUDIO_H
+#include <stdint.h>
 int  audio_play(const char *path);
 void audio_stop(void);
 void audio_toggle(void);
@@ -39,6 +40,13 @@ int  audio_is_active(void);
 int  audio_is_paused(void);
 int  audio_pos_ms(void);
 int  audio_dur_ms(void);
+/* R29: raw abs-sample peak of the most recent output chunk -- see
+ * g_last_peak's own comment in audio.c for why this is deliberately
+ * unscaled. For the Music-only waveform seek bar: sample this on a UI-
+ * thread poll while a track plays and bucket it by audio_pos_ms(), the
+ * same way every other live readout in this app is built from a poll
+ * rather than a callback. */
+int32_t audio_current_peak(void);
 void audio_set_volume(int pct);
 int  audio_volume(void);
 void audio_volume_step(int delta);   /* routes to the BT mixer or software */

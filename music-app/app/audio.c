@@ -1064,6 +1064,18 @@ static char  g_path[512];
 static char  g_next_path[512];      /* queued by the UI, taken at the boundary */
 static int   g_advance;             /* bumped each time the worker rolls on */
 static int   g_speed = 1000;        /* permille, WSOLA time-stretch; 1000 = bypass */
+/* R29: raw abs-sample peak of the most recent chunk actually written to the
+ * output, computed in the decode worker right after the volume gain that
+ * already runs there and published under g_lock in the same critical
+ * section as g_pos_ms just below it -- no extra locking cost, since that
+ * lock is already taken there every chunk regardless. Deliberately not
+ * scaled to any fixed 0..N range: the two source paths (16-bit `short`,
+ * hires `int32_t` shifted for whatever S24_LE/S32_LE the device opened)
+ * have different natural magnitudes, so audio_current_peak() hands back
+ * the raw value and callers building a waveform normalize it against their
+ * own observed max over a whole track -- scale-invariant, and it doesn't
+ * need to know which path produced it. */
+static int32_t g_last_peak;
 
 /* ---- output routing ------------------------------------------------------ */
 /* An A2DP sink shows up as a bluealsa PCM ending in /sink. */
@@ -2296,6 +2308,29 @@ static void *worker(void *arg) {
             for (size_t i = 0; i < n; i++) buf[i] = (short)((buf[i] * gain) >> 8);
         }
 
+        /* R29: cheap abs-max scan for the waveform seek bar, over exactly
+         * what's about to be written (post-gain, so a quiet volume reads as
+         * a quiet waveform too -- callers only compare this against other
+         * samples from the same track's own capture, so that's consistent
+         * within a track rather than wrong in any way that matters). Every
+         * sample, not a stride -- n tops out around CHUNK_FRAMES*channels,
+         * a few thousand plain comparisons, negligible next to the decode
+         * this loop already does every chunk. */
+        int32_t chunk_peak = 0;
+        if (hires) {
+            for (size_t i = 0; i < n; i++) {
+                int32_t v = buf32[i];
+                if (v < 0) v = -v;
+                if (v > chunk_peak) chunk_peak = v;
+            }
+        } else {
+            for (size_t i = 0; i < n; i++) {
+                int32_t v = buf[i];
+                if (v < 0) v = -v;
+                if (v > chunk_peak) chunk_peak = v;
+            }
+        }
+
         /* WSOLA changes what leaves the buffer from here on, not how much
          * content was decoded -- done and g_pos_ms below still count decoded
          * (content) frames, exactly as before this existed, so position and
@@ -2334,6 +2369,7 @@ static void *worker(void *arg) {
 
         done += got_src;
         pthread_mutex_lock(&g_lock);
+        g_last_peak = chunk_peak;
         g_pos_ms = (int)(done * 1000 / rate);
         pthread_mutex_unlock(&g_lock);
     }
@@ -2419,6 +2455,10 @@ void audio_toggle(void) {
 int audio_is_active(void) { pthread_mutex_lock(&g_lock); int v=g_active; pthread_mutex_unlock(&g_lock); return v; }
 int audio_is_paused(void) { pthread_mutex_lock(&g_lock); int v=g_paused; pthread_mutex_unlock(&g_lock); return v; }
 int audio_pos_ms(void)    { pthread_mutex_lock(&g_lock); int v=g_pos_ms; pthread_mutex_unlock(&g_lock); return v; }
+/* R29: see g_last_peak's own comment -- a raw abs-sample peak, scale
+ * depends on which decode path produced it, meaningful only relative to
+ * other reads taken during the same track's own capture. */
+int32_t audio_current_peak(void) { pthread_mutex_lock(&g_lock); int32_t v=g_last_peak; pthread_mutex_unlock(&g_lock); return v; }
 int audio_seek_pending_ms(void) { pthread_mutex_lock(&g_lock); int v=g_seek_to_ms; pthread_mutex_unlock(&g_lock); return v; }
 int audio_dur_ms(void)    { pthread_mutex_lock(&g_lock); int v=g_dur_ms; pthread_mutex_unlock(&g_lock); return v; }
 void audio_set_volume(int p){ if(p<0)p=0; if(p>100)p=100; pthread_mutex_lock(&g_lock); g_vol=p; pthread_mutex_unlock(&g_lock); }

@@ -3778,6 +3778,93 @@ static void queue_remove_display(int display_i) {
     }
 }
 
+/* R29: waveform seek bar, Music only (per its own backlog entry --
+ * audiobooks/podcasts explicitly excluded). Built from real playback, not
+ * a separate offline decode pass: the first time a track plays, its
+ * amplitude envelope is sampled from the exact PCM already being decoded
+ * for output (audio_current_peak(), polled alongside audio_pos_ms() in the
+ * main loop) and cached to the card; every playthrough after that loads
+ * the cache instead of capturing again -- "appears on every playthrough
+ * after the first", requested live, literally. */
+#define WAVE_BUCKETS 120
+#define WAVE_CACHE_DIR "/data/mnt/sd_0/.music_waveforms"
+/* Bump on any change to what a cache file actually contains, so old files
+ * from before the change become unreachable orphans rather than being
+ * misread -- same discipline cover.c's own CACHE_VERSION documents. */
+#define WAVE_CACHE_VERSION "1"
+
+static uint8_t  wave_buckets[WAVE_BUCKETS];   /* currently displayed, valid only if wave_loaded */
+static int      wave_loaded;
+static int      wave_capturing;
+static uint32_t wave_capture[WAVE_BUCKETS];   /* raw running peak per bucket, this playthrough */
+static char     wave_capture_path[LIB_PATH_LEN];
+static int      wave_last_bucket;             /* highest bucket touched so far, -1 = none yet */
+
+/* Same djb2-and-hex-name shape as cover.c's own cache_path() -- a track
+ * path can contain anything the filesystem allows, so hashing it into a
+ * fixed-width hex name sidesteps sanitizing it into something legal. */
+static void wave_cache_path(const char *track_path, char *out, size_t n) {
+    unsigned long h = 5381;
+    for (const unsigned char *p = (const unsigned char *)track_path; *p; p++)
+        h = ((h << 5) + h) ^ *p;
+    for (const unsigned char *p = (const unsigned char *)WAVE_CACHE_VERSION; *p; p++)
+        h = ((h << 5) + h) ^ *p;
+    mkdir(WAVE_CACHE_DIR, 0755);
+    snprintf(out, n, "%s/%08lx.wave", WAVE_CACHE_DIR, h & 0xFFFFFFFFul);
+}
+
+/* 1 and out filled if a fresh cache exists, 0 otherwise (including a stale
+ * one -- older than the track file itself, same rule cover.c's own
+ * load_cache() uses for a replaced cover.jpg -- which is deleted so a
+ * later capture doesn't collide with it under the same hash). */
+static int wave_load(const char *track_path, uint8_t *out) {
+    char p[512];
+    wave_cache_path(track_path, p, sizeof(p));
+    struct stat cs, ts;
+    if (stat(p, &cs) != 0) return 0;
+    if (stat(track_path, &ts) == 0 && ts.st_mtime > cs.st_mtime) {
+        unlink(p);
+        return 0;
+    }
+    FILE *f = fopen(p, "rb");
+    if (!f) return 0;
+    size_t got = fread(out, 1, WAVE_BUCKETS, f);
+    fclose(f);
+    return got == WAVE_BUCKETS;
+}
+
+static void wave_save(const char *track_path, const uint8_t *buckets) {
+    char p[512], tmp[520];
+    wave_cache_path(track_path, p, sizeof(p));
+    snprintf(tmp, sizeof(tmp), "%s.tmp", p);
+    FILE *f = fopen(tmp, "wb");
+    if (!f) return;
+    int ok = fwrite(buckets, 1, WAVE_BUCKETS, f) == WAVE_BUCKETS;
+    fclose(f);
+    if (!ok || rename(tmp, p) != 0) unlink(tmp);
+}
+
+/* Called every time play_index() is about to move on to a different track
+ * -- whichever track was capturing (if any) just had its playthrough end,
+ * whether by reaching the end, being skipped, or the queue advancing. */
+static void wave_finish_capture(void) {
+    if (!wave_capturing) return;
+    wave_capturing = 0;
+    /* A capture that never got near the end (an early skip, or a track
+     * abandoned for the session) is not "a play through" -- saving it
+     * would cache a misleadingly short/empty shape that never gets a
+     * chance to be completed later, since a cache file existing at all is
+     * what stops a future play from capturing again. */
+    if (wave_last_bucket < WAVE_BUCKETS - 4) return;
+    uint32_t maxv = 0;
+    for (int i = 0; i < WAVE_BUCKETS; i++) if (wave_capture[i] > maxv) maxv = wave_capture[i];
+    if (maxv == 0) return;   /* silence throughout, e.g. output was lost -- nothing real to show */
+    uint8_t out[WAVE_BUCKETS];
+    for (int i = 0; i < WAVE_BUCKETS; i++)
+        out[i] = (uint8_t)(wave_capture[i] * 255 / maxv);
+    wave_save(wave_capture_path, out);
+}
+
 static void play_index(int i) {
     radio_mode = 0;
     audiobook_mode = 0;
@@ -3799,6 +3886,25 @@ static void play_index(int i) {
     cur_track = i;
     queue_apply_pending();   /* BG85 */
     audio_play(queue[i].path);
+    /* R29: finish whatever the previous track's own capture was, then
+     * decide what this one shows -- a cache if one already exists (every
+     * playthrough after the one that built it), nothing yet while this
+     * playthrough builds it fresh. podcast_mode is checked explicitly
+     * (radio_mode/audiobook_mode are already known 0, set just above) --
+     * this feature is Music only, per its own backlog entry. */
+    wave_finish_capture();
+    wave_loaded = 0;
+    wave_capturing = 0;
+    if (!podcast_mode) {
+        if (wave_load(queue[i].path, wave_buckets)) {
+            wave_loaded = 1;
+        } else {
+            wave_capturing = 1;
+            memset(wave_capture, 0, sizeof(wave_capture));
+            snprintf(wave_capture_path, sizeof(wave_capture_path), "%s", queue[i].path);
+            wave_last_bucket = -1;
+        }
+    }
     /* R23: the track's own artist wins when it has one, same reasoning
      * Now Playing's display already uses (BG30) -- q_artist is the
      * album's artist and can genuinely differ per track (a compilation).
@@ -5077,13 +5183,42 @@ static void draw_screen(uint16_t *fb) {
         int by = bar_y();      /* BG40: was its own ty+118, now the shared value */
         int bh = scrub_active ? 10 : 6;
         int byy = by - (bh - 6) / 2;
-        fill_rect(fb, 24, byy, FB_W - 48, bh, COL_LINE);
-        if (dur > 0) {
-            int w = (FB_W - 48) * pos / dur;
-            if (w > FB_W - 48) w = FB_W - 48;
-            fill_rect(fb, 24, byy, w, bh, COL_ACCENT);
-            if (scrub_active)
-                fill_circle(fb, 24 + w, by + 3, 13, COL_ACCENT);
+        /* R29: the waveform seek bar, when this track has a cached one
+         * (Music only -- wave_loaded is never set for a podcast episode,
+         * see play_index()'s own comment, so this always falls through to
+         * the plain bar below for those). Same column count as
+         * WAVE_BUCKETS, spread evenly across the same width the plain bar
+         * fills; each column's height comes straight from its cached 0-255
+         * peak. Coloured up to the played fraction, dim past it -- the
+         * same played/unplayed language the plain fill already used, just
+         * shaped instead of flat. */
+        if (wave_loaded) {
+            int wave_w = FB_W - 48;
+            int col_w = wave_w / WAVE_BUCKETS;
+            if (col_w < 1) col_w = 1;
+            int max_h = 32;
+            int played_col = dur > 0 ? WAVE_BUCKETS * pos / dur : 0;
+            for (int c = 0; c < WAVE_BUCKETS; c++) {
+                int h = max_h * wave_buckets[c] / 255;
+                if (h < 2) h = 2;
+                int cx = 24 + c * wave_w / WAVE_BUCKETS;
+                fill_rect(fb, cx, by - h / 2, col_w > 1 ? col_w - 1 : col_w, h,
+                          c <= played_col ? COL_ACCENT : COL_LINE);
+            }
+            if (scrub_active) {
+                int w = dur > 0 ? wave_w * pos / dur : 0;
+                if (w > wave_w) w = wave_w;
+                fill_circle(fb, 24 + w, by, 13, COL_ACCENT);
+            }
+        } else {
+            fill_rect(fb, 24, byy, FB_W - 48, bh, COL_LINE);
+            if (dur > 0) {
+                int w = (FB_W - 48) * pos / dur;
+                if (w > FB_W - 48) w = FB_W - 48;
+                fill_rect(fb, 24, byy, w, bh, COL_ACCENT);
+                if (scrub_active)
+                    fill_circle(fb, 24 + w, by + 3, 13, COL_ACCENT);
+            }
         }
         snprintf(buf, sizeof(buf), "%d:%02d", pos / 60000, (pos / 1000) % 60);
         draw_text(fb, 24, by + 14, buf, COL_DIM, TEXT_PX_SMALL, FB_W);
@@ -10163,6 +10298,25 @@ int music_entry(void *a0, void *a1) {
          * what this exists to survive. Once every ~15s: cheap enough not to
          * matter, infrequent enough not to wear the card writing it. */
         if (++ab_pos_tick >= 450) { ab_pos_tick = 0; ab_save_current_pos(); pod_save_current_pos(); }
+
+        /* R29: waveform seek bar, Music only -- sampled on this same poll
+         * every other live readout in this app already runs on, not a
+         * callback from the decode thread. Paused reads nothing (a paused
+         * chunk's peak is stale, from whenever playback actually last
+         * wrote), which is fine -- the bucket it would have landed in gets
+         * filled in on the next unpaused tick at the same position. */
+        if (wave_capturing && audio_is_active() && !audio_is_paused()) {
+            int dur = audio_dur_ms();
+            if (dur > 0) {
+                int pos = audio_pos_ms();
+                int b = (int)((int64_t)pos * WAVE_BUCKETS / dur);
+                if (b < 0) b = 0;
+                if (b >= WAVE_BUCKETS) b = WAVE_BUCKETS - 1;
+                int32_t peak = audio_current_peak();
+                if (peak > (int32_t)wave_capture[b]) wave_capture[b] = (uint32_t)peak;
+                if (b > wave_last_bucket) wave_last_bucket = b;
+            }
+        }
 
         /* Podcast downloads and whole-feed syncs both run as detached child
          * processes (see podcast.c) -- polled and reaped every tick, cheap
