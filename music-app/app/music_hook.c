@@ -4275,8 +4275,16 @@ static float eq_t_from_freq(float hz) {
 }
 
 static int mini_visible(void) {
+    /* R81 follow-up: reported live -- the USB Storage Mode banner and its
+     * "Done" button were invisible/unreachable whenever the mini player
+     * happened to be showing, since draw_ui() draws it unconditionally
+     * over whatever draw_screen() just drew (see its own call site) --
+     * SC_MENU's own draw code never calls draw_mini() itself, so this was
+     * easy to miss building the banner in the first place. st_usb_mode()
+     * gates every reader of this function at once rather than needing a
+     * separate check wherever the banner (or anything else) cares. */
     return audio_is_active() && screen != SC_PLAYING &&
-           (queue_n > 0 || radio_mode);
+           (queue_n > 0 || radio_mode) && st_usb_mode() != 1;
 }
 
 /* Cover (or book cover), title, subtitle and a pause button, over the bottom
