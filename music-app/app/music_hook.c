@@ -428,9 +428,9 @@ static void mlog(const char *fmt, ...) {
  * number that's some real confirmation it's in the right neighbourhood
  * rather than a bare guess. Worth revisiting if that spec is ever found
  * written down somewhere more authoritative than a review page.
- * R83 follow-up: brought back up 10px, then another 5px, on live feedback
- * that the 5mm push went too far. */
-#define CTRL_NUDGE_PX 60
+ * R83 follow-up: brought back up 10px, then another 5px, then another
+ * 10px, on live feedback that the 5mm push went too far. */
+#define CTRL_NUDGE_PX 50
 /* BG104: a Last.fm/Spotify cover comes back at whatever resolution the host
  * chose to publish, sometimes well over a thousand pixels a side -- fine to
  * store, but confirmed live to cause a visible flicker on this device's
@@ -1374,7 +1374,7 @@ static int live_x, live_y;          /* where the finger is now, while it is down
 /* Quick settings, pulled down from the status strip. Brightness, Wi-Fi and
  * Bluetooth are wanted often enough that leaving the app to reach them is the
  * annoyance; everything else stays in the firmware's own settings. */
-#define QS_H       562   /* +QS_ROW_H over the original 490, for the new USB row */
+#define QS_H       634   /* +QS_ROW_H over 562, for the new format/quality row (R83) */
 #define QS_ROW_H   72
 /* Row label column. Was a bare 68 until the Wi-Fi/Bluetooth/EQ row icons grew
  * larger -- Wi-Fi's natural width at its new height puts its right edge
@@ -6964,6 +6964,10 @@ static int qs_bt_y(void)   { return qs_wifi_y() + QS_ROW_H; }
 static int qs_usb_y(void)  { return qs_bt_y() + QS_ROW_H; }
 static int qs_eq_y(void)   { return qs_usb_y() + QS_ROW_H; }
 static int qs_mseb_y(void) { return qs_eq_y() + QS_ROW_H; }
+/* R83: what's actually playing's own format/quality -- moved here, under
+ * MSEB, from the top bar next to volume (see draw_quick_settings()'s own
+ * comment on the earlier spot this held). */
+static int qs_codec_y(void) { return qs_mseb_y() + QS_ROW_H; }
 /* R51: top-right corner, level with "Brightness" opposite it -- not its own
  * row (tried first, corrected live: too much space for what it does, and
  * putting a whole row's worth of weight behind a single shortcut read as
@@ -7051,13 +7055,14 @@ static void draw_quick_settings(uint16_t *fb) {
     fill_rect(fb, 0, QS_H - 1, FB_W, 1, COL_LINE);
     draw_status(fb);
 
-    /* R83: route (Bluetooth/USB/3.5mm) and what's playing's own format,
-     * moved here from the foot of each mode's Now Playing screen -- visible
-     * from wherever quick settings was pulled down, not just while actually
-     * looking at Now Playing, and the accessory's own codec/battery already
-     * live in the Bluetooth row below (see its own comment) so nothing here
-     * duplicates that. Right after the volume readout draw_status() just
-     * drew, in the same top strip. */
+    /* R83: route (Bluetooth/USB/3.5mm), moved here from the foot of each
+     * mode's Now Playing screen -- visible from wherever quick settings was
+     * pulled down, not just while actually looking at Now Playing, and the
+     * accessory's own codec/battery already live in the Bluetooth row below
+     * (see its own comment) so nothing here duplicates that. Right after
+     * the volume readout draw_status() just drew, in the same top strip.
+     * Format/quality itself moved again, live feedback, to its own row at
+     * the bottom of the panel instead -- see qs_codec_y() below. */
     {
         const int mid = STATUS_H / 2;
         int vol = audio_volume();
@@ -7070,24 +7075,8 @@ static void draw_quick_settings(uint16_t *fb) {
                            : !strcmp(route_kind, "USB")      ? &icon_usb_sm : NULL;
         if (ric) {
             draw_icon(fb, FB_W, FB_H, rx, mid - ric->h / 2, ric, COL_DIM);
-            rx += ric->w + 10;
         } else {
             draw_text(fb, rx, mid - TEXT_PX_SMALL / 2, route_kind, COL_DIM, TEXT_PX_SMALL, FB_W);
-            rx += text_width(route_kind, TEXT_PX_SMALL) + 16;
-        }
-
-        char fmt[64];
-        qs_format_info(fmt, sizeof(fmt));
-        if (fmt[0]) {
-            /* draw_text()'s last argument is an absolute right-edge x, not
-             * a width -- passing a width here (as this first did) put the
-             * clip boundary *before* rx itself whenever rx ran past it,
-             * truncating almost immediately ("FLAC 1..." reported live).
-             * A fixed edge just short of the battery reading, same as
-             * every other right_edge argument in this file already is. */
-            int right_edge = FB_W - 18 - 28 - 12;
-            if (right_edge > rx)
-                draw_text(fb, rx, mid - TEXT_PX_SMALL / 2, fmt, COL_ACCENT, TEXT_PX_SMALL, right_edge);
         }
     }
 
@@ -7203,6 +7192,18 @@ static void draw_quick_settings(uint16_t *fb) {
     draw_text(fb, QS_LABEL_X, by4 + 6, "MSEB", mseb_on ? COL_TEXT : COL_DIM, TEXT_PX_SMALL, 200);
     draw_text(fb, QS_LABEL_X, by4 + 32, "HiBy tuning bands", COL_DIM, TEXT_PX_SMALL, FB_W - 180);
     draw_toggle_switch(fb, by4, mseb_on);
+
+    /* R83: what's actually playing's own format/quality -- moved here,
+     * under MSEB, from the top bar next to volume (asked for live, a
+     * second time, after the top bar placement first shipped). No icon or
+     * toggle, so text stays at QS_LABEL_X rather than x=24 -- aligned under
+     * the rows above it instead of ragged against them. */
+    int by5 = qs_codec_y();
+    draw_text(fb, QS_LABEL_X, by5 + 6, "Format", COL_DIM, TEXT_PX_SMALL, 200);
+    char fmt[64];
+    qs_format_info(fmt, sizeof(fmt));
+    draw_text(fb, QS_LABEL_X, by5 + 32, fmt[0] ? fmt : "Nothing playing",
+              fmt[0] ? COL_ACCENT : COL_DIM, TEXT_PX_SMALL, FB_W - 48);
 
     /* A grab handle, so it is obvious the panel goes back up. */
     fill_rect(fb, FB_W / 2 - 26, QS_H - 14, 52, 4, COL_LINE);
