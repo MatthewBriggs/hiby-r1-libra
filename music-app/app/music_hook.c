@@ -3867,7 +3867,18 @@ static void queue_remove_display(int display_i) {
  * main loop) and cached to the card; every playthrough after that loads
  * the cache instead of capturing again -- "appears on every playthrough
  * after the first", requested live, literally. */
-#define WAVE_BUCKETS 120
+/* R86 follow-up: reported live as uneven bar thickness, after the previous
+ * fix already fixed uneven gaps -- 120 doesn't divide the available 432px
+ * (FB_W-48) evenly (432/120 = 3.6), so no integer-pixel column width can
+ * be perfectly uniform: some columns end up 3px, others 4px, no matter how
+ * the remainder is distributed. 144 is the closest bucket count to 120
+ * that divides 432 exactly (3px per column, zero remainder) -- every
+ * column is now genuinely, not just approximately, the same width. Also
+ * invalidates every existing cache file (their on-disk length no longer
+ * matches WAVE_BUCKETS, so wave_load()'s exact-size check simply misses
+ * and the next play recaptures) -- harmless and self-healing, not
+ * something that needed its own separate migration. */
+#define WAVE_BUCKETS 144
 #define WAVE_CACHE_DIR "/data/mnt/sd_0/.music_waveforms"
 /* Bump on any change to what a cache file actually contains, so old files
  * from before the change become unreachable orphans rather than being
@@ -5317,14 +5328,27 @@ static void draw_screen(uint16_t *fb) {
          * shaped instead of flat. */
         if (wave_loaded) {
             int wave_w = FB_W - 48;
-            int col_w = wave_w / WAVE_BUCKETS;
-            if (col_w < 1) col_w = 1;
             int played_col = dur > 0 ? WAVE_BUCKETS * pos / dur : 0;
+            /* Reported live, twice: first as uneven spacing (a fixed col_w
+             * drawn at an independently-truncated cx each iteration drifts
+             * in and out of step with its own rounding -- fixed by sizing
+             * each column off the real gap to the *next* column's own
+             * start instead of a fixed average), then as uneven thickness
+             * once that was fixed -- WAVE_BUCKETS not dividing wave_w
+             * evenly meant some columns were still 1px wider than others
+             * no matter how the gap-sizing worked, since that's a genuine
+             * integer-remainder problem, not a rounding bug. Fixed at the
+             * source instead (see WAVE_BUCKETS's own comment): 144 divides
+             * this screen's 432px exactly, so cx1-cx0 below is a constant
+             * 3 for every column, not merely close. */
             for (int c = 0; c < WAVE_BUCKETS; c++) {
                 int h = max_h * wave_buckets[c] / 255;
                 if (h < 2) h = 2;
-                int cx = 24 + c * wave_w / WAVE_BUCKETS;
-                fill_rect(fb, cx, wave_cy - h / 2, col_w > 1 ? col_w - 1 : col_w, h,
+                int cx0 = 24 + c * wave_w / WAVE_BUCKETS;
+                int cx1 = 24 + (c + 1) * wave_w / WAVE_BUCKETS;
+                int col_w = cx1 - cx0;
+                if (col_w < 1) col_w = 1;
+                fill_rect(fb, cx0, wave_cy - h / 2, col_w > 1 ? col_w - 1 : col_w, h,
                           c <= played_col ? COL_ACCENT : COL_LINE);
             }
             if (scrub_active) {
