@@ -5277,7 +5277,12 @@ static void draw_screen(uint16_t *fb) {
             int wave_w = FB_W - 48;
             int col_w = wave_w / WAVE_BUCKETS;
             if (col_w < 1) col_w = 1;
-            int max_h = 32;
+            /* R86: requested live -- "use a bit more of the vertical space
+             * around the seek bar", once the played/remaining clock line
+             * below moves down 20px to make room (see its own comment).
+             * Was 32 (matching the plain bar's own visual weight); the
+             * waveform now fills what that push freed up. */
+            int max_h = 72;
             int played_col = dur > 0 ? WAVE_BUCKETS * pos / dur : 0;
             for (int c = 0; c < WAVE_BUCKETS; c++) {
                 int h = max_h * wave_buckets[c] / 255;
@@ -5301,8 +5306,13 @@ static void draw_screen(uint16_t *fb) {
                     fill_circle(fb, 24 + w, by + 3, 13, COL_ACCENT);
             }
         }
+        /* R86: pushed down 20px whenever the waveform is what's actually
+         * showing (not the plain bar) -- that's the room the taller
+         * waveform above now uses instead of sitting empty above a clock
+         * line pinned close to the old, shorter bar. */
+        int clock_dy = wave_loaded ? 20 : 0;
         snprintf(buf, sizeof(buf), "%d:%02d", pos / 60000, (pos / 1000) % 60);
-        draw_text(fb, 24, by + 14, buf, COL_DIM, TEXT_PX_SMALL, FB_W);
+        draw_text(fb, 24, by + 14 + clock_dy, buf, COL_DIM, TEXT_PX_SMALL, FB_W);
         int rem = dur - pos; if (rem < 0) rem = 0;
         /* Real-world time, not content time -- same reasoning as the
          * audiobook screen's Book/Chapter countdowns: position/duration
@@ -5313,7 +5323,7 @@ static void draw_screen(uint16_t *fb) {
         if (podcast_mode)
             rem = (int)(rem / (pod_speed_permille / 1000.0));
         snprintf(buf, sizeof(buf), "-%d:%02d", rem / 60000, (rem / 1000) % 60);
-        draw_right(fb, by + 14, buf);
+        draw_right(fb, by + 14 + clock_dy, buf);
 
         /* BG40: was +58, tight enough against the clock row above (ends
          * around by+36) that the gap read as uneven next to the bigger one
