@@ -314,6 +314,14 @@ static int button_lock_enabled;   /* off by default: a new gesture, opt in */
  * own Bluetooth teardown -- never silently changing a setting the user
  * chose themselves. */
 static int usb_bypass_enabled;
+
+/* R81: start playing when a headset connects. Off by default -- it makes the
+ * device produce sound without anyone touching it, which must be opted into.
+ * Detected in bt_poll() (which already asks st_bt_name() every ~5s, so this
+ * costs no extra polling) and acted on by the main thread, the same handoff
+ * bt_eq_pending_path already uses: audio_toggle() belongs to the UI thread. */
+static int bt_autoplay_enabled;
+static int bt_autoplay_pending;      /* set under bt_lock, cleared by the main loop */
 static int usb_bypass_active;
 static int usb_bypass_bt_was_on;
 static int usb_bypass_saved_vol;
@@ -519,6 +527,16 @@ static void *bt_poll(void *arg) {
         st_bt_name(nm, sizeof(nm));
         if (nm[0]) {
             if (strcmp(nm, bt_matched_name) != 0) {
+                /* R81: an empty -> non-empty name is a headset arriving, which
+                 * is exactly the transition this thread already watches for to
+                 * match an EQ profile. Flagged rather than acted on here:
+                 * audio_toggle() is the UI thread's, same as the EQ handoff
+                 * immediately above. */
+                if (bt_matched_name[0] == '\0' && bt_autoplay_enabled) {
+                    pthread_mutex_lock(&bt_lock);
+                    bt_autoplay_pending = 1;
+                    pthread_mutex_unlock(&bt_lock);
+                }
                 bt_match_profile(nm);
                 snprintf(bt_matched_name, sizeof(bt_matched_name), "%s", nm);
             }
@@ -1702,7 +1720,11 @@ static int set_usbbypass_desc_y(void) { return set_row_usbbypass_y() + ROW_H; }
  * deep_sleep defaulting to 0 nothing reaches the suspend path, and there is no
  * longer a way to switch it on by accident from the UI. Auto shutdown is the
  * shipped answer to the same problem. */
-static int set_row_autooff_y(void)  { return set_usbbypass_desc_y() + 64; }
+/* R81: two-line description like the toggles above it, hence the +64 block
+ * rather than a plain ROW_H row. */
+static int set_row_btautoplay_y(void)  { return set_usbbypass_desc_y() + 64; }
+static int set_btautoplay_desc_y(void) { return set_row_btautoplay_y() + ROW_H; }
+static int set_row_autooff_y(void)  { return set_btautoplay_desc_y() + 64; }
 static int set_autooff_desc_y(void) { return set_row_autooff_y() + ROW_H; }
 /* R41: no description under this one -- "Light theme" needs no explaining
  * the way the toggles above did, so it's a plain ROW_H row like Accent
@@ -4596,10 +4618,29 @@ static void draw_screen(uint16_t *fb) {
                 mlog("[dbg] top_menu[%d] ptr=%p str=\"%s\"\n",
                      i, (void *)top_menu[i].label, top_menu[i].label);
         }
+        /* R81: the card is unsafe to read from while it's exported as a USB
+         * drive to whatever it's plugged into -- a host machine can rename,
+         * move, or delete files out from under a scan or a currently-open
+         * book/feed at any moment, with no way for this app to know. Music/
+         * Audiobooks/Podcasts (the three that actually read the card open-
+         * endedly) grey out and stop opening for exactly as long as that's
+         * true; Parametric EQ/MSEB/Radio/Settings don't touch the card the
+         * same way and stay live. */
+        int usb_storage = st_usb_mode() == 1;
         for (int i = 0; i < TOP_N; i++) {
-            draw_text(fb, 24, y + 20, top_menu[i].label, COL_TEXT, TEXT_PX_BODY, FB_W - 24);
+            int disabled = usb_storage && (i == TOP_MUSIC || i == TOP_AUDIOBOOKS || i == TOP_PODCASTS);
+            draw_text(fb, 24, y + 20, top_menu[i].label,
+                      disabled ? COL_DIM : COL_TEXT, TEXT_PX_BODY, FB_W - 24);
             fill_rect(fb, 0, y + ROW_H - 1, FB_W, 1, COL_LINE);
             y += ROW_H;
+        }
+        if (usb_storage) {
+            int bh = 60;
+            fill_rect(fb, 0, FB_H - bh, FB_W, bh, COL_ACCENT);
+            const char *msg = "USB Storage Mode";
+            int mw = text_width(msg, TEXT_PX_BODY);
+            draw_text(fb, (FB_W - mw) / 2, FB_H - bh + (bh - TEXT_PX_BODY) / 2 - 2,
+                      msg, COL_BG, TEXT_PX_BODY, FB_W - 24);
         }
         return;
     }
@@ -5865,7 +5906,7 @@ static void draw_screen(uint16_t *fb) {
         draw_text_clip(fb, 24, dy + 26, "disable buttons. Double-press again to undo.", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
 
         ry = set_row_usbbypass_y() - off;
-        int usbbypass_h = set_row_autooff_y() - set_row_usbbypass_y();
+        int usbbypass_h = set_row_btautoplay_y() - set_row_usbbypass_y();
         fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
         draw_text_clip(fb, 24, ry + 20, "USB Transport Mode", COL_TEXT, TEXT_PX_BODY, FB_W - 140, CONTENT_Y, clip_bot);
         draw_toggle_switch_h_clip(fb, ry, usb_bypass_enabled, usbbypass_h, CONTENT_Y, clip_bot);
@@ -5873,6 +5914,16 @@ static void draw_screen(uint16_t *fb) {
         int uy = set_usbbypass_desc_y() - off;
         draw_text_clip(fb, 24, uy, "Disables PEQ/MSEB/Bluetooth and locks volume", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
         draw_text_clip(fb, 24, uy + 26, "at 100% while output is USB. Restored after.", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
+
+        ry = set_row_btautoplay_y() - off;
+        int btautoplay_h = set_row_autooff_y() - set_row_btautoplay_y();
+        fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
+        draw_text_clip(fb, 24, ry + 20, "Play on headset connect", COL_TEXT, TEXT_PX_BODY, FB_W - 140, CONTENT_Y, clip_bot);
+        draw_toggle_switch_h_clip(fb, ry, bt_autoplay_enabled, btautoplay_h, CONTENT_Y, clip_bot);
+
+        int py = set_btautoplay_desc_y() - off;
+        draw_text_clip(fb, 24, py, "Resume playback automatically when a", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
+        draw_text_clip(fb, 24, py + 26, "Bluetooth headset reconnects.", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
 
         ry = set_row_autooff_y() - off;
         int autooff_h = set_row_lighttheme_y() - set_row_autooff_y();
@@ -7529,6 +7580,9 @@ static void load_conf(void) {
         } else if (sscanf(line, "usb_bypass_enabled = %d", &v) == 1 ||
                    sscanf(line, "usb_bypass_enabled=%d", &v) == 1) {
             usb_bypass_enabled = v != 0;
+        } else if (sscanf(line, "bt_autoplay_enabled = %d", &v) == 1 ||
+                   sscanf(line, "bt_autoplay_enabled=%d", &v) == 1) {
+            bt_autoplay_enabled = v != 0;
         } else if (sscanf(line, "theme_mode = %d", &v) == 1 ||
                    sscanf(line, "theme_mode=%d", &v) == 1) {
             if (v >= 0 && v < THEME_MODE_N) theme_mode = v;
@@ -7663,6 +7717,7 @@ static void save_conf(void) {
             if (!conf_line_is(lines[n], "accent_index") &&
                 !conf_line_is(lines[n], "button_lock_enabled") &&
                 !conf_line_is(lines[n], "usb_bypass_enabled") &&
+                !conf_line_is(lines[n], "bt_autoplay_enabled") &&
                 !conf_line_is(lines[n], "light_theme") &&
                 !conf_line_is(lines[n], "theme_mode") &&
                 !conf_line_is(lines[n], "tz_index") &&
@@ -7688,6 +7743,7 @@ static void save_conf(void) {
     fprintf(f, "accent_index = %d\n", g_accent_idx);
     fprintf(f, "button_lock_enabled = %d\n", button_lock_enabled);
     fprintf(f, "usb_bypass_enabled = %d\n", usb_bypass_enabled);
+    fprintf(f, "bt_autoplay_enabled = %d\n", bt_autoplay_enabled);
     fprintf(f, "theme_mode = %d\n", theme_mode);
     fprintf(f, "tz_index = %d\n", tz_idx);
     fprintf(f, "shuffle_enabled = %d\n", shuffle_enabled);
@@ -9480,6 +9536,7 @@ int music_entry(void *a0, void *a1) {
                 int ry_lock = set_row_lock_y() - off, ry_theme = set_row_theme_y() - off;
                 int ry_usbbypass = set_row_usbbypass_y() - off;
                 int ry_autooff = set_row_autooff_y() - off, ry_about = set_row_about_y() - off;
+                int ry_btautoplay = set_row_btautoplay_y() - off;
                 int ry_lighttheme = set_row_lighttheme_y() - off;
                 int ry_timezone = set_row_timezone_y() - off;
                 int ry_wifi = set_row_wifi_y() - off, ry_bt = set_row_bt_y() - off;
@@ -9496,13 +9553,17 @@ int music_entry(void *a0, void *a1) {
                  * is ignored, only the label works" (the label sits higher,
                  * at ry+20, still inside the shorter ROW_H-based zone). */
                 int lock_h = set_row_usbbypass_y() - set_row_lock_y();
-                int usbbypass_h = set_row_autooff_y() - set_row_usbbypass_y();
+                int usbbypass_h = set_row_btautoplay_y() - set_row_usbbypass_y();
+                int btautoplay_h = set_row_autooff_y() - set_row_btautoplay_y();
                 int autooff_h = set_row_lighttheme_y() - set_row_autooff_y();
                 if (y >= ry_lock && y < ry_lock + lock_h) {
                     button_lock_enabled = !button_lock_enabled;
                     save_conf();
                 } else if (y >= ry_usbbypass && y < ry_usbbypass + usbbypass_h) {
                     usb_bypass_enabled = !usb_bypass_enabled;
+                    save_conf();
+                } else if (y >= ry_btautoplay && y < ry_btautoplay + btautoplay_h) {
+                    bt_autoplay_enabled = !bt_autoplay_enabled;
                     save_conf();
                 } else if (y >= ry_autooff && y < ry_autooff + autooff_h) {
                     /* Cycles rather than opening a picker: six short values,
@@ -9717,16 +9778,19 @@ int music_entry(void *a0, void *a1) {
                 int smooth_row = (y - off_row_base + off) / ROW_H;
                 if (screen == SC_QUEUE && y < CONTENT_Y + QUEUE_SUMMARY_H) smooth_row = -1;
                 if (screen == SC_MENU) {
+                    /* R81: greyed out on the draw side for exactly the same
+                     * condition -- see that comment for why. */
+                    int usb_storage = st_usb_mode() == 1;
                     if (idx >= TOP_N) { /* nothing there */ }
-                    else if (idx == TOP_MUSIC) {
+                    else if (idx == TOP_MUSIC && !usb_storage) {
                         screen = SC_MUSIC_MENU; reset_scroll();
-                    } else if (idx == TOP_AUDIOBOOKS) {
+                    } else if (idx == TOP_AUDIOBOOKS && !usb_storage) {
                         ab_book_n = ab_scan_books(ab_books, AB_MAX_BOOKS);
                         ab_rebuild_rows();
                         screen = SC_AUDIOBOOKS; reset_scroll();
                         total = ab_book_n;
                         mlog("[music] %d audiobooks\n", ab_book_n);
-                    } else if (idx == TOP_PODCASTS) {
+                    } else if (idx == TOP_PODCASTS && !usb_storage) {
                         pod_feed_n = pod_scan_feeds(pod_feeds, POD_MAX_FEEDS);
                         pod_rebuild_rows();
                         screen = SC_PODCASTS; reset_scroll();
@@ -10997,6 +11061,23 @@ int music_entry(void *a0, void *a1) {
          * overnight, never reached the idle path at all. Paused is not
          * playing: the decoder is parked, the PCM has already been handed
          * back, and nothing is going to the amp. */
+        /* R81: a headset connected while this was idle. Only unpauses a track
+         * that is already loaded -- there is no persisted "last played track"
+         * for music (audiobooks and podcasts keep per-file positions; music
+         * keeps neither a queue nor a last track), so after a cold boot there
+         * is genuinely nothing to start. See R82. */
+        if (bt_autoplay_enabled) {
+            pthread_mutex_lock(&bt_lock);
+            int want = bt_autoplay_pending;
+            bt_autoplay_pending = 0;
+            pthread_mutex_unlock(&bt_lock);
+            if (want && audio_is_active() && audio_is_paused()) {
+                audio_toggle();
+                mlog("[music] R81: headset connected, resuming playback\n");
+                dirty = 1;
+            }
+        }
+
         int playing = audio_is_active() && !audio_is_paused();
         if (locked && !playing && sleep_minutes() > 0 && suspend_ok()) {
             if (++sleep_idle >= sleep_minutes() * 60 * 10) {
