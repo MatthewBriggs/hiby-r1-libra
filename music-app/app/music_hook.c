@@ -442,6 +442,51 @@ static void mlog(const char *fmt, ...) {
  * plausibly serves. */
 #define FETCHED_COVER_MAX_DIM 800
 
+/* BG104 follow-up (R85): the same flicker, reported live again -- "high
+ * resolution images lightly flickering". The original fix only pre-shrank
+ * network-fetched covers before they ever reached cover_load()'s own box
+ * filter; a *local* source just as large (a user's own oversized
+ * cover.jpg, or embedded art extracted from the file) went straight in at
+ * full size, hitting the identical box-filter behaviour. Not applied by
+ * overwriting the user's own file in their album folder the way the
+ * fetched path overwrites its own cache copy -- that file is theirs, not
+ * this app's, and shrinking it in place the first time anyone's cover
+ * happened to be large would be a surprising thing for a music player to
+ * do to a library. A real folder image gets copied into this scratch path
+ * first and the copy is what gets shrunk/loaded; embedded art already
+ * lands in ART_SCRATCH (art_candidate()'s own doc comment: rewritten every
+ * time, never the source track file), so it's shrunk in place directly,
+ * same as a freshly-fetched cover already is. */
+#define ART_LOCAL_SCRATCH "/tmp/.music_art_local.jpg"
+
+/* jpg: whatever art_candidate() just handed back -- either ART_SCRATCH
+ * (embedded art, already disposable) or a real file in the album's own
+ * folder. key: unaffected either way, since it's already keyed by track or
+ * folder path, never by which physical file the pixels came from this
+ * time. cover_downscale_max() is cheap to call unconditionally: a header-
+ * only read and an immediate no-op return for anything already within
+ * FETCHED_COVER_MAX_DIM, which is the common case for most covers. */
+static uint16_t *cover_load_capped(const char *jpg, const char *key, int px) {
+    const char *use = jpg;
+    if (strncmp(jpg, "/tmp/", 5) != 0) {
+        FILE *in = fopen(jpg, "rb");
+        if (in) {
+            FILE *out = fopen(ART_LOCAL_SCRATCH, "wb");
+            if (out) {
+                char buf[8192];
+                size_t got;
+                while ((got = fread(buf, 1, sizeof(buf), in)) > 0)
+                    fwrite(buf, 1, got, out);
+                fclose(out);
+                use = ART_LOCAL_SCRATCH;
+            }
+            fclose(in);
+        }
+    }
+    cover_downscale_max(use, FETCHED_COVER_MAX_DIM);
+    return cover_load(use, key, px);
+}
+
 static pthread_mutex_t art_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint16_t *art_bits;            /* ART_PX * ART_PX, or NULL */
 static char      art_want[512];       /* track the loader should be showing */
@@ -610,7 +655,7 @@ static void *art_worker(void *arg) {
         int rc = art_candidate(track, n, jpg, sizeof(jpg), key, sizeof(key), ART_SCRATCH);
         if (rc == -1) break;
         if (rc == ART_SKIP) continue;
-        bits = cover_load(jpg, key, ART_PX);
+        bits = cover_load_capped(jpg, key, ART_PX);
     }
 
     /* R23: every local candidate is exhausted -- try Last.fm first, then
@@ -801,7 +846,7 @@ static void *view_art_worker(void *arg) {
         int rc = art_candidate(track, n, jpg, sizeof(jpg), key, sizeof(key), ART_SCRATCH);
         if (rc == -1) break;
         if (rc == ART_SKIP) continue;
-        bits = cover_load(jpg, key, ART_PX);
+        bits = cover_load_capped(jpg, key, ART_PX);
     }
     /* Same Last.fm-then-Spotify network fallback art_worker() uses, kept
      * in sync deliberately -- an album can be viewed without ever being
@@ -934,6 +979,12 @@ static void *artist_art_worker(void *arg) {
      * network at all, same as any local-file art candidate. */
     struct stat st;
     int have_jpg = stat(jpg, &st) == 0 && st.st_size > 0;
+    /* R85: same box-filter flicker risk as any other large source -- jpg
+     * here is always this app's own ARTIST_CACHE_DIR copy (fetched or
+     * previously cached), never a file the user owns, so shrinking it in
+     * place is exactly what the fetched-cover path already does to its own
+     * cache copy. Cheap no-op for anything already within bounds. */
+    if (have_jpg) cover_downscale_max(jpg, FETCHED_COVER_MAX_DIM);
     if (have_jpg) bits = cover_load(jpg, key, ART_PX);
     if (have_jpg && !bits) {
         /* Cached file exists but doesn't decode -- confirmed live this is
@@ -971,6 +1022,7 @@ static void *artist_art_worker(void *arg) {
                      * a real decode counts as having a photo, and only
                      * that skips the Spotify fallback below. */
                     if (rc & 1) {
+                        cover_downscale_max(jpg, FETCHED_COVER_MAX_DIM);   /* R85 */
                         bits = cover_load(jpg, key, ART_PX);
                         if (bits) got_jpg = 1;
                         else unlink(jpg);
@@ -985,6 +1037,7 @@ static void *artist_art_worker(void *arg) {
             }
             if (!got_jpg && spotify_has_key() &&
                 spotify_fetch_artist_image(artist, jpg) == 0) {
+                cover_downscale_max(jpg, FETCHED_COVER_MAX_DIM);   /* R85 */
                 bits = cover_load(jpg, key, ART_PX);
                 if (bits) got_jpg = 1;
             }
