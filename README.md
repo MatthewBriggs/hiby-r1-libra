@@ -8,34 +8,34 @@ Please note: Libra is entirely written by LLM with extensive human testing. I do
 
 ## Features
 
-**Music features** you would expect - WAV, FLAC, MP3, OGG, M4A, M4B, shuffle, repeat, queues, playlists.
+🎵**Music features** you would expect - WAV, FLAC, MP3, OGG, M4A, M4B, shuffle, repeat, queues, playlists.
 
-**Podcast player** - The original reason I got into this rabbit hole :-) download and play podcasts on the device with syncing, browsing existing podcasts, custom playback speed. More features coming.
+🎙️**Podcast player** - The original reason I got into this rabbit hole :-) download and play podcasts on the device with syncing, browsing existing podcasts, custom playback speed. More features coming.
 
-**Audiobook player** - Mostly feature complete. Chapter selection, playback speed, doubled-up chapter and book seekbars.
+📖**Audiobook player** - Mostly feature complete. Chapter selection, playback speed, doubled-up chapter and book seekbars.
 
-**Radio** - Internet Radio - everything works apart from HLS streams.
+📻**Radio** - Internet Radio - everything works apart from HLS streams.
 
 
-**Automatic cover art download** - From Spotify and LastFM. Artist pictures and Bios as well.
+💿 **Automatic cover art download** - From Spotify and LastFM. Artist pictures and Bios as well.
 
-**Parametric EQ** - With support for 'EqualizerAPO ParametricEq' profiles from autoeq.app! Just pop them on the SD card under 'EQ Profiles'. Includes automatic profile switching for bluetooth headphones.
+🔈 **Parametric EQ** - With support for 'EqualizerAPO ParametricEq' profiles from autoeq.app! Just pop them on the SD card under 'EQ Profiles'. Includes automatic profile switching for bluetooth headphones.
 
-**MSEB** - a workalike replacement for the built-in Hiby MSEB system.
+🔈 **MSEB** - a workalike replacement for the built-in Hiby MSEB system.
 
-**Hold mode** - Double tap the power button to lock the screen and hardware buttons
+🛑 **Hold mode** - Double tap the power button to lock the screen and hardware buttons
 
-**Automatic theme selection** - There are three themes - light, dark and grey. 'Auto' switches between the three depending on your latitude, date and the timezone.
+🌓 **Automatic theme selection** - There are three themes - light, dark and grey. 'Auto' switches between the three depending on your latitude, date and the timezone.
 
-**Resume from shutdown** - Starting from an auto shutdown puts you back where you were (music, book, podcast etc.), connects to bluetooth and optionally restarts playback
+🏃 **Resume from shutdown** - Starting from an auto shutdown puts you back where you were (music, book, podcast etc.), connects to bluetooth and optionally restarts playback
 
-**Miniplayer** - While you are going through menus, a miniplayer will appear at the bottom of the screen (similar to lots of android apps)
+💽 **Miniplayer** - While you are going through menus, a miniplayer will appear at the bottom of the screen (similar to lots of android apps)
 
-**Waveform seekbar** - After the first playthrough, subsequent playthroughs of music files will replace the standard seekbar with a waveform seekbar.
+🏄 **Waveform seekbar** - After the first playthrough, subsequent playthroughs of music files will replace the standard seekbar with a waveform seekbar.
 
-**USB Transport Mode** - Using USB-out for audio automatically disables bluetooth, PEQ, MSEB and locks volume.
+🚚 **USB Transport Mode** - Using USB-out for audio automatically disables bluetooth, PEQ, MSEB and locks volume.
 
-**Custom Kernel** - Currently this means booting is slightly faster - more work being done here.
+🐧 **Custom Kernel** - Currently this means booting is slightly faster - more work being done here.
 
 ## Requirements
 
