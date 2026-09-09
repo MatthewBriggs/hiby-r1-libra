@@ -54,7 +54,7 @@ Please note: Libra is entirely written by LLM with extensive human testing. I do
 
 ## Using it
 
-After installation, add your WiFi credentials, Radio stations, Spotify and LastFM credentials and podcast RSS feeds to **/<your SD Card>/settings.txt** (example provided)
+After installation, add your WiFi credentials, Radio stations, Spotify and LastFM credentials and podcast RSS feeds to **/your SD Card/settings.txt** (example provided)
 
 **Important note:** Yes, this is putting credentials in plain text on an unencrypted device. No, this is not proper security. If your Spotify and LastFM credentials are otherwise used for something important, don't do this. If your WiFi credentials shouldn't be in plain text then you shouldn't put them in stock either (where they are also in plain text).
 
