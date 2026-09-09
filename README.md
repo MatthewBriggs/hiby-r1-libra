@@ -17,6 +17,8 @@ Please note: Libra is entirely written by LLM with extensive human testing. I do
 📻**Radio** - Internet Radio - everything works apart from HLS streams.
 
 
+
+
 💿 **Automatic cover art download** - From Spotify and LastFM. Artist pictures and Bios as well.
 
 🔈 **Parametric EQ** - With support for 'EqualizerAPO ParametricEq' profiles from autoeq.app! Just pop them on the SD card under 'EQ Profiles'. Includes automatic profile switching for bluetooth headphones.
