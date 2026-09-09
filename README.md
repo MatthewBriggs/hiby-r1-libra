@@ -21,7 +21,7 @@ Please note: Libra is entirely written by LLM with extensive human testing. I do
 
 💿 **Automatic cover art download** - From Spotify and LastFM. Artist pictures and Bios as well.
 
-🔈 **Parametric EQ** - With support for 'EqualizerAPO ParametricEq' profiles from autoeq.app! Just pop them on the SD card under 'EQ Profiles'. Includes automatic profile switching for bluetooth headphones.
+🔈 **Parametric EQ** - With support for 'EqualizerAPO ParametricEq' profiles from https://autoeq.app! Just pop them on the SD card under 'EQ Profiles'. Includes automatic profile switching for bluetooth headphones.
 
 🔈 **MSEB** - a workalike replacement for the built-in Hiby MSEB system.
 
