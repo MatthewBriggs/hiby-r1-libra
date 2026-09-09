@@ -67,6 +67,10 @@ TODO
 - Podcasts plays **MP3 only** — no AAC, M4A/M4B, Opus or FLAC episodes.
 - English UI only; German and Swedish coming
 
+## Bugs
+
+- Very much so :-) Yes. Lots. This is a WIP with lots of testing ongoing.
+
 
 ## Licence
 
