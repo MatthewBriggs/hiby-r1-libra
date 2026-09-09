@@ -8,7 +8,8 @@ Please note: Libra is entirely written by LLM with extensive human testing. I do
 
 ## Features
 
-All the music features you would expect - WAV, FLAC, MP3, OGG, M4A, M4B, shuffle, repeat, queues, playlists.
+**Music features** you would expect - WAV, FLAC, MP3, OGG, M4A, M4B, shuffle, repeat, queues, playlists.
+
 **Podcast player** - The original reason I got into this rabbit hole :-) download and play podcasts on the device with syncing, browsing existing podcasts, custom playback speed. More features coming.
 
 **Audiobook player** - Mostly feature complete. Chapter selection, playback speed, doubled-up chapter and book seekbars.
