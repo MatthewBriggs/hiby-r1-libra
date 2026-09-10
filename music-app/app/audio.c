@@ -1176,7 +1176,7 @@ static char bt_mixer[64];
  * audio_bt_volume_service() for why this is needed at all. */
 static int    bt_mixer_misses;
 static time_t bt_mixer_next_try;
-/* BG93: a single failed bt_read_pct() used to clear bt_mixer immediately,
+/* BG93: a single failed bt_read_raw() used to clear bt_mixer immediately,
  * indistinguishable from the headset actually being gone -- and once
  * bt_mixer_misses/next_try above existed, that meant one transient amixer
  * hiccup (a momentary D-Bus timeout, a race with a write that just landed)
@@ -1187,8 +1187,47 @@ static int    bt_read_fail_count;
 #define BT_READ_FAIL_LIMIT 2   /* consecutive failures before treating the
                                  * mixer as actually gone, not just a blip */
 
+/* R90: reported live, twice -- "goes down 5% then back up 1%" on every
+ * press, holding a button not ramping smoothly, and the first press after
+ * connecting landing as a dramatic *increase*. All three trace to the same
+ * root cause: this app tracked Bluetooth volume in percent and asked amixer
+ * to translate that to/from the mixer's real 0-127 AVRCP steps on every
+ * write *and* every read -- two independent roundings, neither reliably
+ * the inverse of the other, so a set-then-read-back round trip routinely
+ * didn't return what was just requested. A tolerance band around the
+ * expected rounding noise was tried first and still wasn't enough to stop
+ * it being visible. Fixed properly instead: track the mixer's own raw
+ * integer directly, step by a raw amount, write the raw integer with
+ * amixer's plain (non-percent) form, and read the raw integer back --
+ * zero rounding anywhere in the loop, so a write and its own readback are
+ * now identical by construction, not just close. g_vol (0-100) still
+ * exists for the on-screen percentage and every other output path's
+ * software-gain use of it; for Bluetooth it is now purely a *display*
+ * conversion of bt_vol_raw, never the value actually being stepped. */
+static int bt_vol_raw = -1;      /* -1 = not yet read this connection */
+static int bt_vol_max  = 127;    /* AVRCP's own range; re-read per mixer in
+                                   * case a future device differs */
+/* How many equal steps a single volume-key press moves across bt_vol_max --
+ * a Settings choice (16/32/64/128), not derived from percent at all. 128 is
+ * the mixer's real per-step resolution; the others are coarser/fewer-taps
+ * options. Persisted by the caller (music_hook.c), not here. */
+static int bt_vol_steps = 32;
+void audio_set_bt_vol_steps(int n) {
+    if (n != 16 && n != 32 && n != 64 && n != 128) n = 32;
+    bt_vol_steps = n;
+}
+int audio_bt_vol_steps(void) { return bt_vol_steps; }
+
+static int bt_raw_to_pct(int raw) {
+    return bt_vol_max > 0 ? (raw * 100 + bt_vol_max / 2) / bt_vol_max : 0;
+}
+static int bt_pct_to_raw(int pct) {
+    return (pct * bt_vol_max + 50) / 100;
+}
+
 static void find_bt_mixer(void) {
     bt_mixer[0] = '\0';
+    bt_vol_raw = -1;
     FILE *p = popen("amixer -D bluealsa scontrols 2>/dev/null", "r");
     if (!p) return;
     char line[256];
@@ -1211,27 +1250,41 @@ static void find_bt_mixer(void) {
     if (!bt_mixer[0]) alog("[audio] bt: no AVRCP mixer control found (amixer -D bluealsa scontrols empty)\n");
 }
 
-static int bt_read_pct(void) {
+/* Reads the control's own raw integer (not the percent amixer derives from
+ * it) -- "Front Left: Playback 65 [51%] ..." -> 65. Also re-reads the
+ * control's own advertised range from its "Limits: Playback 0 - 127" line
+ * when max_out is given, rather than assuming 127 forever: this is what
+ * AVRCP absolute volume specifies and what's been observed live, but
+ * nothing stops a future device or bluealsa version reporting something
+ * else, and trusting its own stated range costs one more sscanf. */
+static int bt_read_raw(int *max_out) {
     if (!bt_mixer[0]) return -1;
     char cmd[192];
     snprintf(cmd, sizeof(cmd), "amixer -D bluealsa sget '%s' 2>/dev/null", bt_mixer);
     FILE *p = popen(cmd, "r");
     if (!p) return -1;
     char line[256];
-    int pct = -1;
+    int raw = -1, max = -1;
     while (fgets(line, sizeof(line), p)) {
-        char *b = strchr(line, '[');
-        if (b && strchr(b, '%')) { pct = atoi(b + 1); break; }
+        int lo, hi;
+        if (sscanf(line, " Limits: Playback %d - %d", &lo, &hi) == 2 && hi > 0)
+            max = hi;
+        char *b = strstr(line, "Playback ");
+        if (b && raw < 0) {
+            int v;
+            if (sscanf(b, "Playback %d [", &v) == 1) raw = v;
+        }
     }
     pclose(p);
-    return pct;
+    if (max_out && max > 0) *max_out = max;
+    return raw;
 }
 
 /* One entry point for a volume change, so the caller does not have to know
  * which route is live. */
-/* Absolute set, for the slider. The wired path scales samples in software; on
- * Bluetooth the headset has a real mixer — a 0-127 one, which is why stepping
- * it in percent lands between its notches and reads back as 13%, 19%, 26%.
+/* Absolute set, for the slider. The wired path scales samples in software;
+ * on Bluetooth the headset has a real mixer, stepped in its own raw units
+ * (see this section's own top comment for why).
  *
  * Neither of these talks to bluealsa directly any more. Both `system()` here
  * and the `popen()` readback are blocking D-Bus round-trips, and the volume
@@ -1246,7 +1299,7 @@ static int bt_read_pct(void) {
  * g_vol update so the display still feels instant. */
 static pthread_mutex_t bt_vol_lock = PTHREAD_MUTEX_INITIALIZER;
 static int bt_vol_pending;            /* 1 = a write is waiting to be applied */
-static int bt_vol_pending_abs;
+static int bt_vol_pending_raw;
 
 /* USB Transport Mode's volume lock -- see audio_set_vol_locked()'s own
  * comment in audio.h. Deliberately doesn't gate audio_set_volume() itself:
@@ -1270,9 +1323,16 @@ void audio_volume_set(int pct) {
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
     if (!audio_using_bt()) { audio_set_volume(pct); return; }
+    int raw = bt_pct_to_raw(pct);
+    if (raw < 0) raw = 0; if (raw > bt_vol_max) raw = bt_vol_max;
+    bt_vol_raw = raw;
     pthread_mutex_lock(&bt_vol_lock);
-    bt_vol_pending = 1; bt_vol_pending_abs = pct;
+    bt_vol_pending = 1; bt_vol_pending_raw = raw;
     pthread_mutex_unlock(&bt_vol_lock);
+    /* The slider asked for this exact percentage -- show it directly
+     * rather than round-tripping through bt_raw_to_pct(), which could
+     * legitimately land one point off given bt_vol_max isn't always a
+     * clean divisor of 100. */
     pthread_mutex_lock(&g_lock); g_vol = pct; pthread_mutex_unlock(&g_lock);
     /* BG94: see audio_volume_step()'s matching comment. */
     if (!bt_mixer[0]) bt_mixer_next_try = 0;
@@ -1287,32 +1347,26 @@ void audio_volume_step(int delta) {
         audio_set_volume(v);
         return;
     }
-    /* g_vol accumulates every press even though the background thread only
-     * drains every ~100ms (BG23) -- several presses easily land inside that
-     * window, and overwriting instead of accumulating dropped all but the
-     * last one from what reached the mixer while g_vol had already counted
-     * them all, which is what "jumps around" originally was.
-     *
-     * What actually got sent to the mixer was a *relative* amixer step
-     * ("+35%"), computed against bluealsa's own current raw value on
-     * whatever internal (likely non-linear/dB) curve it uses -- not against
-     * g_vol's clean linear accumulation. Batching several quick presses
-     * into one big relative jump could land on a very different raw value
-     * than doing them one at a time would have: confirmed live, seven
-     * presses accumulating to g_vol=100 sent as a single "35%+" read back
-     * at 65%, an outright drop after raising the volume -- "two volume
-     * controls" disagreeing, exactly as reported. Pushing g_vol's own
-     * already-correct absolute value as the target instead keeps the same
-     * coalescing (multiple presses before a drain still collapse into one
-     * write) but the real mixer can never diverge from what's on screen,
-     * whatever its own step curve does internally. */
+    /* R90: the step size is bt_vol_max/bt_vol_steps raw units -- a user
+     * Settings choice, not derived from `delta` (still ±5, the same call
+     * every other output path uses; only its *sign* matters here). A
+     * fresh connection with no raw reading yet (-1) starts from whatever
+     * g_vol last showed, converted once -- the best available guess until
+     * the next mixer discovery corrects it for real (see
+     * audio_bt_volume_service()). Base state is bt_vol_raw itself, not a
+     * value re-derived from g_vol every press: g_vol accumulating a
+     * fractional raw step every time it got converted back and forth was
+     * exactly the old bug. */
+    int base = bt_vol_raw >= 0 ? bt_vol_raw : bt_pct_to_raw(audio_volume());
+    int step = bt_vol_max / bt_vol_steps; if (step < 1) step = 1;
+    int raw = base + (delta > 0 ? step : delta < 0 ? -step : 0);
+    if (raw < 0) raw = 0; if (raw > bt_vol_max) raw = bt_vol_max;
+    bt_vol_raw = raw;
     pthread_mutex_lock(&g_lock);
-    int v = g_vol + delta;
-    if (v < 0) v = 0; if (v > 100) v = 100;
-    g_vol = v;
+    g_vol = bt_raw_to_pct(raw);
     pthread_mutex_unlock(&g_lock);
     pthread_mutex_lock(&bt_vol_lock);
-    bt_vol_pending = 1; bt_vol_pending_abs = v;
+    bt_vol_pending = 1; bt_vol_pending_raw = raw;
     pthread_mutex_unlock(&bt_vol_lock);
     /* BG94: reported as hardware volume buttons lagging several seconds
      * behind a press, sometimes matching the on-screen slider and sometimes
@@ -1345,16 +1399,20 @@ int audio_bt_volume_pending(void) {
  * then always reads back — both because the headset's own buttons move the
  * mixer without a key event reaching this app at all (bluealsa applies
  * --a2dp-volume directly), and because a step or set may have landed between
- * a notch, and g_vol should show what actually took, not the request. */
+ * a notch, and g_vol should show what actually took, not the request. Both
+ * the write and the readback are the mixer's own raw integer now (see this
+ * section's own top comment) -- no percent conversion anywhere in this
+ * round trip, so a write this app just made and its own readback are
+ * identical by construction, not merely close. */
 void audio_bt_volume_service(void) {
     if (!audio_using_bt()) {
         bt_mixer_misses = 0; bt_mixer_next_try = 0; bt_read_fail_count = 0;
         return;
     }
 
-    int pending, abs_val;
+    int pending, raw_val;
     pthread_mutex_lock(&bt_vol_lock);
-    pending = bt_vol_pending; abs_val = bt_vol_pending_abs;
+    pending = bt_vol_pending; raw_val = bt_vol_pending_raw;
     bt_vol_pending = 0;
     pthread_mutex_unlock(&bt_vol_lock);
 
@@ -1383,6 +1441,30 @@ void audio_bt_volume_service(void) {
             } else {
                 bt_mixer_misses = 0; bt_mixer_next_try = 0;
                 bt_read_fail_count = 0;
+                /* R90: reported live as the first volume-down press after
+                 * connecting a Jabra Elite 4 Active landing as a dramatic
+                 * *increase* instead. This control was just discovered --
+                 * never read from yet -- and any write already queued while
+                 * it was still unknown (bt_vol_pending, e.g. from a button
+                 * pressed in the couple of seconds before AVRCP negotiated)
+                 * was computed against whatever g_vol happened to be left
+                 * over from before this headset connected, not this
+                 * headset's own actual current volume. Sync to reality
+                 * first and apply the pending write next tick (still
+                 * queued, ~100ms away, not lost) against a mixer this
+                 * function has actually read from at least once, rather
+                 * than writing blind to a control with an unconfirmed
+                 * range/current value. */
+                int max = bt_vol_max;
+                int fresh = bt_read_raw(&max);
+                if (fresh >= 0) {
+                    bt_vol_max = max;
+                    bt_vol_raw = fresh;
+                    pthread_mutex_lock(&g_lock);
+                    g_vol = bt_raw_to_pct(fresh);
+                    pthread_mutex_unlock(&g_lock);
+                }
+                return;
             }
         }
     }
@@ -1393,14 +1475,16 @@ void audio_bt_volume_service(void) {
         /* Always an absolute target, never a relative step -- see
          * audio_volume_step()'s comment for why a batched relative step
          * against the mixer's own current value could disagree with g_vol
-         * by tens of percent. */
-        snprintf(cmd, sizeof(cmd), "amixer -D bluealsa sset '%s' %d%% >/dev/null 2>&1",
-                 bt_mixer, abs_val);
+         * by tens of percent. Plain integer, not "N%" -- see this
+         * section's own top comment for why. */
+        snprintf(cmd, sizeof(cmd), "amixer -D bluealsa sset '%s' %d >/dev/null 2>&1",
+                 bt_mixer, raw_val);
         if (system(cmd) == -1) return;
     }
 
-    int pct = bt_read_pct();
-    if (pct < 0) {
+    int max = bt_vol_max;
+    int raw = bt_read_raw(&max);
+    if (raw < 0) {
         /* BG93: one failed read no longer means "gone" -- only
          * BT_READ_FAIL_LIMIT in a row does, so a lone transient hiccup
          * costs nothing beyond skipping this poll's g_vol readback. */
@@ -1411,8 +1495,10 @@ void audio_bt_volume_service(void) {
         return;
     }
     bt_read_fail_count = 0;
+    bt_vol_max = max;
+    bt_vol_raw = raw;
     pthread_mutex_lock(&g_lock);
-    g_vol = pct;
+    g_vol = bt_raw_to_pct(raw);
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -1770,11 +1856,14 @@ static void apply_decode_priority(void) {
  * much. Pulled out into one shared call so that stops being possible. */
 static void bt_repush_volume(void) {
     if (g_out_kind != 2) return;
-    pthread_mutex_lock(&g_lock);
-    int cur_vol = g_vol;
-    pthread_mutex_unlock(&g_lock);
+    /* R90: bt_vol_raw is this app's own last-known raw setting -- reuse it
+     * directly rather than converting g_vol (percent) back to raw, the
+     * same "never round-trip through percent" reasoning as everywhere else
+     * in this file now. Falls back to converting g_vol only on a fresh
+     * connection that hasn't read a raw value yet at all. */
+    int raw = bt_vol_raw >= 0 ? bt_vol_raw : bt_pct_to_raw(audio_volume());
     pthread_mutex_lock(&bt_vol_lock);
-    bt_vol_pending = 1; bt_vol_pending_abs = cur_vol;
+    bt_vol_pending = 1; bt_vol_pending_raw = raw;
     pthread_mutex_unlock(&bt_vol_lock);
 }
 

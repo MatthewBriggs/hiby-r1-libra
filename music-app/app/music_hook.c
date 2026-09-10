@@ -1831,6 +1831,17 @@ static const int AUTO_OFF_CHOICES[] = { 0, 5, 15, 30, 60, 120 };
 static int auto_off_idx;                        /* index into AUTO_OFF_CHOICES */
 static int auto_off_minutes(void) { return AUTO_OFF_CHOICES[auto_off_idx]; }
 
+/* R90: how many equal steps a Bluetooth volume-key press moves across the
+ * AVRCP mixer's own 0-127 range -- see audio_set_bt_vol_steps()'s own
+ * comment in audio.h/audio.c for why this exists at all (in short: the app
+ * used to step in percent and let amixer convert to/from raw on every
+ * write and read, which is where the "down 5%, back up 1%" bug came from).
+ * Index into BT_VOL_STEP_CHOICES, same cycle-on-tap shape as Auto shutdown
+ * just below it. */
+static const int BT_VOL_STEP_CHOICES[] = { 16, 32, 64, 128 };
+#define BT_VOL_STEP_CHOICE_N ((int)(sizeof(BT_VOL_STEP_CHOICES) / sizeof(BT_VOL_STEP_CHOICES[0])))
+static int bt_vol_step_idx = 1;   /* index into BT_VOL_STEP_CHOICES -- default 32 */
+
 /* SC_SETTINGS's rows, same reason. */
 /* The +40 below each description used to be the gap before the *next row's
  * title*, back when the divider sat above the description instead of below
@@ -1856,7 +1867,12 @@ static int set_usbbypass_desc_y(void) { return set_row_usbbypass_y() + ROW_H; }
  * rather than a plain ROW_H row. */
 static int set_row_btautoplay_y(void)  { return set_usbbypass_desc_y() + 64; }
 static int set_btautoplay_desc_y(void) { return set_row_btautoplay_y() + ROW_H; }
-static int set_row_autooff_y(void)  { return set_btautoplay_desc_y() + 64; }
+/* R90: plain ROW_H row, no description -- "16/32/64/128" reads for itself
+ * once picked, same as Theme/Timezone below. Grouped with the other
+ * Bluetooth-specific row (Auto-play) above it rather than down with the
+ * unrelated appearance rows. */
+static int set_row_btvolsteps_y(void) { return set_btautoplay_desc_y() + ROW_H; }
+static int set_row_autooff_y(void)  { return set_row_btvolsteps_y() + ROW_H; }
 static int set_autooff_desc_y(void) { return set_row_autooff_y() + ROW_H; }
 /* R41: no description under this one -- "Light theme" needs no explaining
  * the way the toggles above did, so it's a plain ROW_H row like Accent
@@ -6156,10 +6172,10 @@ static void draw_screen(uint16_t *fb) {
 
         int uy = set_usbbypass_desc_y() - off;
         draw_text_clip(fb, 24, uy, "Disables PEQ/MSEB/Bluetooth and locks volume", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
-        draw_text_clip(fb, 24, uy + 26, "at 100% while output is USB. Restored after.", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
+        draw_text_clip(fb, 24, uy + 26, "at 50% while output is USB. Restored after.", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
 
         ry = set_row_btautoplay_y() - off;
-        int btautoplay_h = set_row_autooff_y() - set_row_btautoplay_y();
+        int btautoplay_h = set_row_btvolsteps_y() - set_row_btautoplay_y();
         fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
         draw_text_clip(fb, 24, ry + 20, "Play on headset connect", COL_TEXT, TEXT_PX_BODY, FB_W - 140, CONTENT_Y, clip_bot);
         draw_toggle_switch_h_clip(fb, ry, bt_autoplay_enabled, btautoplay_h, CONTENT_Y, clip_bot);
@@ -6167,6 +6183,12 @@ static void draw_screen(uint16_t *fb) {
         int py = set_btautoplay_desc_y() - off;
         draw_text_clip(fb, 24, py, "Resume playback automatically when a", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
         draw_text_clip(fb, 24, py + 26, "Bluetooth headset reconnects.", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
+
+        ry = set_row_btvolsteps_y() - off;
+        fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
+        draw_text_clip(fb, 24, ry + 20, "Bluetooth volume steps", COL_TEXT, TEXT_PX_BODY, FB_W - 200, CONTENT_Y, clip_bot);
+        snprintf(buf, sizeof(buf), "%d", audio_bt_vol_steps());
+        draw_right_col_clip(fb, ry + ROW_H / 2 - TEXT_PX_SMALL / 2, buf, COL_ACCENT, CONTENT_Y, clip_bot);
 
         ry = set_row_autooff_y() - off;
         int autooff_h = set_row_lighttheme_y() - set_row_autooff_y();
@@ -7982,6 +8004,11 @@ static void load_conf(void) {
                    sscanf(line, "auto_off_minutes=%d", &v) == 1) {
             for (int i = 0; i < AUTO_OFF_CHOICE_N; i++)
                 if (AUTO_OFF_CHOICES[i] == v) { auto_off_idx = i; break; }
+        } else if (sscanf(line, "bt_vol_steps = %d", &v) == 1 ||
+                   sscanf(line, "bt_vol_steps=%d", &v) == 1) {
+            for (int i = 0; i < BT_VOL_STEP_CHOICE_N; i++)
+                if (BT_VOL_STEP_CHOICES[i] == v) { bt_vol_step_idx = i; break; }
+            audio_set_bt_vol_steps(BT_VOL_STEP_CHOICES[bt_vol_step_idx]);
         } else if (sscanf(line, "eq_on = %d", &v) == 1 ||
                    sscanf(line, "eq_on=%d", &v) == 1) {
             eq_on_saved = v != 0;
@@ -8085,6 +8112,7 @@ static void save_conf(void) {
                 !conf_line_is(lines[n], "deep_sleep") &&
                 !conf_line_is(lines[n], "sleep_minutes") &&
                 !conf_line_is(lines[n], "auto_off_minutes") &&
+                !conf_line_is(lines[n], "bt_vol_steps") &&
                 !conf_line_is(lines[n], "eq_on") &&
                 !conf_line_is(lines[n], "eq_profile_path") &&
                 !conf_line_is(lines[n], "wifi_enabled") &&
@@ -8110,6 +8138,7 @@ static void save_conf(void) {
     fprintf(f, "sleep_minutes = %d\n", sleep_minutes());
     fprintf(f, "deep_sleep = %d\n", deep_sleep_enabled);
     fprintf(f, "auto_off_minutes = %d\n", auto_off_minutes());
+    fprintf(f, "bt_vol_steps = %d\n", audio_bt_vol_steps());
     /* BG38 */
     fprintf(f, "eq_on = %d\n", eq_enabled());
     if (eq_cur_path[0]) fprintf(f, "eq_profile_path = %s\n", eq_cur_path);
@@ -9905,6 +9934,7 @@ int music_entry(void *a0, void *a1) {
                 int ry_usbbypass = set_row_usbbypass_y() - off;
                 int ry_autooff = set_row_autooff_y() - off, ry_about = set_row_about_y() - off;
                 int ry_btautoplay = set_row_btautoplay_y() - off;
+                int ry_btvolsteps = set_row_btvolsteps_y() - off;
                 int ry_lighttheme = set_row_lighttheme_y() - off;
                 int ry_timezone = set_row_timezone_y() - off;
                 int ry_wifi = set_row_wifi_y() - off, ry_bt = set_row_bt_y() - off;
@@ -9922,7 +9952,7 @@ int music_entry(void *a0, void *a1) {
                  * at ry+20, still inside the shorter ROW_H-based zone). */
                 int lock_h = set_row_usbbypass_y() - set_row_lock_y();
                 int usbbypass_h = set_row_btautoplay_y() - set_row_usbbypass_y();
-                int btautoplay_h = set_row_autooff_y() - set_row_btautoplay_y();
+                int btautoplay_h = set_row_btvolsteps_y() - set_row_btautoplay_y();
                 int autooff_h = set_row_lighttheme_y() - set_row_autooff_y();
                 if (y >= ry_lock && y < ry_lock + lock_h) {
                     button_lock_enabled = !button_lock_enabled;
@@ -9932,6 +9962,10 @@ int music_entry(void *a0, void *a1) {
                     save_conf();
                 } else if (y >= ry_btautoplay && y < ry_btautoplay + btautoplay_h) {
                     bt_autoplay_enabled = !bt_autoplay_enabled;
+                    save_conf();
+                } else if (y >= ry_btvolsteps && y < ry_btvolsteps + ROW_H) {
+                    bt_vol_step_idx = (bt_vol_step_idx + 1) % BT_VOL_STEP_CHOICE_N;
+                    audio_set_bt_vol_steps(BT_VOL_STEP_CHOICES[bt_vol_step_idx]);
                     save_conf();
                 } else if (y >= ry_autooff && y < ry_autooff + autooff_h) {
                     /* Cycles rather than opening a picker: six short values,

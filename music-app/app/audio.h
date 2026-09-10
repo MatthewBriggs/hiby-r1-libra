@@ -51,6 +51,14 @@ void audio_set_volume(int pct);
 int  audio_volume(void);
 void audio_volume_step(int delta);   /* routes to the BT mixer or software */
 void audio_volume_set(int pct);      /* absolute, for the slider */
+/* R90: how many equal steps a single volume-key press moves across the BT
+ * mixer's own native 0-127 range -- 16/32/64/128 are the only valid values
+ * (128 is the mixer's real per-step resolution; the others are coarser,
+ * fewer-taps-to-full-range options). Off Bluetooth this has no effect: the
+ * wired path's software gain has never used amixer or percent rounding.
+ * Default 32 if never set. */
+void audio_set_bt_vol_steps(int n);
+int  audio_bt_vol_steps(void);
 int  audio_using_bt(void);
 int  audio_using_usb(void);
 /* Settings' "disable PEQ, MSEB and Bluetooth when playing over USB" -- skips

@@ -110,6 +110,7 @@ static const char *SCHEMA_SQL =
 static volatile int g_scan_started, g_scan_running;
 static volatile int g_scanned, g_written;
 static volatile int g_kick;
+static volatile int g_usb_paused;
 
 int scanner_scan_running(void) { return g_scan_running; }
 
@@ -189,6 +190,15 @@ static int scan_one(sqlite3 *widb, const char *real, const struct stat *st) {
     char album_artist[LIB_NAME_LEN], genre[LIB_NAME_LEN];
     tag_read_meta(real, artist, sizeof(artist), album, sizeof(album),
                  album_artist, sizeof(album_artist), genre, sizeof(genre));
+    /* R91: a loose file with no album tag at all (a stray radio-show rip
+     * sitting at the card root, reported live as "won't show up in Music")
+     * indexed with album="", which groups (correctly, by SQL's own rules)
+     * with every other untagged file into an entry with no visible label --
+     * sorts first alphabetically and is trivially easy to mistake for
+     * nothing being there, which is exactly what happened. A named bucket
+     * is reachable and self-explanatory the same way "no album" fallbacks
+     * work in most other music apps. */
+    if (!album[0]) snprintf(album, sizeof(album), "Unknown Album");
     /* Title tag when the container states one (currently FLAC only -- see
      * tag_title()'s own comment); the filename otherwise, same fallback
      * library.c itself reaches for reading a track the index never saw. */
@@ -241,10 +251,12 @@ static int scan_one(sqlite3 *widb, const char *real, const struct stat *st) {
  * (an episode or chapter showing up as a plain "track"), not to describe
  * one specific folder layout. */
 static void scan_dir(sqlite3 *widb, const char *dir, int *batch) {
+    if (g_usb_paused) return;
     DIR *d = opendir(dir);
     if (!d) return;
     struct dirent *e;
     while ((e = readdir(d)) != NULL) {
+        if (g_usb_paused) break;
         if (e->d_name[0] == '.') continue;
         char full[LIB_PATH_LEN];
         snprintf(full, sizeof(full), "%s/%s", dir, e->d_name);
@@ -350,7 +362,12 @@ void scanner_scan_start(void) {
  * deliberate and cheap -- see index.c's own scan_one(), an unchanged file
  * is one indexed lookup, not a re-read. */
 void scanner_rescan_now(void) {
+    if (g_usb_paused) return;
     scanner_scan_start();
     g_kick = 1;
     index_rescan_now();
+}
+
+void scanner_pause_for_usb(int paused) {
+    g_usb_paused = paused != 0;
 }
