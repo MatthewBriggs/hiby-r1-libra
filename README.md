@@ -4,7 +4,7 @@ An alternative firmware for the Hiby R1.
 
 The aim is to create a completely open soure firmware for the R1 from the kernel upwards that is faster and includes QoL features.
 
-Please note: Libra is entirely written by LLM with extensive human testing. I don't know C, but he is does have strong opinions on QA and how the firmware should work.
+Please note: Libra is entirely written by LLM with extensive human testing. I don't know C, but I do have strong opinions on QA and how the firmware should work.
 
 ## Features
 
