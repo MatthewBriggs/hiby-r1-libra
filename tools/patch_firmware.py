@@ -740,6 +740,79 @@ def disable_hgl(root):
     return True
 
 
+# RP-follow-up, live measurement 2026-09-10: hiby_player itself and the
+# stock assets only it ever drew are dead weight in a standalone build, same
+# reasoning as HGL above -- confirmed by cross-referencing `strings` on
+# every binary/script that still runs (bt_init, bt_resume, wifi_on.sh,
+# library_standalone itself) against usr/resource: nothing outside
+# hiby_player references usr/resource/fonts/default.otf (8.3MB, the stock
+# UI's own font -- Library draws its own bitmap font) or Thai.ttf (30KB).
+# Korean.ttf and msyh.ttf ARE kept -- library_standalone's own strings
+# reference them directly as CJK fallback glyphs. Of litegui's 10.7MB
+# (theme1/theme2/midi), only four files are ever touched by anything that
+# still runs: theme1 and theme2's launcher/about.png + about_s.png, and
+# only as shadow_resources()'s own bind-mount *targets* -- their content is
+# replaced by that mount, so an empty placeholder at the same path is all a
+# mount point needs. dmrd (72KB, DLNA renderer) is not started by any
+# init.d script -- confirmed by grepping all of them -- and the
+# usr/resource/upnp/ icons it would have used do not even exist on this
+# rootfs, so it has literally never been reachable.
+LITEGUI_DIR = "usr/resource/litegui"
+LITEGUI_KEEP = [  # shadow_resources()'s own bind-mount targets -- content
+    "litegui/theme1/launcher/about.png",     # is irrelevant, only the path
+    "litegui/theme1/launcher/about_s.png",   # needs to exist for the mount
+    "litegui/theme2/launcher/about.png",     # call in music_hook.c to
+    "litegui/theme2/launcher/about_s.png",   # succeed.
+]
+UNUSED_FONTS = ["usr/resource/fonts/default.otf", "usr/resource/fonts/Thai.ttf"]
+UNUSED_BINARIES = ["usr/bin/hiby_player", "usr/bin/dmrd"]
+
+
+def strip_unused_resources(root):
+    """Delete hiby_player, its stock-only fonts, and all of litegui except
+    the four files shadow_resources() bind-mounts over. Standalone builds
+    only -- see this module's own comment for why each is safe. Returns
+    (files_removed, bytes_freed)."""
+    n, freed = 0, 0
+
+    def rm(rel):
+        nonlocal n, freed
+        path = os.path.join(root, rel)
+        if os.path.exists(path):
+            freed += os.path.getsize(path)
+            os.remove(path)
+            n += 1
+
+    for rel in UNUSED_FONTS + UNUSED_BINARIES:
+        rm(rel)
+
+    litegui = os.path.join(root, LITEGUI_DIR)
+    if os.path.isdir(litegui):
+        keep = {os.path.join(root, "usr/resource", p) for p in LITEGUI_KEEP}
+        for dirpath, _, filenames in os.walk(litegui):
+            for name in filenames:
+                path = os.path.join(dirpath, name)
+                if path not in keep:
+                    freed += os.path.getsize(path)
+                    os.remove(path)
+                    n += 1
+        # Prune whatever directories that emptied out, deepest first, but
+        # never the four kept files' own parents.
+        keep_dirs = {os.path.dirname(p) for p in keep}
+        for dirpath, dirnames, filenames in os.walk(litegui, topdown=False):
+            if dirpath in keep_dirs or dirpath == litegui:
+                continue
+            if not os.listdir(dirpath):
+                os.rmdir(dirpath)
+        for rel in LITEGUI_KEEP:
+            path = os.path.join(root, "usr/resource", rel)
+            if not os.path.exists(path):
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                open(path, "wb").close()
+
+    return n, freed
+
+
 def install_brcmfmac_firmware(root):
     """Copy the vendor WiFi firmware to the names mainline brcmfmac looks for.
 
@@ -1731,6 +1804,166 @@ def enable_rtc32k_at_boot(root):
         fh.write(t)
     return True
 
+
+RAIL_BLOCK = """# --- Power WL_REG_ON before soc_msc probes mmc0 --------------------------
+# mmc0 is non-removable, so the MMC core scans it ONCE at host probe and never
+# rescans. If the combo chip is not powered by then, the SDIO card never
+# enumerates and brcmfmac has nothing to bind to -- measured on BRCM_5:
+# soc_msc accepted wifi_reg_on=PB03 but never claimed the pin (gpio35 stayed
+# exportable) and mmc0 enumerated no card at all, while mmc1 (the SD card) was
+# fine. cywdhd used to do this itself, which is why removing it broke
+# enumeration rather than just the driver binding.
+#
+# Placed after soc_gpio.sh so the GPIO banks exist, and before soc_msc.sh.
+_wl_power_on() {
+    W=35                      # WL_REG_ON = PB03, bank B starts at 32
+    [ -d /sys/class/gpio/gpio$W ] || echo $W > /sys/class/gpio/export 2>/dev/null
+    [ -d /sys/class/gpio/gpio$W ] || return 1
+    echo out > /sys/class/gpio/gpio$W/direction 2>/dev/null
+    echo 0 > /sys/class/gpio/gpio$W/value 2>/dev/null
+    usleep 200000
+    echo 1 > /sys/class/gpio/gpio$W/value 2>/dev/null
+    usleep 300000
+}
+_wl_power_on
+"""
+
+
+BRCM_MODULES = ("brcmutil.ko", "brcmfmac.ko")
+BRCM_FIRMWARE = ("brcmfmac43430-sdio.bin", "brcmfmac43430-sdio.txt")
+
+
+def switch_to_brcmfmac(root, modules_dir, firmware_dir):
+    """Replace cywdhd with mainline brcmfmac. docs/10 step 3.
+
+    Four changes, all in the rootfs -- no kernel rebuild:
+
+    1. soc_msc gets wifi_reg_on=PB03. This is the crux. cywdhd owns WL_REG_ON
+       today (its own gpio_wlan_reg_on=PB03), which is why brcmfmac probes
+       -1 the moment cywdhd is gone: nothing powers the chip. soc_msc -- the
+       SDIO glue, not the blob -- exposes wifi_reg_on/wifi_power_on module
+       parameters, both -1 (unset) as shipped. Setting it makes the glue own
+       the rail, which is the mainline mmc-pwrseq-simple arrangement in all
+       but name.
+
+       mmc-pwrseq-simple itself cannot be used: it attaches via the host's
+       of_node, and module_drivers registers its devices from its own parsed
+       tree with platform_data instead (md_ingenic,mmc.0 has NO of_node --
+       checked on hardware; the msc@ DT nodes are status="disable"). So the
+       DT-only route recorded earlier in docs/10 does not exist.
+
+    2. cywdhd is not loaded.
+    3. brcmutil.ko + brcmfmac.ko are installed and loaded in its place.
+    4. Firmware goes to /lib/firmware/brcm/ under the names mainline asks for
+       -- a rename of the vendor blobs, verified compatible on hardware.
+
+    Bluetooth then depends on the bt_power driver in the BTPWR kernels, which
+    could not power the chip while cywdhd was present. Whether it can once
+    cywdhd is gone and soc_msc holds WL_REG_ON is exactly what this build
+    tests; it is not a promise.
+    """
+    init = os.path.join(root, MODULE_INIT_SCRIPT)
+    msc = os.path.join(root, "module_driver/soc_msc.sh")
+    if not (os.path.exists(init) and os.path.exists(msc)):
+        return "missing module_driver scripts"
+
+    # 1. soc_msc owns WL_REG_ON
+    with open(msc) as fh:
+        t = fh.read()
+    # The script already passes these, defaulted to -1 (unset), so EDIT them
+    # rather than appending. An earlier version guarded on "wifi_reg_on=" being
+    # absent and therefore silently did nothing -- the shipped default matched.
+    if "wifi_reg_on=PB03" not in t:
+        if "wifi_reg_on=-1" not in t:
+            return "no wifi_reg_on=-1 to set (soc_msc.sh has changed shape)"
+        t = t.replace("wifi_reg_on=-1", "wifi_reg_on=PB03", 1)
+        t = t.replace("wifi_reg_on_level=0", "wifi_reg_on_level=1", 1)
+        with open(msc, "w") as fh:
+            fh.write(t)
+
+    # 1b. Power the rail before soc_msc probes mmc0.
+    with open(init) as fh:
+        t = fh.read()
+    if "_wl_power_on" not in t:
+        anchor = "sh soc_gpio.sh\n"
+        if t.count(anchor) != 1:
+            return "no 'sh soc_gpio.sh' line to anchor the rail power-up"
+        t = t.replace(anchor, anchor + RAIL_BLOCK, 1)
+        with open(init, "w") as fh:
+            fh.write(t)
+
+    # 2 + 3. cywdhd out, brcmfmac in
+    with open(init) as fh:
+        t = fh.read()
+    if "sh cywdhd.sh" not in t:
+        return "no cywdhd load line found"
+    t = t.replace("sh cywdhd.sh &",
+                  "# cywdhd REPLACED by mainline brcmfmac -- docs/10 step 3\n"
+                  "sh brcmfmac.sh &", 1)
+    t = t.replace("sh cywdhd.sh",
+                  "# cywdhd REPLACED by mainline brcmfmac -- docs/10 step 3\n"
+                  "sh brcmfmac.sh", 1)
+    with open(init, "w") as fh:
+        fh.write(t)
+
+    loader = os.path.join(root, "module_driver/brcmfmac.sh")
+    with open(loader, "w") as fh:
+        fh.write("insmod brcmutil.ko\n"
+                 "insmod brcmfmac.ko\n")
+    os.chmod(loader, 0o755)
+
+    # modules alongside the vendor ones
+    for m in BRCM_MODULES:
+        src = os.path.join(modules_dir, m)
+        if not os.path.exists(src):
+            return f"missing {src}"
+        shutil.copy2(src, os.path.join(root, "module_driver", m))
+
+    # 4. firmware under mainline's names
+    fwdir = os.path.join(root, "lib/firmware/brcm")
+    os.makedirs(fwdir, exist_ok=True)
+    for f in BRCM_FIRMWARE:
+        src = os.path.join(firmware_dir, f)
+        if not os.path.exists(src):
+            return f"missing {src}"
+        shutil.copy2(src, os.path.join(fwdir, f))
+    return None
+
+
+def bt_enable_ssp(text):
+    """Assert Simple Pairing Mode before anything can pair.
+
+    Reported against an earlier base: pairing with SSP-only peripherals (a FiiO
+    BTR17) failed with Auth Complete: Pairing Not Allowed (0x18) because the
+    controller had SSP disabled and bluez fell back to legacy PIN pairing.
+
+    NOT reproducible on this base, checked 2026-09-10 on hardware:
+      * Read Simple Pairing Mode (0x03/0x0055) returns 01 on a cold boot.
+      * It stays 01 across `hciconfig hci0 reset` -- bluez 5.54 re-applies it.
+      * The BTR17's stored record is [LinkKey] Type=4, PINLength=0, i.e. an
+        authenticated SSP key, so it did pair over SSP.
+    Most likely already fixed as a side effect of keeping the radio powered
+    (bt_keep_powered_when_enabled) instead of powering it off and back on.
+
+    Added anyway because it is idempotent, costs one HCI command, and makes the
+    guarantee explicit rather than dependent on bluez's timing. Placed AFTER the
+    HCI reset -- a reset returns the controller to defaults, so writing it
+    earlier would be undone -- and before bt-agent, so nothing can pair first.
+
+    Returns the new text, or None if the anchor is missing.
+    """
+    if "0x0056" in text:
+        return None
+    anchor = "bt-agent -c NoInputNoOutput &\n"
+    if text.count(anchor) != 1:
+        return None
+    block = ("# Write Simple Pairing Mode = enabled (OGF 0x03, OCF 0x0056).\n"
+             "# After the reset above, which would clear it; before bt-agent,\n"
+             "# so no pairing can be attempted with SSP still off.\n"
+             "hcitool cmd 0x03 0x0056 0x01 >/dev/null 2>&1\n"
+             + anchor)
+    return text.replace(anchor, block, 1)
+
 def hasten_bt_init(root):
     """Move bt_init from S80 to S22, so its fixed cost overlaps the rest of boot.
 
@@ -2108,6 +2341,12 @@ def main():
                          "stamped alongside the embedded binary and compared "
                          "against /usr/data's own marker at boot to decide "
                          "whether to copy it in.")
+    ap.add_argument("--brcmfmac-switch", metavar="MODULES_DIR",
+                    help="replace cywdhd with mainline brcmfmac (docs/10 step 3). "
+                         "MODULES_DIR must hold brcmutil.ko and brcmfmac.ko; "
+                         "firmware is taken from --brcm-firmware.")
+    ap.add_argument("--brcm-firmware", metavar="DIR",
+                    help="directory holding brcmfmac43430-sdio.bin/.txt")
     ap.add_argument("--bt-gpio-test", action="store_true",
                     help="EXPERIMENT: power the BT radio by driving PB04 from "
                          "userspace instead of waiting for cywdhd's rfkill0, "
@@ -2290,6 +2529,11 @@ def main():
             nfw = install_brcmfmac_firmware(root)
             if nfw:
                 print(f"installed {nfw} brcmfmac firmware file(s) under lib/firmware/brcm/")
+            sn, sbytes = strip_unused_resources(root)
+            if sn:
+                print(f"stripped {sn} unused stock file(s) "
+                      f"({sbytes / 1024 / 1024:.1f}MB) -- hiby_player, dmrd, "
+                      f"stock-only fonts, unused litegui assets")
             if args.background_touch:
                 if background_touch_module(root):
                     print("backgrounded the touchscreen module load (~0.3s) — "
@@ -2330,6 +2574,14 @@ def main():
             if nt:
                 print(f"instrumented {BT_INIT} with {nt} boot-time stamps "
                       f"-> /usr/data/btboot.log")
+
+            if args.brcmfmac_switch:
+                err = switch_to_brcmfmac(root, args.brcmfmac_switch,
+                                         args.brcm_firmware or args.brcmfmac_switch)
+                if err:
+                    die(f"--brcmfmac-switch: {err}")
+                print("patched module_driver (cywdhd -> mainline brcmfmac; "
+                      "soc_msc wifi_reg_on=PB03)")
 
             if enable_rtc32k_at_boot(root):
                 print("patched module_driver/soc_utils.sh (rtc32k_init_on=1: "
@@ -2420,6 +2672,16 @@ def main():
                 bpatched = btext
                 print(f"patched {BT_INIT} (reconnect to the last-used headset, "
                       f"6 tries over ~30s, backgrounded)")
+
+            ssp = bt_enable_ssp(btext)
+            if ssp is None:
+                print(f"note: {BT_INIT} SSP write not added — already present, "
+                      f"or the bt-agent line has moved")
+            else:
+                btext = ssp
+                bpatched = btext
+                print(f"patched {BT_INIT} (Write Simple Pairing Mode = on, "
+                      f"after the HCI reset)")
 
             retried = bt_patchram_retry(btext)
             if retried is None:
