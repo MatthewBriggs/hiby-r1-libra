@@ -284,11 +284,17 @@ uint16_t *cover_cached(const char *cache_key, const char *dir, int px) {
     return buf;
 }
 
-uint16_t *cover_load(const char *jpeg_path, const char *cache_key, int px) {
+/* use_cache == 0 is the "refresh this cover" path: decode from the source
+ * again and overwrite whatever the cache holds. The cache is otherwise
+ * authoritative and has no expiry beyond its mtime check, so a bad entry --
+ * one written before a decode bug was fixed, say -- would otherwise be
+ * pinned forever with no way for the reader to say "no, fetch it again". */
+static uint16_t *cover_load_ex(const char *jpeg_path, const char *cache_key,
+                               int px, int use_cache) {
     if (px <= 0 || px > 512) return NULL;
     if (!cache_key) cache_key = jpeg_path;
 
-    uint16_t *cached = load_cache(jpeg_path, cache_key, px);
+    uint16_t *cached = use_cache ? load_cache(jpeg_path, cache_key, px) : NULL;
     if (cached) return cached;
     if (!load_lib()) return NULL;
 
@@ -553,6 +559,14 @@ uint16_t *cover_load(const char *jpeg_path, const char *cache_key, int px) {
 
     save_cache(cache_key, px, out);
     return out;
+}
+
+uint16_t *cover_load(const char *jpeg_path, const char *cache_key, int px) {
+    return cover_load_ex(jpeg_path, cache_key, px, 1);
+}
+
+uint16_t *cover_load_fresh(const char *jpeg_path, const char *cache_key, int px) {
+    return cover_load_ex(jpeg_path, cache_key, px, 0);
 }
 
 /* BG104: see cover.h's own comment -- shrink a network-fetched cover before

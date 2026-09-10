@@ -6,6 +6,11 @@
  * live — extracted art is decoded from a scratch file that is the same path
  * every time, so the path cannot be the key. */
 uint16_t *cover_load(const char *jpeg_path, const char *cache_key, int px);
+/* As cover_load(), but ignores any cached bitmap and re-decodes from source,
+ * replacing the cache entry. Backs the "hold the artwork to refresh it"
+ * gesture, which exists so a cover cached wrongly can be corrected without
+ * deleting files by hand. */
+uint16_t *cover_load_fresh(const char *jpeg_path, const char *cache_key, int px);
 
 /* The cached bitmap for `cache_key`, or NULL if there isn't one. Lets a caller
  * skip finding a JPEG at all when the decoded answer is already on the card —

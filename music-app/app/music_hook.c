@@ -458,7 +458,28 @@ static void mlog(const char *fmt, ...) {
  * lands in ART_SCRATCH (art_candidate()'s own doc comment: rewritten every
  * time, never the source track file), so it's shrunk in place directly,
  * same as a freshly-fetched cover already is. */
-#define ART_LOCAL_SCRATCH "/tmp/.music_art_local.jpg"
+/* One scratch pair per art worker, never shared.
+ *
+ * cover_load_capped() rewrites its input file in place (cover_downscale_max()
+ * decodes, shrinks and re-encodes over the top of it), so a scratch path is
+ * exclusively owned by one decode for the whole of that decode. art_worker()
+ * (the playing track) and view_art_worker() (the album being browsed) both
+ * used ART_SCRATCH, and all three workers shared one local-copy path -- so
+ * opening an album page while a track's art loaded had one worker rewriting
+ * the very file the other was part-way through reading. The decode kept the
+ * rows it had already read and never got the rest: art correct down to some
+ * horizontal line and flat grey below it, which is exactly how this was
+ * reported ("A Kind of Magic", "At War with the Mystics").
+ *
+ * Latent since the scratch was introduced, but it only became reproducible
+ * with the cover-colour work (R92/R94): computing a palette per album, and
+ * prewarming palettes in the background, turned concurrent art decoding from
+ * rare into the normal case. The prewarm pass was given its own path at the
+ * time for exactly this reason -- these two just never got the same. */
+#define ART_LOCAL_SCRATCH        "/tmp/.music_art_local.jpg"
+#define ART_VIEW_SCRATCH         "/tmp/.music_art_view.jpg"
+#define ART_VIEW_LOCAL_SCRATCH   "/tmp/.music_art_view_local.jpg"
+#define COVER_PREWARM_LOCAL_SCRATCH "/tmp/.music_art_prewarm_local.jpg"
 
 /* jpg: whatever art_candidate() just handed back -- either ART_SCRATCH
  * (embedded art, already disposable) or a real file in the album's own
@@ -467,25 +488,41 @@ static void mlog(const char *fmt, ...) {
  * time. cover_downscale_max() is cheap to call unconditionally: a header-
  * only read and an immediate no-op return for anything already within
  * FETCHED_COVER_MAX_DIM, which is the common case for most covers. */
-static uint16_t *cover_load_capped(const char *jpg, const char *key, int px) {
+/* Set by the hold-the-artwork-to-refresh gesture, consumed once by the next
+ * art worker to start. A cached cover is otherwise permanent: nothing in the
+ * app ever decides an entry is wrong, so an album that cached badly (the
+ * shared-scratch collision above did exactly that) stayed wrong until someone
+ * deleted files over adb. This is the way to say "that one is wrong, do it
+ * again" without leaving the device. */
+static volatile int art_force_fresh;
+
+/* The gesture itself: forget what this album cached -- bitmap and colours --
+ * and ask for it again from source. The palette file has to go too, or the
+ * refreshed art would be drawn under the colours derived from the bad decode
+ * it replaced. */
+static void art_refresh_request(const char *track, const char *artist,
+                                const char *album, int for_view);
+
+static uint16_t *cover_load_capped(const char *jpg, const char *key, int px,
+                                   const char *local_scratch, int fresh) {
     const char *use = jpg;
     if (strncmp(jpg, "/tmp/", 5) != 0) {
         FILE *in = fopen(jpg, "rb");
         if (in) {
-            FILE *out = fopen(ART_LOCAL_SCRATCH, "wb");
+            FILE *out = fopen(local_scratch, "wb");
             if (out) {
                 char buf[8192];
                 size_t got;
                 while ((got = fread(buf, 1, sizeof(buf), in)) > 0)
                     fwrite(buf, 1, got, out);
                 fclose(out);
-                use = ART_LOCAL_SCRATCH;
+                use = local_scratch;
             }
             fclose(in);
         }
     }
     cover_downscale_max(use, FETCHED_COVER_MAX_DIM);
-    return cover_load(use, key, px);
+    return fresh ? cover_load_fresh(use, key, px) : cover_load(use, key, px);
 }
 
 static pthread_mutex_t art_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -1022,7 +1059,7 @@ static void *cover_prewarm_worker(void *arg) {
                                    COVER_PREWARM_SCRATCH);
             if (rc == -1) break;
             if (rc == ART_SKIP) continue;
-            bits = cover_load_capped(jpg, key, ART_PX);
+            bits = cover_load_capped(jpg, key, ART_PX, COVER_PREWARM_LOCAL_SCRATCH, 0);
         }
         /* Local-candidate only, deliberately -- no Last.fm/Spotify fallback
          * here the way view_art_worker() has for a manually-opened album.
@@ -1136,6 +1173,8 @@ static void *art_worker(void *arg) {
     (void)arg;
     art_worker_yield_priority("art");
     char track[512], artist[LIB_NAME_LEN], album[LIB_NAME_LEN];
+    int fresh = art_force_fresh;
+    art_force_fresh = 0;
     pthread_mutex_lock(&art_lock);
     snprintf(track, sizeof(track), "%s", art_want);
     snprintf(artist, sizeof(artist), "%s", art_want_artist);
@@ -1154,7 +1193,7 @@ static void *art_worker(void *arg) {
         int rc = art_candidate(track, n, jpg, sizeof(jpg), key, sizeof(key), ART_SCRATCH);
         if (rc == -1) break;
         if (rc == ART_SKIP) continue;
-        bits = cover_load_capped(jpg, key, ART_PX);
+        bits = cover_load_capped(jpg, key, ART_PX, ART_LOCAL_SCRATCH, fresh);
     }
 
     /* R23: every local candidate is exhausted -- try Last.fm first, then
@@ -1334,6 +1373,8 @@ static void *view_art_worker(void *arg) {
     (void)arg;
     art_worker_yield_priority("view-art");
     char track[512], artist[LIB_NAME_LEN], album[LIB_NAME_LEN];
+    int fresh = art_force_fresh;
+    art_force_fresh = 0;
     pthread_mutex_lock(&view_art_lock);
     snprintf(track, sizeof(track), "%s", view_art_want);
     snprintf(artist, sizeof(artist), "%s", view_art_want_artist);
@@ -1343,10 +1384,10 @@ static void *view_art_worker(void *arg) {
     char jpg[512], key[512];
     uint16_t *bits = NULL;
     for (int n = 0; !bits; n++) {
-        int rc = art_candidate(track, n, jpg, sizeof(jpg), key, sizeof(key), ART_SCRATCH);
+        int rc = art_candidate(track, n, jpg, sizeof(jpg), key, sizeof(key), ART_VIEW_SCRATCH);
         if (rc == -1) break;
         if (rc == ART_SKIP) continue;
-        bits = cover_load_capped(jpg, key, ART_PX);
+        bits = cover_load_capped(jpg, key, ART_PX, ART_VIEW_LOCAL_SCRATCH, fresh);
     }
     /* Same Last.fm-then-Spotify network fallback art_worker() uses, kept
      * in sync deliberately -- an album can be viewed without ever being
@@ -1410,6 +1451,17 @@ static void view_art_clear(void) {
     view_art_done = 1;
     view_art_want[0] = '\0';
     pthread_mutex_unlock(&view_art_lock);
+}
+
+static void art_refresh_request(const char *track, const char *artist,
+                                const char *album, int for_view) {
+    char pal[512];
+    pal_cache_path(artist, album, pal, sizeof(pal));
+    unlink(pal);
+    np_palette_valid = 0;
+    art_force_fresh = 1;
+    if (for_view) view_art_request(track, artist, album);
+    else          art_request(track, artist, album);
 }
 
 static void view_blit_art_clip(uint16_t *fb, int x, int y, int clip_top, int clip_bot) {
@@ -12047,6 +12099,21 @@ int music_entry(void *a0, void *a1) {
                 } else {
                     int off = scroll * ROW_H + scroll_px;
                     int content_y = touch_y + off;
+                    /* Held on the cover itself rather than a track row:
+                     * refresh it. Same gesture the rows use, told apart
+                     * purely by where it landed -- the artwork occupies
+                     * content rows 0..ART_PX, above every track row, and
+                     * g_view_art_gone_frame is exactly the flag the draw
+                     * side uses to know whether it drew a cover there at
+                     * all (nothing to refresh if it didn't). */
+                    if (!g_view_art_gone_frame && content_y >= 0 && content_y < ART_PX &&
+                        !browsing_is_playlist && track_n > 0) {
+                        hold_fired = 1;
+                        art_refresh_request(tracks[0].path, cur_artist, cur_album, 1);
+                        snprintf(sheet_note, sizeof(sheet_note), "Refreshing artwork");
+                        dirty = 1; idle = 0;
+                        continue;
+                    }
                     idx = track_index_at(content_y);
                 }
                 hold_fired = 1;
