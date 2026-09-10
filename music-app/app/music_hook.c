@@ -634,6 +634,202 @@ static int art_seq(void) {
     return v;
 }
 
+/* R92: Now Playing colours derived from the current album art -- a second
+ * attempt at a feature built once already (by another session), shipped,
+ * and explicitly reverted. Live feedback on why: the background always
+ * ended up plain white or black rather than an actual shade, and the
+ * chosen colours were never checked against each other for contrast (an
+ * unreadable seek bar was the specific complaint). Both addressed below,
+ * not just patched over -- see compute_cover_palette()'s own comment for
+ * the mechanism. Persisted like any other Settings toggle
+ * (cover_palette_enabled); the three colours themselves are runtime-only,
+ * recomputed from art_bits, never saved. */
+static int      cover_palette_enabled;
+static uint16_t np_bg = 0, np_accent = 0, np_fg = 0xFFFF;
+static int       np_palette_seq = -1;   /* art_seq_v this was last computed for */
+
+static void rgb565_to_rgb8(uint16_t c, int *r, int *g, int *b) {
+    int r5 = (c >> 11) & 0x1F, g6 = (c >> 5) & 0x3F, b5 = c & 0x1F;
+    *r = (r5 * 255 + 15) / 31;
+    *g = (g6 * 255 + 31) / 63;
+    *b = (b5 * 255 + 15) / 31;
+}
+static uint16_t rgb8_to_rgb565(int r, int g, int b) {
+    if (r < 0) r = 0; if (r > 255) r = 255;
+    if (g < 0) g = 0; if (g > 255) g = 255;
+    if (b < 0) b = 0; if (b > 255) b = 255;
+    return (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+}
+static float pal_luma(int r, int g, int b) {
+    return (0.299f * r + 0.587f * g + 0.114f * b) / 255.0f;
+}
+/* HSV-style saturation (0..1) -- cheap, and all that's needed to tell a
+ * genuinely-coloured pixel from a desaturated near-black/near-white one,
+ * which is the entire fix for "background always ended up white or
+ * black": that outcome is what picking the single *most common* pixel in
+ * a luma range does on typical art, where a big desaturated dark border
+ * or a bright white highlight usually outnumbers any one saturated shade.
+ * Scoring bins by population *and* saturation together fixes it without
+ * needing a smarter histogram -- an unpopular-but-colourful bin can now
+ * outscore a popular-but-grey one. */
+static float pal_sat(int r, int g, int b) {
+    int mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+    int mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+    return mx > 0 ? (float)(mx - mn) / (float)mx : 0.0f;
+}
+static void rgb8_to_hsl(int r, int g, int b, float *H, float *S, float *L) {
+    float rf = r / 255.0f, gf = g / 255.0f, bf = b / 255.0f;
+    float mx = rf > gf ? (rf > bf ? rf : bf) : (gf > bf ? gf : bf);
+    float mn = rf < gf ? (rf < bf ? rf : bf) : (gf < bf ? gf : bf);
+    float l = (mx + mn) / 2.0f, h = 0.0f, s = 0.0f;
+    if (mx != mn) {
+        float d = mx - mn;
+        s = l > 0.5f ? d / (2.0f - mx - mn) : d / (mx + mn);
+        if (mx == rf)      h = (gf - bf) / d + (gf < bf ? 6.0f : 0.0f);
+        else if (mx == gf) h = (bf - rf) / d + 2.0f;
+        else                h = (rf - gf) / d + 4.0f;
+        h /= 6.0f;
+    }
+    *H = h; *S = s; *L = l;
+}
+static float pal_hue2rgb(float p, float q, float t) {
+    if (t < 0) t += 1; if (t > 1) t -= 1;
+    if (t < 1.0f / 6) return p + (q - p) * 6.0f * t;
+    if (t < 1.0f / 2) return q;
+    if (t < 2.0f / 3) return p + (q - p) * (2.0f / 3 - t) * 6.0f;
+    return p;
+}
+static void hsl_to_rgb8(float h, float s, float l, int *r, int *g, int *b) {
+    float rf, gf, bf;
+    if (s <= 0.0f) { rf = gf = bf = l; }
+    else {
+        float q = l < 0.5f ? l * (1.0f + s) : l + s - l * s;
+        float p = 2.0f * l - q;
+        rf = pal_hue2rgb(p, q, h + 1.0f / 3);
+        gf = pal_hue2rgb(p, q, h);
+        bf = pal_hue2rgb(p, q, h - 1.0f / 3);
+    }
+    *r = (int)(rf * 255.0f + 0.5f);
+    *g = (int)(gf * 255.0f + 0.5f);
+    *b = (int)(bf * 255.0f + 0.5f);
+}
+
+/* 4 bits/channel -- enough bins to keep genuinely different colours apart
+ * without spreading one real shade's pixels across dozens of near-
+ * identical bins, which would let population-based scoring get swamped by
+ * quantization noise. */
+#define PAL_BINS 4096
+static int pal_bin_of(int r, int g, int b) {
+    return ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
+}
+static void pal_bin_rgb(int bin, int *r, int *g, int *b) {
+    *r = (((bin >> 8) & 0xF) << 4) | 8;
+    *g = (((bin >> 4) & 0xF) << 4) | 8;
+    *b = ((bin & 0xF) << 4) | 8;
+}
+
+/* Recomputes np_bg/np_accent/np_fg from art_bits, only when it has actually
+ * changed (np_palette_seq vs art_seq_v -- the same R84 same-album-skip
+ * signal Now Playing's own art already uses, so this costs nothing on a
+ * same-album track change). Dark and light candidates are pooled into
+ * separate histograms by luma, scored by count*saturation so a common but
+ * grey pixel can't win over a rarer but genuinely-coloured one (see
+ * pal_sat()'s own comment -- this is the fix for "always ended up plain
+ * white or black"), then the winning accent is pushed in HSL lightness
+ * away from the winning background until they actually contrast, rather
+ * than trusting whatever the histogram happened to pick (the fix for "the
+ * seek bar looked awful"). */
+static void compute_cover_palette(void) {
+    int seq = art_seq();
+    if (seq == np_palette_seq) return;
+    np_palette_seq = seq;
+
+    pthread_mutex_lock(&art_lock);
+    uint16_t *bits = art_bits;
+    /* Sampled into a local scratch copy so the lock isn't held through the
+     * whole histogram pass -- this runs on the UI thread, right before a
+     * draw, and art_worker() replacing art_bits mid-scan would otherwise
+     * block a fresh cover fetch on however long that takes. ART_PX*ART_PX
+     * uint16_t -- the same size Now Playing's own blit already reads
+     * whole every frame, so one more copy of it is not a new cost class. */
+    static uint16_t *scratch;
+    if (bits) {
+        if (!scratch) scratch = malloc((size_t)ART_PX * ART_PX * sizeof(uint16_t));
+        if (scratch) memcpy(scratch, bits, (size_t)ART_PX * ART_PX * sizeof(uint16_t));
+        else bits = NULL;
+    }
+    pthread_mutex_unlock(&art_lock);
+    if (!bits) return;   /* scratch alloc failed: leave last-known colours alone */
+
+    static uint32_t *hist_dark, *hist_light;
+    if (!hist_dark)  hist_dark  = calloc(PAL_BINS, sizeof(uint32_t));
+    if (!hist_light) hist_light = calloc(PAL_BINS, sizeof(uint32_t));
+    if (!hist_dark || !hist_light) return;
+    memset(hist_dark, 0, PAL_BINS * sizeof(uint32_t));
+    memset(hist_light, 0, PAL_BINS * sizeof(uint32_t));
+
+    int total = ART_PX * ART_PX;
+    for (int i = 0; i < total; i += 4) {   /* every 4th pixel: plenty for a histogram */
+        int r, g, b;
+        rgb565_to_rgb8(scratch[i], &r, &g, &b);
+        float l = pal_luma(r, g, b);
+        int bin = pal_bin_of(r, g, b);
+        if (l < 0.45f)      hist_dark[bin]++;
+        else if (l > 0.62f) hist_light[bin]++;
+        /* midtones (0.45-0.62) deliberately counted toward neither -- a
+         * clean gap between the two roles instead of a boundary that
+         * quantization noise could flip either way. */
+    }
+
+    int best_dark = -1, best_light = -1;
+    float best_dark_score = 0, best_light_score = 0;
+    for (int i = 0; i < PAL_BINS; i++) {
+        if (hist_dark[i]) {
+            int r, g, b; pal_bin_rgb(i, &r, &g, &b);
+            float score = (float)hist_dark[i] * (0.25f + 0.75f * pal_sat(r, g, b));
+            if (score > best_dark_score) { best_dark_score = score; best_dark = i; }
+        }
+        if (hist_light[i]) {
+            int r, g, b; pal_bin_rgb(i, &r, &g, &b);
+            float score = (float)hist_light[i] * (0.25f + 0.75f * pal_sat(r, g, b));
+            if (score > best_light_score) { best_light_score = score; best_light = i; }
+        }
+    }
+
+    int bgr = 20, bgg = 20, bgb = 24;         /* fallback: a plain dark neutral */
+    int acr = 255, acg = 255, acb = 255;      /* fallback: white */
+    if (best_dark >= 0)  pal_bin_rgb(best_dark, &bgr, &bgg, &bgb);
+    if (best_light >= 0) pal_bin_rgb(best_light, &acr, &acg, &acb);
+
+    /* Contrast check, not a trust-the-histogram guess: push the accent's
+     * own lightness away from the background's until the gap is real,
+     * preserving its hue/saturation (still "purple", just a purple that
+     * actually reads against this particular background) rather than
+     * sliding it toward grey. */
+    float bh, bs, bl, ah, as, al;
+    rgb8_to_hsl(bgr, bgg, bgb, &bh, &bs, &bl);
+    rgb8_to_hsl(acr, acg, acb, &ah, &as, &al);
+    #define NP_MIN_L_DELTA 0.35f
+    if (al - bl < NP_MIN_L_DELTA) {
+        al = bl + NP_MIN_L_DELTA;
+        if (al > 1.0f) al = 1.0f;
+        if (as < 0.15f) as = 0.4f;   /* a washed-out accent gained no hue to push toward */
+        hsl_to_rgb8(ah, as, al, &acr, &acg, &acb);
+    }
+
+    np_bg     = rgb8_to_rgb565(bgr, bgg, bgb);
+    np_accent = rgb8_to_rgb565(acr, acg, acb);
+    np_fg     = pal_luma(bgr, bgg, bgb) > 0.5f ? 0x0000 : 0xFFFF;
+}
+
+/* Drop-in replacements for COL_BG/COL_ACCENT/COL_TEXT at any Now Playing
+ * draw site that should follow the cover art -- each falls straight back
+ * to the plain theme colour whenever the toggle is off or there is no art
+ * to derive from, so a call site never needs its own if/else. */
+static uint16_t np_col_bg(void)     { return (cover_palette_enabled && art_bits) ? np_bg     : COL_BG; }
+static uint16_t np_col_accent(void) { return (cover_palette_enabled && art_bits) ? np_accent : COL_ACCENT; }
+static uint16_t np_col_fg(void)     { return (cover_palette_enabled && art_bits) ? np_fg     : COL_TEXT; }
+
 static void *art_worker(void *arg) {
     (void)arg;
     char track[512], artist[LIB_NAME_LEN], album[LIB_NAME_LEN];
@@ -1882,10 +2078,15 @@ static int set_row_lighttheme_y(void) { return set_autooff_desc_y() + 64; }
  * as Theme above it. */
 static int set_row_timezone_y(void) { return set_row_lighttheme_y() + ROW_H; }
 static int set_row_theme_y(void) { return set_row_timezone_y() + ROW_H; }
+/* R92: two-line description like Power button lock/USB Transport Mode
+ * above -- "derived from the current cover" isn't self-explanatory from
+ * the label alone the way a plain colour picker would be. */
+static int set_row_coverpalette_y(void)  { return set_row_theme_y() + ROW_H; }
+static int set_coverpalette_desc_y(void) { return set_row_coverpalette_y() + ROW_H; }
 /* R26: About, one row below Accent colour -- which now needs its own
  * trailing divider back (it used to be the last row and closed the list
  * itself), and this row takes over closing the list instead. */
-static int set_row_about_y(void) { return set_row_theme_y() + ROW_H; }
+static int set_row_about_y(void) { return set_coverpalette_desc_y() + 64; }
 /* Wi-Fi/Bluetooth: reachable here too, not just via holding their row in
  * quick settings -- that hold is fast once you know it's there, but
  * nothing on screen ever told a first-time user it existed. */
@@ -2043,18 +2244,24 @@ static void about_ram_free(char *out, size_t n) {
  *
  * Publishes title_span so the drag handler knows how far there is to go --
  * only the draw side knows the rendered width of the string. */
-static void draw_scroll_title(uint16_t *fb, int y, const char *s) {
+/* R92: fg/bg passed in rather than hardcoded -- the shared music/podcast
+ * Now Playing screen wants np_col_fg()/np_col_bg() when cover colours are
+ * active, but this same function also draws the audiobook screen's title,
+ * which never themes off album art (see draw_screen()'s own comment on
+ * why) and must keep the plain COL_TEXT/COL_BG regardless of whatever a
+ * previous music session last computed. */
+static void draw_scroll_title(uint16_t *fb, int y, const char *s, uint16_t fg, uint16_t bg) {
     int avail = FB_W - 48;
     int w = text_width(s, TEXT_PX_TITLE);
     title_span = w > avail ? w - avail : 0;
     if (title_off_live < -title_span) title_off_live = -title_span;
     if (title_off < -title_span)      title_off = -title_span;
 
-    draw_text(fb, 24 + title_off_live, y, s, COL_TEXT, TEXT_PX_TITLE, FB_W - 24);
+    draw_text(fb, 24 + title_off_live, y, s, fg, TEXT_PX_TITLE, FB_W - 24);
     /* text_draw only clips at the framebuffer edge, so whatever has slid past
      * the left margin is painted back out here. Without this, letters sit in
      * the margin and read as a rendering fault rather than a scroll. */
-    fill_rect(fb, 0, y - 2, 24, TEXT_PX_TITLE + 12, COL_BG);
+    fill_rect(fb, 0, y - 2, 24, TEXT_PX_TITLE + 12, bg);
 }
 
 /* h:mm:ss past an hour, m:ss below it. Everything an audiobook shows needs
@@ -4773,7 +4980,19 @@ static void draw_screen(uint16_t *fb) {
      * broken. Left as a known-attempted, not-yet-safe idea, not an open
      * "try this" -- the double-buffer staleness reasoning needs more than
      * a same-frame-combination-stable counter to actually hold. */
-    fill_rect(fb, 0, 0, FB_W, FB_H, COL_BG);
+    /* R92: cover-derived colours only apply to the shared music/podcast
+     * Now Playing screen -- audiobook_mode keeps its own plain background,
+     * same reasoning R29's waveform already used to scope itself to Music
+     * (a book chapter isn't "an album" the way this feature's colours are
+     * themed around). Recomputed here, once per frame it's actually
+     * needed, rather than only from art_request()'s own callback: this is
+     * a plain seq-number check (see compute_cover_palette()'s own
+     * comment) that's a no-op on every frame but the one where art_bits
+     * genuinely just changed. */
+    if (cover_palette_enabled && screen == SC_PLAYING && !audiobook_mode)
+        compute_cover_palette();
+    fill_rect(fb, 0, 0, FB_W, FB_H,
+              (screen == SC_PLAYING && !audiobook_mode) ? np_col_bg() : COL_BG);
     /* The player has no title bar at all: a strip saying "Now playing" over a
      * screen showing the track, the artist and the artwork was telling you
      * what you could already see, and it was 62px that the artwork wanted.
@@ -5133,7 +5352,7 @@ static void draw_screen(uint16_t *fb) {
             fill_rect(fb, cx, cy, ART_PX, ART_PX, COL_ROW);
             blit_art(fb, cx, cy);
             int ty = title_y();
-            draw_scroll_title(fb, ty, t->name);
+            draw_scroll_title(fb, ty, t->name, COL_TEXT, COL_BG);
 
             draw_text(fb, 24, ty + 44, q_album, COL_DIM, TEXT_PX_BODY, FB_W - 24);
             snprintf(buf, sizeof(buf), "%d of %d", cur_track + 1, queue_n);
@@ -5302,7 +5521,7 @@ static void draw_screen(uint16_t *fb) {
             blit_art(fb, cx, cy);
         }
         int ty = title_y();
-        draw_scroll_title(fb, ty, t->name);
+        draw_scroll_title(fb, ty, t->name, np_col_fg(), np_col_bg());
         /* The track's own artist wins when it has one -- q_artist is the
          * *album's* artist and can genuinely differ from a track's own tag
          * (BG30: a compilation showed the album's artist for every track
@@ -5422,21 +5641,21 @@ static void draw_screen(uint16_t *fb) {
                 int col_w = cx1 - cx0;
                 if (col_w < 1) col_w = 1;
                 fill_rect(fb, cx0, wave_cy - h / 2, col_w > 1 ? col_w - 1 : col_w, h,
-                          c <= played_col ? COL_ACCENT : COL_LINE);
+                          c <= played_col ? np_col_accent() : COL_LINE);
             }
             if (scrub_active) {
                 int w = dur > 0 ? wave_w * pos / dur : 0;
                 if (w > wave_w) w = wave_w;
-                fill_circle(fb, 24 + w, wave_cy, 13, COL_ACCENT);
+                fill_circle(fb, 24 + w, wave_cy, 13, np_col_accent());
             }
         } else {
             fill_rect(fb, 24, byy, FB_W - 48, bh, COL_LINE);
             if (dur > 0) {
                 int w = (FB_W - 48) * pos / dur;
                 if (w > FB_W - 48) w = FB_W - 48;
-                fill_rect(fb, 24, byy, w, bh, COL_ACCENT);
+                fill_rect(fb, 24, byy, w, bh, np_col_accent());
                 if (scrub_active)
-                    fill_circle(fb, 24 + w, by + 3, 13, COL_ACCENT);
+                    fill_circle(fb, 24 + w, by + 3, 13, np_col_accent());
             }
         }
         snprintf(buf, sizeof(buf), "%d:%02d", pos / 60000, (pos / 1000) % 60);
@@ -5541,14 +5760,14 @@ static void draw_screen(uint16_t *fb) {
                       pm_on ? COL_ACCENT : COL_DIM);
         }
 
-        fill_circle(fb, mid, cyy, 42, COL_ACCENT);
+        fill_circle(fb, mid, cyy, 42, np_col_accent());
         if (audio_is_paused()) {
             /* nudged right: a triangle's visual centre is left of its bounding
              * box, and centring the box makes it look like it is falling over */
-            fill_triangle(fb, mid + 4, cyy, 36, +1, COL_BG);
+            fill_triangle(fb, mid + 4, cyy, 36, +1, np_col_bg());
         } else {
-            fill_rect(fb, mid - 15, cyy - 18, 10, 36, COL_BG);
-            fill_rect(fb, mid + 5,  cyy - 18, 10, 36, COL_BG);
+            fill_rect(fb, mid - 15, cyy - 18, 10, 36, np_col_bg());
+            fill_rect(fb, mid + 5,  cyy - 18, 10, 36, np_col_bg());
         }
 
         /* R83: the route/battery readout and the format/kbps line that used
@@ -6218,13 +6437,23 @@ static void draw_screen(uint16_t *fb) {
                             TZ_PRESETS[tz_idx].name, COL_ACCENT, CONTENT_Y, clip_bot);
 
         ry = set_row_theme_y() - off;
-        int theme_h = set_row_about_y() - set_row_theme_y();
+        int theme_h = set_row_coverpalette_y() - set_row_theme_y();
         fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
         draw_text_clip(fb, 24, ry + 20, "Accent colour", COL_TEXT, TEXT_PX_BODY, FB_W - 200, CONTENT_Y, clip_bot);
         /* The value itself renders in the accent colour it names, rather
          * than a separate swatch blob next to plain text (BG63 follow-up). */
         draw_right_col_clip(fb, ry + theme_h / 2 - TEXT_PX_SMALL / 2,
                             ACCENT_PRESETS[g_accent_idx].name, ACCENT_PRESETS[g_accent_idx].color, CONTENT_Y, clip_bot);
+
+        ry = set_row_coverpalette_y() - off;
+        int coverpalette_h = set_row_about_y() - set_row_coverpalette_y();
+        fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
+        draw_text_clip(fb, 24, ry + 20, "Cover colours", COL_TEXT, TEXT_PX_BODY, FB_W - 140, CONTENT_Y, clip_bot);
+        draw_toggle_switch_h_clip(fb, ry, cover_palette_enabled, coverpalette_h, CONTENT_Y, clip_bot);
+
+        int cpy = set_coverpalette_desc_y() - off;
+        draw_text_clip(fb, 24, cpy, "Now Playing's background and accent follow", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
+        draw_text_clip(fb, 24, cpy + 26, "the current album art (Music only).", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
 
         ry = set_row_about_y() - off;
         fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
@@ -7961,6 +8190,9 @@ static void load_conf(void) {
         } else if (sscanf(line, "usb_bypass_enabled = %d", &v) == 1 ||
                    sscanf(line, "usb_bypass_enabled=%d", &v) == 1) {
             usb_bypass_enabled = v != 0;
+        } else if (sscanf(line, "cover_palette_enabled = %d", &v) == 1 ||
+                   sscanf(line, "cover_palette_enabled=%d", &v) == 1) {
+            cover_palette_enabled = v != 0;
         } else if (sscanf(line, "bt_autoplay_enabled = %d", &v) == 1 ||
                    sscanf(line, "bt_autoplay_enabled=%d", &v) == 1) {
             bt_autoplay_enabled = v != 0;
@@ -8103,6 +8335,7 @@ static void save_conf(void) {
             if (!conf_line_is(lines[n], "accent_index") &&
                 !conf_line_is(lines[n], "button_lock_enabled") &&
                 !conf_line_is(lines[n], "usb_bypass_enabled") &&
+                !conf_line_is(lines[n], "cover_palette_enabled") &&
                 !conf_line_is(lines[n], "bt_autoplay_enabled") &&
                 !conf_line_is(lines[n], "light_theme") &&
                 !conf_line_is(lines[n], "theme_mode") &&
@@ -8130,6 +8363,7 @@ static void save_conf(void) {
     fprintf(f, "accent_index = %d\n", g_accent_idx);
     fprintf(f, "button_lock_enabled = %d\n", button_lock_enabled);
     fprintf(f, "usb_bypass_enabled = %d\n", usb_bypass_enabled);
+    fprintf(f, "cover_palette_enabled = %d\n", cover_palette_enabled);
     fprintf(f, "bt_autoplay_enabled = %d\n", bt_autoplay_enabled);
     fprintf(f, "theme_mode = %d\n", theme_mode);
     fprintf(f, "tz_index = %d\n", tz_idx);
@@ -9931,6 +10165,8 @@ int music_entry(void *a0, void *a1) {
                  * finger regardless of how far Settings has been scrolled. */
                 int off = scroll * ROW_H + scroll_px;
                 int ry_lock = set_row_lock_y() - off, ry_theme = set_row_theme_y() - off;
+                int ry_coverpalette = set_row_coverpalette_y() - off;
+                int coverpalette_h = set_row_about_y() - set_row_coverpalette_y();
                 int ry_usbbypass = set_row_usbbypass_y() - off;
                 int ry_autooff = set_row_autooff_y() - off, ry_about = set_row_about_y() - off;
                 int ry_btautoplay = set_row_btautoplay_y() - off;
@@ -9979,6 +10215,10 @@ int music_entry(void *a0, void *a1) {
                     screen = SC_SETTINGS_TIMEZONE; reset_scroll();
                 } else if (y >= ry_theme && y < ry_theme + ROW_H) {
                     screen = SC_SETTINGS_THEME; reset_scroll();
+                } else if (y >= ry_coverpalette && y < ry_coverpalette + coverpalette_h) {
+                    cover_palette_enabled = !cover_palette_enabled;
+                    np_palette_seq = -1;   /* force a recompute on next draw */
+                    save_conf();
                 } else if (y >= ry_about && y < ry_about + ROW_H) {
                     screen = SC_SETTINGS_ABOUT; reset_scroll();
                 } else if (y >= ry_wifi && y < ry_wifi + ROW_H) {
