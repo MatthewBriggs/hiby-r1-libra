@@ -524,6 +524,14 @@ static int  bt_thread_valid;
  * and the main loop drains it and performs the switch itself. */
 static char bt_matched_name[64];      /* device this thread last matched */
 static char bt_eq_pending_path[EP_PATH_LEN];   /* set here, applied on the main thread */
+/* R100: distinct from bt_eq_pending_path's own empty-means-nothing-new
+ * meaning -- that alone can't tell "haven't matched yet" apart from
+ * "matched, and there genuinely isn't one for this device", and the two
+ * need different handling (leave whatever EQ state was already active vs.
+ * explicitly turn it off). Set opposite ways at the two places
+ * bt_match_profile() can end: 0 the moment a match is found (alongside
+ * setting the pending path itself), 1 if the scan runs out without one. */
+static int bt_eq_no_match;
 
 /* Case-insensitive, either-direction substring match against each profile's
  * own name (from its filename): forgiving of a device advertising a
@@ -546,10 +554,18 @@ static void bt_match_profile(const char *dev_name) {
             pthread_mutex_lock(&bt_lock);
             snprintf(bt_eq_pending_path, sizeof(bt_eq_pending_path), "%s",
                     profiles[i].path);
+            bt_eq_no_match = 0;
             pthread_mutex_unlock(&bt_lock);
             return;
         }
     }
+    /* R100: reported live -- connecting a headset with no saved profile
+     * left whatever EQ curve a *previous* device's profile (or the user's
+     * own manual setting) had left active, rather than turning it off for
+     * a device nothing was ever tuned for. */
+    pthread_mutex_lock(&bt_lock);
+    bt_eq_no_match = 1;
+    pthread_mutex_unlock(&bt_lock);
 }
 
 static void *bt_poll(void *arg) {
@@ -3774,6 +3790,17 @@ static void pod_play_episode(int idx) {
     int resume = pod_resume_lookup(pod_eps[idx].path, &dur);
     pod_notes_avail = pod_load_notes(pod_eps[idx].path, pod_notes_text, sizeof(pod_notes_text)) > 0;
     audio_set_next(NULL);
+    /* R99: per-feed, not one speed shared across every podcast -- a show's
+     * own pacing preference shouldn't reset picking a different episode of
+     * the same show, or bleed into an unrelated show's own preference.
+     * Looked up fresh on every episode start rather than cached against
+     * cur_feed changing, the same reasoning ab_resume_book()/the resume
+     * lookup just above already established for doing this early rather
+     * than assuming stale state is still correct. 0 back means this feed
+     * has no saved speed yet -- 1.0x, same default pod_speed_permille
+     * itself already starts at. */
+    pod_speed_permille = pod_speed_lookup(cur_feed);
+    if (pod_speed_permille <= 0) pod_speed_permille = 1000;
     audio_set_speed(pod_speed_permille);
     audio_play(pod_eps[idx].path);
     art_request(pod_eps[idx].path, "", "");
@@ -7921,8 +7948,22 @@ static void qs_format_info(char *out, size_t outsz) {
         if (kbps > 0) snprintf(out, outsz, "%s  %d kbps", ext, kbps);
         else          snprintf(out, outsz, "%s", ext);
     } else if (track_is_vbr_mp3(t->path)) {
-        snprintf(out, outsz, "%s  %d/%g kHz  VBR",
-                 track_format_name(t), t->bits, t->rate / 1000.0);
+        /* R101: reported live -- "just 'VBR' isn't right, give an
+         * average". True by definition (a VBR file's own header states no
+         * single rate to report, the same reason audiobook/podcast's own
+         * branches above already compute one instead of reading a
+         * header), so this reuses that exact same size*8/duration
+         * arithmetic ab_file_bitrate_kbps() already provides rather than
+         * a second implementation of the same sum. */
+        int dur = audio_dur_ms();
+        if (dur <= 0) dur = t->dur_ms;
+        int kbps = ab_file_bitrate_kbps(t->path, dur);
+        if (kbps > 0)
+            snprintf(out, outsz, "%s  %d/%g kHz  VBR (avg %d kbps)",
+                     track_format_name(t), t->bits, t->rate / 1000.0, kbps);
+        else
+            snprintf(out, outsz, "%s  %d/%g kHz  VBR",
+                     track_format_name(t), t->bits, t->rate / 1000.0);
     } else {
         snprintf(out, outsz, "%s  %d/%g kHz  %d kbps",
                  track_format_name(t), t->bits, t->rate / 1000.0, t->bitrate / 1000);
@@ -9777,12 +9818,25 @@ int music_entry(void *a0, void *a1) {
          * here, not on that thread -- see the comment on bt_match_profile(). */
         {
             char eqpath[EP_PATH_LEN];
+            int no_match;
             pthread_mutex_lock(&bt_lock);
             snprintf(eqpath, sizeof(eqpath), "%s", bt_eq_pending_path);
             bt_eq_pending_path[0] = '\0';
+            no_match = bt_eq_no_match;
+            bt_eq_no_match = 0;
             pthread_mutex_unlock(&bt_lock);
             if (eqpath[0] && strcmp(eqpath, eq_cur_path) != 0) {
                 eq_switch_to(eqpath);
+                save_conf();
+                dirty = 1;
+            } else if (no_match && eq_enabled()) {
+                /* R100: a device with no saved profile of its own gets a
+                 * flat response rather than inheriting whatever the last
+                 * device (or the user's own manual setting) left active.
+                 * eq_enabled() itself, not the saved profile/bands, so
+                 * reconnecting the *previous* matched device later still
+                 * finds its own EQ exactly as it was. */
+                eq_set_enabled(0);
                 save_conf();
                 dirty = 1;
             }
@@ -10228,6 +10282,7 @@ int music_entry(void *a0, void *a1) {
                             pod_speed_permille += 100;
                             if (pod_speed_permille > 2000) pod_speed_permille = 1000;
                             audio_set_speed(pod_speed_permille);
+                            pod_speed_store(cur_feed, pod_speed_permille);   /* R99 */
                             save_conf();          /* BG91 */
                         } else if (x < (x10 + mid) / 2) {
                             audio_seek_ms(audio_pos_ms() - 10000);

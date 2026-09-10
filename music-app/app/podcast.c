@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <signal.h>
 #include <time.h>
 #include <unistd.h>
 #include <utime.h>
@@ -155,6 +156,68 @@ void pod_delete_download(const char *path) {
     if (!path || !path[0]) return;
     unlink(path);
     pod_resume_store(path, 0, 0);
+}
+
+/* ---- per-feed playback speed -------------------------------------------- */
+
+#define SPEED_FILE "/usr/data/podcast_speed.txt"
+
+int pod_speed_lookup(const char *feed) {
+    if (!feed || !feed[0]) return 0;
+    FILE *f = fopen(SPEED_FILE, "r");
+    if (!f) return 0;
+    char line[POD_NAME_LEN + 32];
+    int permille = 0;
+    while (fgets(line, sizeof(line), f)) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        char *t1 = strchr(line, '\t');
+        if (!t1) continue;
+        *t1 = '\0';
+        if (strcmp(t1 + 1, feed) == 0) {
+            permille = atoi(line);
+            break;
+        }
+    }
+    fclose(f);
+    return permille;
+}
+
+void pod_speed_store(const char *feed, int permille) {
+    if (!feed || !feed[0]) return;
+    /* Same write-then-rename shape pod_resume_store() uses, and the same
+     * reason: an OOM kill mid-write must not cost every other feed's own
+     * saved speed, not just the one just changed. Feed count is nothing
+     * like episode count, but there's no reason to trust that forever --
+     * same 127-entry cap as the resume file, for the same reason. */
+    char (*keep)[POD_NAME_LEN + 32] = malloc(sizeof(*keep) * 128);
+    if (!keep) return;
+    int n = 0;
+    FILE *f = fopen(SPEED_FILE, "r");
+    if (f) {
+        char line[POD_NAME_LEN + 32];
+        while (n < 127 && fgets(line, sizeof(line), f)) {
+            char probe[POD_NAME_LEN + 32];
+            snprintf(probe, sizeof(probe), "%s", line);
+            char *nl = strchr(probe, '\n');
+            if (nl) *nl = '\0';
+            char *t1 = strchr(probe, '\t');
+            if (t1 && strcmp(t1 + 1, feed) == 0) continue;   /* replaced below */
+            snprintf(keep[n++], POD_NAME_LEN + 32, "%s", line);
+        }
+        fclose(f);
+    }
+    char tmp[sizeof(SPEED_FILE) + 8];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", SPEED_FILE);
+    f = fopen(tmp, "w");
+    if (f) {
+        if (permille != 1000) fprintf(f, "%d\t%s\n", permille, feed);
+        for (int i = 0; i < n; i++) fputs(keep[i], f);
+        int ok = (fflush(f) == 0);
+        fclose(f);
+        if (!ok || rename(tmp, SPEED_FILE) != 0) unlink(tmp);
+    }
+    free(keep);
 }
 
 /* ---- episodes ---------------------------------------------------------- */
@@ -398,6 +461,7 @@ void pod_download_start(int idx) {
 
     pid_t pid = fork();
     if (pid == 0) {
+        setpgid(0, 0);       /* cancellation must include curl descendants */
         execl(PODSYNC_CURL, PODSYNC_CURL, "-fsSL", "--cacert", PODSYNC_CA,
               "--connect-timeout", "20", "--max-time", "900",
               "-D", DL_HDR_PATH, "-o", dl_part_path, g_ep_url[idx],
@@ -543,6 +607,7 @@ void pod_update_start(void) {
     unlink(SYNC_LOG);
     pid_t pid = fork();
     if (pid == 0) {
+        setpgid(0, 0);       /* the shell starts writers of its own */
         execl("/bin/sh", "sh", SYNC_SCRIPT, (char *)NULL);
         _exit(127);
     }
@@ -610,6 +675,24 @@ void pod_update_reap(void) {
          * on "the child is gone" turned every normal finish into a red
          * "Sync stopped early." */
         if (!sync_log_has_done()) update_died_flag = 1;
+    }
+}
+
+void pod_cancel_io(void) {
+    /* Both children write directly onto the SD card.  They must be gone
+     * before that block device is handed to the USB host. */
+    if (dl_pid > 0) {
+        kill(-dl_pid, SIGTERM);
+        (void)waitpid(dl_pid, NULL, 0);
+        dl_pid = -1;
+        unlink(dl_part_path);
+    }
+    if (update_pid > 0) {
+        kill(-update_pid, SIGTERM);
+        (void)waitpid(update_pid, NULL, 0);
+        update_pid = -1;
+        update_running_flag = 0;
+        update_died_flag = 1;
     }
 }
 

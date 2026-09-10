@@ -77,6 +77,17 @@ int  pod_resume_lookup(const char *path, int *dur_out);
  * shown as not-downloaded (same as an episode that was never fetched). */
 void pod_delete_download(const char *path);
 
+/* Playback speed, per *feed* rather than per episode -- a show's own
+ * pacing preference (a chatty interview show at 1.0x, a slow-talking one
+ * at 1.5x) rather than something that should reset picking a new episode
+ * of the same show. Same "<value>\t<key>" shape and 127-entry cap
+ * pod_resume_store() already established, keyed on the feed's own name
+ * instead of an episode path. Permille (1000 = 1.0x), same unit
+ * audio_set_speed() already takes. 0 back from the lookup means "no
+ * saved speed for this feed" -- the caller's own default (1000) applies. */
+void pod_speed_store(const char *feed, int permille);
+int  pod_speed_lookup(const char *feed);
+
 /* On-demand download of one manifest-only episode (R18), same fork+curl
  * shape update_start() uses for the whole-feed sync below, scoped to one
  * file. One at a time. `idx` indexes the array pod_load_episodes() last
@@ -106,6 +117,7 @@ int  pod_update_tail(char out[][POD_NAME_LEN], int max_lines);
 /* Reaps the fetcher's pid once it has exited; marks pod_update_died() if it
  * exited without ever writing "__DONE__" (killed, or exec failed). */
 void pod_update_reap(void);
+void pod_cancel_io(void);
 
 /* The episode's notes sidecar (same basename, .txt), raw and unwrapped --
  * wrapping to the screen width is a drawing concern, left to the caller. 0
