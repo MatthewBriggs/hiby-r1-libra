@@ -23,6 +23,7 @@ int index_scan_progress(int *scanned, int *written);
  * somehow never started, and wakes it immediately for a fresh pass rather
  * than waiting out its normal idle interval. */
 void index_rescan_now(void);
+void index_pause_for_usb(int paused);
 
 /* Looks up a path's cached track/disc/duration, valid only if `mtime`
  * (the caller's own fresh stat() of the file) matches what was on disk when

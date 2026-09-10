@@ -16,5 +16,6 @@ void scanner_scan_start(void);
 int  scanner_scan_running(void);
 int  scanner_scan_progress(int *scanned, int *written);
 void scanner_rescan_now(void);
+void scanner_pause_for_usb(int paused);
 
 #endif

@@ -1363,6 +1363,23 @@ if (view_art_thread_valid) { pthread_join(view_art_thread, NULL); view_art_threa
         view_art_thread_valid = 1;
 }
 
+/* BG-playlist: playlists have no single album to show art for, but nothing
+ * else stops view_art_bits from just being whatever the last real album
+ * page left behind -- view_art_request() is never called on the playlist
+ * path (there's no track/artist/album triple that means anything here), so
+ * without an explicit clear the header silently kept showing stale art from
+ * wherever browsing came from. */
+static void view_art_clear(void) {
+    if (view_art_thread_valid) { pthread_join(view_art_thread, NULL); view_art_thread_valid = 0; }
+    pthread_mutex_lock(&view_art_lock);
+    free(view_art_bits);
+    view_art_bits = NULL;
+    view_art_seq_v++;
+    view_art_done = 1;
+    view_art_want[0] = '\0';
+    pthread_mutex_unlock(&view_art_lock);
+}
+
 static void view_blit_art_clip(uint16_t *fb, int x, int y, int clip_top, int clip_bot) {
     pthread_mutex_lock(&view_art_lock);
     if (view_art_bits) {
@@ -5855,8 +5872,11 @@ static void draw_screen(uint16_t *fb) {
          * the decoder, so you can see where you are about to land. */
         if (scrub_active) pos = scrub_ms(dur);
         int by = bar_y();      /* BG40: was its own ty+118, now the shared value */
-        int bh = scrub_active ? 10 : 6;
-        int byy = by - (bh - 6) / 2;
+        /* R102: reported live as thin -- 6px (10 while scrubbing) read as
+         * flimsy next to the waveform's own columns. Bumped to a flat 10
+         * (14 scrubbing), the same +4 bump on top scrubbing already had. */
+        int bh = scrub_active ? 14 : 10;
+        int byy = by - (bh - 10) / 2;
         /* R86 follow-up: R86's first cut grew the waveform around the
          * *plain bar's* centre (`by`) without checking what that centre
          * actually had room for -- screenshotted live, the taller columns
@@ -5870,13 +5890,23 @@ static void draw_screen(uint16_t *fb) {
          * literal `fill_circle(..., 42, ...)` below). wave_cy/max_h/
          * clock_y computed once here and read by both the draw block just
          * below and the clock text further down, rather than each
-         * re-deriving the same bounds a second time. Only used for
-         * wave_loaded -- the plain bar keeps using `by`/`by+14` exactly as
-         * it always has, unaffected by any of this. */
-        int wave_cy = by, max_h = 32, clock_y = by + 14;
+         * re-deriving the same bounds a second time.
+         *
+         * R102: clock_y used to be wave_bot-anchored only for wave_loaded,
+         * falling back to a plain `by+14` otherwise -- reported live as
+         * inconsistent spacing between tracks, since which one a given
+         * track got depended on nothing the listener could see (whether
+         * its waveform happened to be cached yet). Computed unconditionally
+         * now, off `by` alone, so every track's clock sits in exactly the
+         * same place regardless of wave_loaded -- only max_h (how tall the
+         * waveform itself gets to be) stays conditional, since a plain bar
+         * has no equivalent height to compute. */
+        int wave_top = ty + 82 + TEXT_PX_SMALL + 12;
+        int wave_bot = (by + 70 + CTRL_NUDGE_PX) - 42 - 10;
+        int gap = 10;
+        int clock_y = wave_bot - 6;
+        int wave_cy = by, max_h = 32;
         if (wave_loaded) {
-            int wave_top = ty + 82 + TEXT_PX_SMALL + 12;
-            int wave_bot = (by + 70 + CTRL_NUDGE_PX) - 42 - 10;
             /* R86 follow-up again: anchored to the waveform before (clock
              * sat a fixed gap under it), so pushing the clock down and
              * growing the waveform were two separate, easy-to-desync
@@ -5893,8 +5923,6 @@ static void draw_screen(uint16_t *fb) {
              * replaced. Pinned hard against the bottom bound now instead
              * (a small fixed margin off the buttons, not a size-dependent
              * subtraction that can flip sign again). */
-            int gap = 10;
-            clock_y = wave_bot - 6;
             max_h = (clock_y - gap) - wave_top;
             if (max_h < 16) max_h = 16;
             wave_cy = wave_top + max_h / 2;
@@ -6215,8 +6243,13 @@ static void draw_screen(uint16_t *fb) {
                     fill_rect_clip(fb, 0, row_y, FB_W, 2, COL_ACCENT, 0, clip_bot);
                     fill_rect_clip(fb, 0, row_y + ROW_H - 2, FB_W, 2, COL_ACCENT, 0, clip_bot);
                 }
-                if (t->track > 0) snprintf(buf, sizeof(buf), "%d", t->track);
-                else              buf[0] = '\0';
+                /* BG-playlist: t->track is the source album's own track
+                 * number, leftover metadata like t->disc -- meaningless (and
+                 * actively misleading) for a playlist's own order, so this
+                 * row never shows one at all. */
+                if (show_edit)      buf[0] = '\0';
+                else if (t->track > 0) snprintf(buf, sizeof(buf), "%d", t->track);
+                else                buf[0] = '\0';
                 draw_text_clip(fb, 20 + dx0, row_y + 22, buf, COL_DIM, TEXT_PX_SMALL,
                               56 + dx0, 0, clip_bot);
                 draw_text_clip(fb, 68 + dx0, row_y + 20, t->name, playing ? COL_ACCENT : COL_TEXT,
@@ -10964,6 +10997,7 @@ int music_entry(void *a0, void *a1) {
                     /* A playlist is an order someone chose; leave it alone. */
                     snprintf(cur_album, sizeof(cur_album), "%s", playlists[pi].name);
                     cur_artist[0] = '\0';
+                    view_art_clear();   /* BG-playlist: no per-playlist art, don't show stale art */
                     browsing_is_playlist = 1;   /* BG73 */
                     tracks_from_artist_page = 0;
                     screen = SC_TRACKS; reset_scroll();

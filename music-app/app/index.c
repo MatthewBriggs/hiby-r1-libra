@@ -128,6 +128,7 @@ static int g_scan_started;
 static volatile int g_scan_running;
 static volatile int g_scanned, g_written;
 static volatile int g_kick;          /* set by index_rescan_now(), cleared once seen */
+static volatile int g_usb_paused;
 
 /* ---- lookup, UI thread only ----------------------------------------- */
 
@@ -464,7 +465,7 @@ static void *scan_worker(void *arg) {
         if (sqlite3_prepare_v2(rodb, sql, -1, &st, NULL) == SQLITE_OK) {
             int batch = 0;
             sqlite3_exec(widb, "begin", NULL, NULL, NULL);
-            while (sqlite3_step(st) == SQLITE_ROW) {
+            while (!g_usb_paused && sqlite3_step(st) == SQLITE_ROW) {
                 const unsigned char *raw_col = sqlite3_column_text(st, 0);
                 if (!raw_col) continue;
                 char stored[LIB_PATH_LEN], real[LIB_PATH_LEN];
@@ -526,8 +527,13 @@ int index_scan_progress(int *scanned, int *written) {
 }
 
 void index_rescan_now(void) {
+    if (g_usb_paused) return;
     index_scan_start();   /* in case it was never started at all */
     g_kick = 1;
+}
+
+void index_pause_for_usb(int paused) {
+    g_usb_paused = paused != 0;
 }
 
 void index_scan_start(void) {

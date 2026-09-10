@@ -937,7 +937,30 @@ int lib_track_by_path(const char *real, lib_track_t *out) {
     sqlite3_bind_text(st, 1, pat, -1, SQLITE_TRANSIENT);
 
     int rc = -1;
-    if (sqlite3_step(st) == SQLITE_ROW) {
+    int stepped = sqlite3_step(st);
+    if (stepped != SQLITE_ROW) {
+        /* BG-playlist: an old scanner.c briefly wrote "a:\\\\" (a doubled
+         * backslash after the drive letter) instead of "a:\\" -- real_path()
+         * silently absorbs that extra separator on the way back out (its own
+         * backslash-to-slash pass turns it into a harmless doubled slash), so
+         * nothing else ever noticed, but this LIKE prefix is byte-exact and
+         * never matched those rows. Files re-tagged since the fix landed are
+         * fine; anything scanned before it and never touched since (an
+         * unchanged mtime skips re-deriving the path) is still stuck in the
+         * old form, which is common enough that a plain lookup miss is worth
+         * one retry against it rather than leaving those tracks unresolvable
+         * forever -- confirmed live: this is why a playlist entry added from
+         * one of those older files came back empty. */
+        char stored2[LIB_PATH_LEN];
+        snprintf(stored2, sizeof(stored2), "a:\\\\%s", rel);
+        for (char *q = stored2 + 3; *q; q++) if (*q == '/') *q = '\\';
+        char pat2[LIB_PATH_LEN + 2];
+        snprintf(pat2, sizeof(pat2), "%s%%", stored2);
+        sqlite3_reset(st);
+        sqlite3_bind_text(st, 1, pat2, -1, SQLITE_TRANSIENT);
+        stepped = sqlite3_step(st);
+    }
+    if (stepped == SQLITE_ROW) {
         copy_text(out->name, sizeof(out->name), sqlite3_column_text(st, 0));
         char raw[LIB_PATH_LEN];
         copy_text(raw, sizeof(raw), sqlite3_column_text(st, 1));
