@@ -829,6 +829,25 @@ static void compute_cover_palette(void) {
 static uint16_t np_col_bg(void)     { return (cover_palette_enabled && art_bits) ? np_bg     : COL_BG; }
 static uint16_t np_col_accent(void) { return (cover_palette_enabled && art_bits) ? np_accent : COL_ACCENT; }
 static uint16_t np_col_fg(void)     { return (cover_palette_enabled && art_bits) ? np_fg     : COL_TEXT; }
+/* R92 follow-up: reported live -- the unplayed track/prev-next-button glyphs
+ * kept their plain COL_LINE/COL_TEXT even once the background went dark,
+ * reading as invisible or low-contrast rather than merely dim. COL_LINE is
+ * a light-theme divider grey with no relationship to whatever this album's
+ * own background turned out to be; blending toward np_fg instead keeps it
+ * visibly *there* -- a real "unplayed" marker, not just the background
+ * showing through -- while still reading as secondary next to the accent
+ * fill and np_fg's own full-contrast text/icons. */
+static uint16_t np_blend(uint16_t a, uint16_t b, float t) {
+    int ar, ag, ab, br, bg, bb;
+    rgb565_to_rgb8(a, &ar, &ag, &ab);
+    rgb565_to_rgb8(b, &br, &bg, &bb);
+    return rgb8_to_rgb565(ar + (int)((br - ar) * t),
+                          ag + (int)((bg - ag) * t),
+                          ab + (int)((bb - ab) * t));
+}
+static uint16_t np_col_line(void) {
+    return (cover_palette_enabled && art_bits) ? np_blend(np_bg, np_fg, 0.35f) : COL_LINE;
+}
 
 static void *art_worker(void *arg) {
     (void)arg;
@@ -5641,7 +5660,7 @@ static void draw_screen(uint16_t *fb) {
                 int col_w = cx1 - cx0;
                 if (col_w < 1) col_w = 1;
                 fill_rect(fb, cx0, wave_cy - h / 2, col_w > 1 ? col_w - 1 : col_w, h,
-                          c <= played_col ? np_col_accent() : COL_LINE);
+                          c <= played_col ? np_col_accent() : np_col_line());
             }
             if (scrub_active) {
                 int w = dur > 0 ? wave_w * pos / dur : 0;
@@ -5649,7 +5668,7 @@ static void draw_screen(uint16_t *fb) {
                 fill_circle(fb, 24 + w, wave_cy, 13, np_col_accent());
             }
         } else {
-            fill_rect(fb, 24, byy, FB_W - 48, bh, COL_LINE);
+            fill_rect(fb, 24, byy, FB_W - 48, bh, np_col_line());
             if (dur > 0) {
                 int w = (FB_W - 48) * pos / dur;
                 if (w > FB_W - 48) w = FB_W - 48;
@@ -5695,20 +5714,20 @@ static void draw_screen(uint16_t *fb) {
              * below so the two cannot drift apart -- same reasoning as
              * bar_y(). */
             draw_icon(fb, FB_W, FB_H, mid - POD_SKIP_OFF - icon_skip_back.w / 2,
-                     cyy - icon_skip_back.h / 2, &icon_skip_back, COL_TEXT);
+                     cyy - icon_skip_back.h / 2, &icon_skip_back, np_col_fg());
             draw_icon(fb, FB_W, FB_H, mid + POD_SKIP_OFF - icon_skip_forward.w / 2,
-                     cyy - icon_skip_forward.h / 2, &icon_skip_forward, COL_TEXT);
+                     cyy - icon_skip_forward.h / 2, &icon_skip_forward, np_col_fg());
             const char *n10 = "10s", *n30 = "30s";
             int w10 = text_width(n10, TEXT_PX_SMALL), w30 = text_width(n30, TEXT_PX_SMALL);
-            draw_text(fb, mid - POD_SKIP_OFF - w10 / 2, cyy - TEXT_PX_SMALL / 2 + 2, n10, COL_TEXT, TEXT_PX_SMALL, FB_W);
-            draw_text(fb, mid + POD_SKIP_OFF - w30 / 2, cyy - TEXT_PX_SMALL / 2 + 2, n30, COL_TEXT, TEXT_PX_SMALL, FB_W);
+            draw_text(fb, mid - POD_SKIP_OFF - w10 / 2, cyy - TEXT_PX_SMALL / 2 + 2, n10, np_col_fg(), TEXT_PX_SMALL, FB_W);
+            draw_text(fb, mid + POD_SKIP_OFF - w30 / 2, cyy - TEXT_PX_SMALL / 2 + 2, n30, np_col_fg(), TEXT_PX_SMALL, FB_W);
 
             int scx = pod_speed_x(mid), scy = cyy;
             fill_circle(fb, scx, scy, 22, COL_LINE);
-            fill_circle(fb, scx, scy, 20, COL_BG);
+            fill_circle(fb, scx, scy, 20, np_col_bg());
             snprintf(buf, sizeof(buf), "%.1f\xc3\x97", pod_speed_permille / 1000.0);
             int sw = text_width(buf, TEXT_PX_SMALL);
-            draw_text(fb, scx - sw / 2, scy - TEXT_PX_SMALL / 2 + 2, buf, COL_TEXT, TEXT_PX_SMALL, FB_W);
+            draw_text(fb, scx - sw / 2, scy - TEXT_PX_SMALL / 2 + 2, buf, np_col_fg(), TEXT_PX_SMALL, FB_W);
 
             /* Show-notes info icon, right of the +30s arc -- moved here
              * from the top-right corner of the cover art per explicit
@@ -5718,8 +5737,8 @@ static void draw_screen(uint16_t *fb) {
             if (pod_notes_avail) {
                 int icx = pod_info_x(mid), icy = cyy;
                 fill_circle(fb, icx, icy, 22, COL_LINE);
-                fill_circle(fb, icx, icy, 20, COL_BG);
-                draw_text(fb, icx - 3, icy - TEXT_PX_BODY / 2 + 2, "i", COL_TEXT, TEXT_PX_BODY, FB_W);
+                fill_circle(fb, icx, icy, 20, np_col_bg());
+                draw_text(fb, icx - 3, icy - TEXT_PX_BODY / 2 + 2, "i", np_col_fg(), TEXT_PX_BODY, FB_W);
             }
         } else {
             /* previous: triangle against a bar. Offset 96, not the old 128 --
@@ -5728,11 +5747,11 @@ static void draw_screen(uint16_t *fb) {
              * this row reads as one cluster rather than two icons stranded
              * out at the edges. R47's mode button below took the room this
              * freed on the left. */
-            fill_triangle(fb, mid - 96, cyy, 34, -1, COL_TEXT);
-            fill_rect(fb, mid - 96 - 15 - 5, cyy - 17, 5, 34, COL_TEXT);
+            fill_triangle(fb, mid - 96, cyy, 34, -1, np_col_fg());
+            fill_rect(fb, mid - 96 - 15 - 5, cyy - 17, 5, 34, np_col_fg());
             /* next: mirrored */
-            fill_triangle(fb, mid + 96, cyy, 34, +1, COL_TEXT);
-            fill_rect(fb, mid + 96 + 15, cyy - 17, 5, 34, COL_TEXT);
+            fill_triangle(fb, mid + 96, cyy, 34, +1, np_col_fg());
+            fill_rect(fb, mid + 96 + 15, cyy - 17, 5, 34, np_col_fg());
 
             /* R47: Normal -> Shuffle -> Repeat -> Normal, one button. Same
              * slot the audiobook player uses for its own extra control past
@@ -5752,12 +5771,12 @@ static void draw_screen(uint16_t *fb) {
             int pmx = mid - 96 - 82, pmy = cyy;
             int pm_on = shuffle_enabled || repeat_mode != REPEAT_OFF;
             fill_circle(fb, pmx, pmy, 26, COL_DIM);
-            fill_circle(fb, pmx, pmy, 25, COL_BG);
+            fill_circle(fb, pmx, pmy, 25, np_col_bg());
             const icon_t *pmicon = shuffle_enabled ? &icon_mode_shuffle
                                   : repeat_mode != REPEAT_OFF ? &icon_mode_repeat
                                   : &icon_mode_off;
             draw_icon(fb, FB_W, FB_H, pmx - 13, pmy - 13, pmicon,
-                      pm_on ? COL_ACCENT : COL_DIM);
+                      pm_on ? np_col_accent() : COL_DIM);
         }
 
         fill_circle(fb, mid, cyy, 42, np_col_accent());
