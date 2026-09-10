@@ -1063,6 +1063,9 @@ static int   g_vol = 70;
 static char  g_path[512];
 static char  g_next_path[512];      /* queued by the UI, taken at the boundary */
 static int   g_advance;             /* bumped each time the worker rolls on */
+/* Set by audio_skip_to(): the worker takes it as an immediate end of track,
+ * so a skip reuses the gapless handover instead of closing the device. */
+static int   g_skip_now;
 static int   g_speed = 1000;        /* permille, WSOLA time-stretch; 1000 = bypass */
 /* R29: raw abs-sample peak of the most recent chunk actually written to the
  * output, computed in the decode worker right after the volume gain that
@@ -2241,6 +2244,35 @@ static void *worker(void *arg) {
          * than handed to dr_flac/dr_wav's own undithered s16 reader. */
         uint64_t got = src_wide ? dec_read32(d, buf32, CHUNK_FRAMES)
                                 : dec_read(d, buf, CHUNK_FRAMES);
+
+        /* A skip is just an early end of track.
+         *
+         * Reaching the end of a track already hands over to the next one
+         * without touching the open device (see the got == 0 block below,
+         * and the comment there about where the gap used to come from).
+         * Skipping did not: it went out through audio_play(), which stops
+         * the worker, closes the PCM and opens a new one. On the local DAC
+         * that is a quick reopen; over Bluetooth it tears down the A2DP
+         * stream and builds a fresh bluealsa connection, and *nothing is
+         * transmitted* until that completes.
+         *
+         * Measured on a verified capture of the Bluetooth stream: every
+         * track change punched a hole of 250-400 ms, every
+         * music/audiobook/podcast switch 500-1200 ms, and each hole ended
+         * to the millisecond on the log line for the new PCM opening. 49
+         * gaps, 14.2 s of audio simply absent, in 13 minutes.
+         *
+         * So a skip now sets the next path and raises this flag, and the
+         * worker treats it exactly as the natural boundary it already
+         * handles well: same decoder handover, same device kept open, same
+         * reopen only if the format genuinely changes. */
+        if (got > 0) {
+            pthread_mutex_lock(&g_lock);
+            int skip = g_skip_now && g_next_path[0];
+            if (skip) g_skip_now = 0;
+            pthread_mutex_unlock(&g_lock);
+            if (skip) got = 0;
+        }
         /* done/g_pos_ms track source frames throughout -- captured before
          * decimation below can shrink `got`, so position and duration (both
          * figured against `rate`, the source rate) read correctly regardless
@@ -2519,6 +2551,7 @@ int audio_play(const char *path) {
     g_seek_to_ms = -1;
     g_next_path[0] = '\0';
     g_advance = 0;
+    g_skip_now = 0;
     g_out_lost = 0;
     pthread_mutex_unlock(&g_lock);
     if (pthread_create(&g_thread, NULL, worker, NULL) != 0) {
@@ -2531,6 +2564,29 @@ int audio_play(const char *path) {
     g_thread_valid = 1;
     pthread_mutex_unlock(&g_lock);
     return 0;
+}
+
+/* Skip straight to `path`, keeping the output device open if the worker is
+ * already running and the format allows it. Returns 0 if the running worker
+ * took it, or falls back to a full audio_play() when there is nothing to
+ * hand over to (stopped, paused into a dead worker, or no worker at all).
+ *
+ * The caller does not need to know which happened: both end with `path`
+ * playing. The difference is only whether the Bluetooth link had to be torn
+ * down to get there -- see the skip handling in worker(). */
+int audio_skip_to(const char *path) {
+    if (!path || !path[0]) return -1;
+    pthread_mutex_lock(&g_lock);
+    int live = g_running && g_active && g_thread_valid;
+    if (live) {
+        snprintf(g_next_path, sizeof(g_next_path), "%s", path);
+        g_skip_now = 1;
+        g_seek_to_ms = -1;
+        g_paused = 0;
+    }
+    pthread_mutex_unlock(&g_lock);
+    if (live) return 0;
+    return audio_play(path);
 }
 
 void audio_stop(void) {

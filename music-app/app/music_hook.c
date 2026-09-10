@@ -37,6 +37,7 @@
 #include <dirent.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/ioctl.h>
 #include <sys/utsname.h>
@@ -977,8 +978,37 @@ static pthread_t cover_prewarm_thread;
  * starts, cleared as the very last thing the worker itself does. */
 static volatile int cover_prewarm_running;
 
+/* Every artwork worker calls this first, and it is the whole reason they can
+ * run at all without being heard.
+ *
+ * Measured over a verified Bluetooth capture: 49 dropouts and 14.2 s of
+ * audio missing entirely across 13 minutes, in gaps of 280-715 ms, one at
+ * every track change, every music/audiobook/podcast switch, and even while
+ * merely scrolling menus. Each gap sat exactly on top of a burst where this
+ * single core was pinned at 100%, with an artwork thread taking 47-67% of
+ * it -- decoding a cover is genuinely expensive here.
+ *
+ * What makes that fatal specifically on Bluetooth is apply_decode_priority()
+ * in audio.c: it gives the decode thread nice -8 on the local DAC, but
+ * deliberately leaves it at 0 over Bluetooth so it cannot starve bluealsa's
+ * encoder, which is a separate process downstream of us. Correct as far as
+ * it goes -- but it also left decode with no advantage over *our own*
+ * background threads, so artwork and audio competed as equals and audio lost.
+ *
+ * Lowering the artwork threads is the fix that does not re-open that: the
+ * decoder keeps exactly the share it has now, bluealsa's encoder keeps its
+ * share, and only this work yields. Nobody notices a cover arriving a
+ * fraction of a second later; everybody hears a 700 ms hole. */
+#define ART_WORKER_NICE 10
+
+static void art_worker_yield_priority(const char *what) {
+    if (setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), ART_WORKER_NICE) != 0)
+        mlog("[music] %s: could not lower thread priority\n", what);
+}
+
 static void *cover_prewarm_worker(void *arg) {
     (void)arg;
+    art_worker_yield_priority("cover-prewarm");
     for (int i = 0; i < cover_prewarm_n; i++) {
         cover_prewarm_item_t *it = &cover_prewarm_items[i];
         uint16_t bg, accent, fg;
@@ -1104,6 +1134,7 @@ static uint16_t np_col_line(void) {
 
 static void *art_worker(void *arg) {
     (void)arg;
+    art_worker_yield_priority("art");
     char track[512], artist[LIB_NAME_LEN], album[LIB_NAME_LEN];
     pthread_mutex_lock(&art_lock);
     snprintf(track, sizeof(track), "%s", art_want);
@@ -1301,6 +1332,7 @@ static int g_view_art_gone_frame;
 
 static void *view_art_worker(void *arg) {
     (void)arg;
+    art_worker_yield_priority("view-art");
     char track[512], artist[LIB_NAME_LEN], album[LIB_NAME_LEN];
     pthread_mutex_lock(&view_art_lock);
     snprintf(track, sizeof(track), "%s", view_art_want);
@@ -1444,6 +1476,7 @@ static void artist_cache_key(const char *artist, char *out, size_t out_n) {
 
 static void *artist_art_worker(void *arg) {
     (void)arg;
+    art_worker_yield_priority("artist-art");
     char artist[LIB_NAME_LEN];
     pthread_mutex_lock(&artist_art_lock);
     snprintf(artist, sizeof(artist), "%s", artist_art_want);
@@ -4561,7 +4594,18 @@ static void play_index(int i) {
     if (i < 0 || i >= queue_n) return;
     cur_track = i;
     queue_apply_pending();   /* BG85 */
-    audio_play(queue[i].path);
+    /* audio_skip_to(), not audio_play(): this is every Next/Prev and queue
+     * tap, and audio_play() stops the worker and closes the output device to
+     * start the new track. Over Bluetooth that tears down the A2DP stream --
+     * measured as a 250-400 ms hole in the transmitted audio at every single
+     * skip. Handing the path to the running worker instead reuses the same
+     * seamless handover the natural end of a track already uses.
+     *
+     * Only here, deliberately: the podcast and audiobook entry points follow
+     * their own start with audio_seek_ms() to restore a resume position, and
+     * an asynchronous handover would race that seek. They keep audio_play()
+     * until the handover can carry a start offset with it. */
+    audio_skip_to(queue[i].path);
     /* R29: finish whatever the previous track's own capture was, then
      * decide what this one shows -- a cache if one already exists (every
      * playthrough after the one that built it), nothing yet while this
@@ -4960,21 +5004,13 @@ static void draw_mini(uint16_t *fb) {
          * for the rare track with no artist tag of its own at all. */
         const char *sub = audiobook_mode ? q_album
                          : (t->artist[0] ? t->artist : q_artist);
-        /* R47: a short suffix rather than a second line or icon -- this bar
-         * has no room to spare (see text_edge above), and the artist name
-         * is what a glance actually wants; shuffle/repeat only need to be
-         * noticeable, not detailed, here. */
-        if (!audiobook_mode && (shuffle_enabled || repeat_mode != REPEAT_OFF)) {
-            char subbuf[96];
-            const char *tag = repeat_mode == REPEAT_ONE ? " \xc2\xb7 R1"
-                             : repeat_mode == REPEAT_ALL ? " \xc2\xb7 R"
-                             : "";
-            snprintf(subbuf, sizeof(subbuf), "%s%s%s", sub,
-                     shuffle_enabled ? " \xc2\xb7 S" : "", tag);
-            draw_text(fb, text_x, by + 42, subbuf, COL_DIM, TEXT_PX_SMALL, text_edge);
-        } else {
-            draw_text(fb, text_x, by + 42, sub, COL_DIM, TEXT_PX_SMALL, text_edge);
-        }
+        /* R47's " . S" / " . R" / " . R1" suffix is gone: appended to the
+         * artist line it read as part of the artist ("New Order . R1"),
+         * which is what it was reported as. The mode is already shown
+         * unambiguously by the transport row's own mode button, so this was
+         * a second, worse copy of that state rather than the only way to
+         * see it. */
+        draw_text(fb, text_x, by + 42, sub, COL_DIM, TEXT_PX_SMALL, text_edge);
     }
 
     int cy = by + MINI_H / 2;
@@ -5876,7 +5912,6 @@ static void draw_screen(uint16_t *fb) {
          * flimsy next to the waveform's own columns. Bumped to a flat 10
          * (14 scrubbing), the same +4 bump on top scrubbing already had. */
         int bh = scrub_active ? 14 : 10;
-        int byy = by - (bh - 10) / 2;
         /* R86 follow-up: R86's first cut grew the waveform around the
          * *plain bar's* centre (`by`) without checking what that centre
          * actually had room for -- screenshotted live, the taller columns
@@ -5898,35 +5933,25 @@ static void draw_screen(uint16_t *fb) {
          * track got depended on nothing the listener could see (whether
          * its waveform happened to be cached yet). Computed unconditionally
          * now, off `by` alone, so every track's clock sits in exactly the
-         * same place regardless of wave_loaded -- only max_h (how tall the
-         * waveform itself gets to be) stays conditional, since a plain bar
-         * has no equivalent height to compute. */
+         * same place regardless of wave_loaded.
+         *
+         * R104: wave_cy/max_h moved out of the wave_loaded branch and made
+         * unconditional too, same reasoning as clock_y just above -- the
+         * plain bar was still centring on raw `by`, 2-6px above the true
+         * midpoint of the title/clock gap once R102 thickened it, reported
+         * live as "needs to be more vertically central." wave_cy already
+         * computed the correct centre of exactly that gap for the waveform
+         * case; the plain bar now shares it rather than deriving its own
+         * off `by`. max_h keeps its own >=16 floor even though the plain
+         * bar never reads it, since wave_cy's derivation depends on it. */
         int wave_top = ty + 82 + TEXT_PX_SMALL + 12;
         int wave_bot = (by + 70 + CTRL_NUDGE_PX) - 42 - 10;
         int gap = 10;
         int clock_y = wave_bot - 6;
-        int wave_cy = by, max_h = 32;
-        if (wave_loaded) {
-            /* R86 follow-up again: anchored to the waveform before (clock
-             * sat a fixed gap under it), so pushing the clock down and
-             * growing the waveform were two separate, easy-to-desync
-             * requests. Anchored to the bottom bound instead: the clock
-             * sits close to the transport buttons, and the waveform fills
-             * and centres in whatever is left above it, growing
-             * automatically the next time the clock moves down.
-             *
-             * The previous cut of this same idea (`wave_bot - clock_h +
-             * 6`) actually landed the clock *higher* than the version
-             * before it -- clock_h (36, TEXT_PX_SMALL+14) subtracted more
-             * than the +6 added back, a sign error going the wrong
-             * direction that was never checked against the number it
-             * replaced. Pinned hard against the bottom bound now instead
-             * (a small fixed margin off the buttons, not a size-dependent
-             * subtraction that can flip sign again). */
-            max_h = (clock_y - gap) - wave_top;
-            if (max_h < 16) max_h = 16;
-            wave_cy = wave_top + max_h / 2;
-        }
+        int max_h = (clock_y - gap) - wave_top;
+        if (max_h < 16) max_h = 16;
+        int wave_cy = wave_top + max_h / 2;
+        int byy = wave_cy - bh / 2;
         /* R29: the waveform seek bar, when this track has a cached one
          * (Music only -- wave_loaded is never set for a podcast episode,
          * see play_index()'s own comment, so this always falls through to
@@ -5979,7 +6004,7 @@ static void draw_screen(uint16_t *fb) {
                 if (w > FB_W - 48) w = FB_W - 48;
                 fill_rect(fb, 24, byy, w, bh, np_col_accent());
                 if (scrub_active)
-                    fill_circle(fb, 24 + w, by + 3, 13, np_col_accent());
+                    fill_circle(fb, 24 + w, wave_cy, 13, np_col_accent());
             }
         }
         snprintf(buf, sizeof(buf), "%d:%02d", pos / 60000, (pos / 1000) % 60);
@@ -10931,7 +10956,21 @@ int music_entry(void *a0, void *a1) {
                      * is matched rather than the literal text "Unknown". */
                     snprintf(cur_artist, sizeof(cur_artist), "%s",
                              row->owner[0] ? LIB_UNKNOWN_MARK : row->name);
-                    snprintf(albums_artist, sizeof(albums_artist), "%s", cur_artist);
+                    /* BG-albumshdr: albums_artist must only ever be set where
+                     * SC_ALBUMS is actually entered (see its own comment) --
+                     * this row lands on SC_ARTIST_PAGE directly (the "Reported
+                     * live" shortcut below), never SC_ALBUMS itself, so this
+                     * used to leak the tapped artist's name into albums_artist
+                     * with nothing to ever clear it again. The next plain
+                     * "Albums" visit reached by backing out of some unrelated
+                     * album's track list (not via the Music menu's own clear,
+                     * which only fires when a menu row is freshly tapped)
+                     * restored that stale name as if Albums were still
+                     * filtered by it -- reported
+                     * live as "Queen" sitting in the header of what was
+                     * visibly the full, unfiltered album list. Same bug class
+                     * BG7/the SC_PLAYING case above already fixed twice for
+                     * two other routes into this exact mistake. */
                     artists_scroll_saved = scroll;         /* BG37 */
                     artists_scroll_px_saved = scroll_px;
                     /* Reported live: tapping an artist row here should land

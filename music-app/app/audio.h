@@ -3,6 +3,12 @@
 #define AUDIO_H
 #include <stdint.h>
 int  audio_play(const char *path);
+/* Same end result as audio_play(), but hands the new track to the running
+ * worker instead of stopping it, so the output device stays open across the
+ * change. Over Bluetooth that is the difference between a seamless join and
+ * a 250-400 ms hole while the A2DP stream is torn down and rebuilt. Falls
+ * back to audio_play() when nothing is playing. */
+int  audio_skip_to(const char *path);
 void audio_stop(void);
 void audio_toggle(void);
 void audio_seek_ms(int ms);
