@@ -741,12 +741,22 @@ static void pal_bin_rgb(int bin, int *r, int *g, int *b) {
  * (the fix for "the seek bar looked awful"). */
 static void derive_palette_from_bits(const uint16_t *bits, uint16_t *out_bg,
                                      uint16_t *out_accent, uint16_t *out_fg) {
-    static uint32_t *hist_dark, *hist_light;
-    if (!hist_dark)  hist_dark  = calloc(PAL_BINS, sizeof(uint32_t));
-    if (!hist_light) hist_light = calloc(PAL_BINS, sizeof(uint32_t));
-    if (!hist_dark || !hist_light) return;
-    memset(hist_dark, 0, PAL_BINS * sizeof(uint32_t));
-    memset(hist_light, 0, PAL_BINS * sizeof(uint32_t));
+    /* R94 follow-up: reported live as general lag and lockups right after
+     * the prewarm pass shipped -- these were `static`, reused between
+     * calls to avoid a malloc/free pair, back when this only ever ran on
+     * the UI thread. cover_prewarm_worker() now calls this same function
+     * from its own thread, so a live palette computation (a track
+     * changing) and the background prewarm pass could land inside this
+     * function at the same time, both reading and writing the *same*
+     * unprotected buffers -- a data race, not just a slowdown, and a
+     * plausible cause of an outright hang or corruption depending on
+     * exactly where the two interleaved. Heap-allocated per call instead:
+     * 32KB, freed before returning, cheap next to decoding the cover
+     * itself and the only way two threads can each get their own copy
+     * without a mutex serializing them against each other. */
+    uint32_t *hist_dark  = calloc(PAL_BINS, sizeof(uint32_t));
+    uint32_t *hist_light = calloc(PAL_BINS, sizeof(uint32_t));
+    if (!hist_dark || !hist_light) { free(hist_dark); free(hist_light); return; }
 
     int total = ART_PX * ART_PX;
     for (int i = 0; i < total; i += 4) {   /* every 4th pixel: plenty for a histogram */
@@ -800,6 +810,9 @@ static void derive_palette_from_bits(const uint16_t *bits, uint16_t *out_bg,
     *out_bg     = rgb8_to_rgb565(bgr, bgg, bgb);
     *out_accent = rgb8_to_rgb565(acr, acg, acb);
     *out_fg     = pal_luma(bgr, bgg, bgb) > 0.5f ? 0x0000 : 0xFFFF;
+
+    free(hist_dark);
+    free(hist_light);
 }
 
 /* R94: on-disk cache so an album's palette only ever needs deriving once --
@@ -909,7 +922,15 @@ typedef struct {
 static cover_prewarm_item_t cover_prewarm_items[COVER_PREWARM_N];
 static int       cover_prewarm_n;
 static pthread_t cover_prewarm_thread;
-static int       cover_prewarm_thread_valid;
+/* R94 follow-up: reported live as lag/lockups. This used to be joined from
+ * cover_prewarm_start() on the UI thread whenever a previous pass was
+ * still running -- decoding up to 10 covers is real work on this CPU, and
+ * blocking the UI thread on it, for however long it took, is a stall
+ * severe enough to read as a lockup. Detached instead (never joined at
+ * all -- see cover_prewarm_start()'s own comment), with this plain flag
+ * as the only "is one already running" signal: set before the thread
+ * starts, cleared as the very last thing the worker itself does. */
+static volatile int cover_prewarm_running;
 
 static void *cover_prewarm_worker(void *arg) {
     (void)arg;
@@ -943,6 +964,7 @@ static void *cover_prewarm_worker(void *arg) {
             free(bits);
         }
     }
+    cover_prewarm_running = 0;
     return NULL;
 }
 
@@ -952,13 +974,13 @@ static void *cover_prewarm_worker(void *arg) {
  * the snapshot into cover_prewarm_items[] happens here, synchronously
  * (cheap: at most 10 small queries), and only the slow part -- decoding up
  * to 10 covers and hashing them -- runs on cover_prewarm_worker()'s own
- * thread. */
+ * thread, detached (see cover_prewarm_running's own comment) rather than
+ * ever joined from here. A pass still running from an earlier trigger
+ * just means this one is skipped outright -- another scan finishing, or
+ * the toggle being flipped again, tries again later; nothing is lost by
+ * not stacking a second pass on top of one already in flight. */
 static void cover_prewarm_start(void) {
-    if (!cover_palette_enabled) return;
-    if (cover_prewarm_thread_valid) {
-        pthread_join(cover_prewarm_thread, NULL);
-        cover_prewarm_thread_valid = 0;
-    }
+    if (!cover_palette_enabled || cover_prewarm_running) return;
     lib_row_t rows[COVER_PREWARM_N];
     int n = lib_albums_recent_added(rows, COVER_PREWARM_N);
     cover_prewarm_n = 0;
@@ -977,9 +999,13 @@ static void cover_prewarm_start(void) {
         snprintf(it->track, sizeof(it->track), "%s", one[0].path);
         cover_prewarm_n++;
     }
-    if (cover_prewarm_n > 0 &&
-        pthread_create(&cover_prewarm_thread, NULL, cover_prewarm_worker, NULL) == 0)
-        cover_prewarm_thread_valid = 1;
+    if (cover_prewarm_n > 0) {
+        cover_prewarm_running = 1;
+        if (pthread_create(&cover_prewarm_thread, NULL, cover_prewarm_worker, NULL) == 0)
+            pthread_detach(cover_prewarm_thread);
+        else
+            cover_prewarm_running = 0;
+    }
 }
 
 /* Drop-in replacements for COL_BG/COL_ACCENT/COL_TEXT at any Now Playing
@@ -5828,6 +5854,12 @@ static void draw_screen(uint16_t *fb) {
              * source instead (see WAVE_BUCKETS's own comment): 144 divides
              * this screen's 432px exactly, so cx1-cx0 below is a constant
              * 3 for every column, not merely close. */
+            /* R94 follow-up: reported live as general lag -- np_col_accent()/
+             * np_col_line() were being called (and np_col_line() doing real
+             * float HSL/blend math) once per column, up to 144 times every
+             * single frame, recomputing the exact same two colours each
+             * time since neither changes mid-frame. Hoisted out to once. */
+            uint16_t wave_accent = np_col_accent(), wave_line = np_col_line();
             for (int c = 0; c < WAVE_BUCKETS; c++) {
                 int h = max_h * wave_buckets[c] / 255;
                 if (h < 2) h = 2;
@@ -5836,7 +5868,7 @@ static void draw_screen(uint16_t *fb) {
                 int col_w = cx1 - cx0;
                 if (col_w < 1) col_w = 1;
                 fill_rect(fb, cx0, wave_cy - h / 2, col_w > 1 ? col_w - 1 : col_w, h,
-                          c <= played_col ? np_col_accent() : np_col_line());
+                          c <= played_col ? wave_accent : wave_line);
             }
             if (scrub_active) {
                 int w = dur > 0 ? wave_w * pos / dur : 0;
