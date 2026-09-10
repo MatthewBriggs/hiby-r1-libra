@@ -7516,14 +7516,22 @@ static void draw_quick_settings(uint16_t *fb) {
     }
 
     int by3 = qs_eq_y();
-    int on = eq_enabled();
+    /* R89: on's own preference is untouched by USB Transport Mode -- see
+     * its engage-site comment -- but showing the toggle as ON while the
+     * bypass has actually skipped processing entirely reads as "PEQ is
+     * still on" (reported live), which is backwards: it's the one thing
+     * that's genuinely off right now. Drawn state follows what is actually
+     * running, not the saved setting, same distinction the volume toast
+     * already draws for the locked value vs. the saved one. */
+    int on = eq_enabled() && !usb_bypass_active;
     /* Block-centered vertically, same as Wi-Fi/Bluetooth above (y was +6
      * when the icon was smaller and merely aligned to the title line). x=29
      * for the same centroid-matching reason as Bluetooth's +34 above --
      * measured centroid 42 against Wi-Fi's 46, so +5. */
     draw_eq_icon(fb, 29, by3 + 16, on ? COL_ACCENT : COL_DIM);
     draw_text(fb, QS_LABEL_X, by3 + 6, "Parametric EQ", on ? COL_TEXT : COL_DIM, TEXT_PX_SMALL, 200);
-    draw_text(fb, QS_LABEL_X, by3 + 32, eq_cur_path[0] ? eq_cur.name : "no profile",
+    draw_text(fb, QS_LABEL_X, by3 + 32,
+              usb_bypass_active ? "USB Transport Mode" : eq_cur_path[0] ? eq_cur.name : "no profile",
               COL_DIM, TEXT_PX_SMALL, FB_W - 180);
     draw_toggle_switch(fb, by3, on);
 
@@ -7532,10 +7540,13 @@ static void draw_quick_settings(uint16_t *fb) {
      * menu). Reuses the same squiggle icon: MSEB is still, visually, "an
      * EQ" -- a distinct glyph for it would say otherwise. */
     int by4 = qs_mseb_y();
-    draw_eq_icon(fb, 29, by4 + 16, mseb_on ? COL_ACCENT : COL_DIM);
-    draw_text(fb, QS_LABEL_X, by4 + 6, "MSEB", mseb_on ? COL_TEXT : COL_DIM, TEXT_PX_SMALL, 200);
-    draw_text(fb, QS_LABEL_X, by4 + 32, "HiBy tuning bands", COL_DIM, TEXT_PX_SMALL, FB_W - 180);
-    draw_toggle_switch(fb, by4, mseb_on);
+    int mseb_shown = mseb_on && !usb_bypass_active;
+    draw_eq_icon(fb, 29, by4 + 16, mseb_shown ? COL_ACCENT : COL_DIM);
+    draw_text(fb, QS_LABEL_X, by4 + 6, "MSEB", mseb_shown ? COL_TEXT : COL_DIM, TEXT_PX_SMALL, 200);
+    draw_text(fb, QS_LABEL_X, by4 + 32,
+              usb_bypass_active ? "USB Transport Mode" : "HiBy tuning bands",
+              COL_DIM, TEXT_PX_SMALL, FB_W - 180);
+    draw_toggle_switch(fb, by4, mseb_shown);
 
     /* R83: what's actually playing's own format/quality -- moved here,
      * under MSEB, from the top bar next to volume (asked for live, a
