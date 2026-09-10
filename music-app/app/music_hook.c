@@ -877,22 +877,37 @@ static void pal_cache_save(const char *artist, const char *album,
     if (!ok || rename(tmp, p) != 0) unlink(tmp);
 }
 
+/* R98: whether np_bg/np_accent/np_fg actually hold a real, current palette
+ * -- separate from whether art_bits (the full ART_PX*ART_PX bitmap) has
+ * finished loading. Reported live as the theme applying noticeably later
+ * than it could: every np_col_*() helper gated on art_bits being non-NULL,
+ * so even a *cached* palette -- available instantly, before this function
+ * even runs a second time -- sat unused until the much slower full-art
+ * decode/blit pipeline also finished. The two are genuinely independent:
+ * art_want_artist/art_want_album (what pal_cache_load() keys on) are set
+ * synchronously by art_request() the moment a track changes, well before
+ * art_worker() has even started decoding, let alone finished -- a cache
+ * hit is known immediately. */
+static int np_palette_valid;
+
 /* Recomputes np_bg/np_accent/np_fg for whatever art_bits currently holds,
  * only when it has actually changed (np_palette_seq vs art_seq_v -- the
  * same R84 same-album-skip signal Now Playing's own art already uses, so
  * this costs nothing on a same-album track change). Checks the on-disk
  * cache first -- a hit (this album was played before, or cover_prewarm_
- * worker() got to it first) skips the histogram pass entirely, which is
- * what makes a freshly-scanned album's very first playthrough show its
- * real theme immediately rather than the plain default for one frame
- * while this runs. */
+ * worker() got to it first) skips the histogram pass entirely *and* the
+ * wait for art_bits, which is what makes a freshly-scanned album's very
+ * first playthrough show its real theme immediately rather than the plain
+ * default while either runs. */
 static void compute_cover_palette(void) {
     int seq = art_seq();
     if (seq == np_palette_seq) return;
     np_palette_seq = seq;
 
-    if (pal_cache_load(art_want_artist, art_want_album, &np_bg, &np_accent, &np_fg))
+    if (pal_cache_load(art_want_artist, art_want_album, &np_bg, &np_accent, &np_fg)) {
+        np_palette_valid = 1;
         return;
+    }
 
     pthread_mutex_lock(&art_lock);
     uint16_t *bits = art_bits;
@@ -909,10 +924,11 @@ static void compute_cover_palette(void) {
         else bits = NULL;
     }
     pthread_mutex_unlock(&art_lock);
-    if (!bits) return;   /* scratch alloc failed: leave last-known colours alone */
+    if (!bits) { np_palette_valid = 0; return; }   /* nothing cached, art not loaded yet either */
 
     derive_palette_from_bits(bits, &np_bg, &np_accent, &np_fg);
     pal_cache_save(art_want_artist, art_want_album, np_bg, np_accent, np_fg);
+    np_palette_valid = 1;
 }
 
 /* R94: precomputes recently-added albums' palettes right after a library
@@ -1025,9 +1041,9 @@ static void cover_prewarm_start(void) {
  * draw site that should follow the cover art -- each falls straight back
  * to the plain theme colour whenever the toggle is off or there is no art
  * to derive from, so a call site never needs its own if/else. */
-static uint16_t np_col_bg(void)     { return (cover_palette_enabled && art_bits) ? np_bg     : COL_BG; }
-static uint16_t np_col_accent(void) { return (cover_palette_enabled && art_bits) ? np_accent : COL_ACCENT; }
-static uint16_t np_col_fg(void)     { return (cover_palette_enabled && art_bits) ? np_fg     : COL_TEXT; }
+static uint16_t np_col_bg(void)     { return (cover_palette_enabled && np_palette_valid) ? np_bg     : COL_BG; }
+static uint16_t np_col_accent(void) { return (cover_palette_enabled && np_palette_valid) ? np_accent : COL_ACCENT; }
+static uint16_t np_col_fg(void)     { return (cover_palette_enabled && np_palette_valid) ? np_fg     : COL_TEXT; }
 /* R92 follow-up: reported live -- "on dark backgrounds, all text should be
  * white". Secondary text (artist/album, track count, the clock) was left
  * at plain COL_DIM regardless of the art, which stayed a fixed grey no
@@ -1036,7 +1052,7 @@ static uint16_t np_col_fg(void)     { return (cover_palette_enabled && art_bits)
  * own comment) -- this is the same colour, just falling back to COL_DIM
  * rather than COL_TEXT when the feature is off, so a call site that used
  * to be dim stays dim with cover colours disabled. */
-static uint16_t np_col_dim(void)    { return (cover_palette_enabled && art_bits) ? np_fg     : COL_DIM; }
+static uint16_t np_col_dim(void)    { return (cover_palette_enabled && np_palette_valid) ? np_fg     : COL_DIM; }
 /* R96: the mode (shuffle/repeat) and queue buttons' own ring+glyph --
  * explicit request that both go white (ring and icon alike) whenever the
  * background is genuinely dark, reverting to the plain COL_DIM grey on a
@@ -1047,7 +1063,7 @@ static uint16_t np_col_dim(void)    { return (cover_palette_enabled && art_bits)
  * for the dark case (np_fg's own black value is never what's wanted here,
  * even on a light background -- COL_DIM is). */
 static uint16_t np_col_circle(void) {
-    if (!(cover_palette_enabled && art_bits)) return COL_DIM;
+    if (!(cover_palette_enabled && np_palette_valid)) return COL_DIM;
     return np_fg == 0xFFFF ? 0xFFFF : COL_DIM;
 }
 /* R92 follow-up: reported live -- the unplayed track/prev-next-button glyphs
@@ -1067,7 +1083,7 @@ static uint16_t np_blend(uint16_t a, uint16_t b, float t) {
                           ab + (int)((bb - ab) * t));
 }
 static uint16_t np_col_line(void) {
-    return (cover_palette_enabled && art_bits) ? np_blend(np_bg, np_fg, 0.35f) : COL_LINE;
+    return (cover_palette_enabled && np_palette_valid) ? np_blend(np_bg, np_fg, 0.35f) : COL_LINE;
 }
 
 static void *art_worker(void *arg) {

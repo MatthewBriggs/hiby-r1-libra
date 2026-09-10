@@ -437,8 +437,25 @@ uint16_t *cover_load(const char *jpeg_path, const char *cache_key, int px) {
      * treats that as "try the next art candidate" (a network-fetched cover,
      * typically), the same fallback BG46's own size-decline case above
      * already relies on. */
+    /* BG46 follow-up 3: reported live -- a real photo (two people, both in
+     * mostly-black clothing, against a dark wood background: Lisa
+     * Batiashvili/Daniel Barenboim's "Tchaikovsky, Sibelius: Violin
+     * Concertos") got wrongly rejected by this same check. 8 consecutive
+     * rows is a trivial fraction of any real decode (under 2% of a 480px
+     * one) -- a dark suit jacket or a shadow can easily span that with no
+     * lighter pixel anywhere in it, with nothing wrong with the decode at
+     * all. Scaled to the source instead of a small fixed count: the
+     * confirmed real defect (Elbow's cover) blanked roughly half the
+     * image, so a run has to cover a full third of the source's own
+     * height before it's treated as the defect rather than legitimate
+     * content -- high enough that genuine dark clothing/shadow, which
+     * still has *some* lighter interruption (a collar, a button, a fold)
+     * over that large a span in virtually any real photo, doesn't trip
+     * it, while a true "this whole band came back blank" defect still
+     * does. */
     int zero_run = 0;
-    #define COVER_ZERO_RUN_LIMIT 8
+    int zero_run_limit = side / 3;
+    if (zero_run_limit < 40) zero_run_limit = 40;   /* floor for a small/thumbnail source */
     for (int y = 0; y < px; y++) {
         int row_end = (int)((int64_t)(y + 1) * side / px);
         if (row_end > side) row_end = side;
@@ -476,7 +493,7 @@ uint16_t *cover_load(const char *jpeg_path, const char *cache_key, int px) {
                     for (size_t i = 0; i < (size_t)w * comps; i++)
                         if (row[i] != 0) { all_zero = 0; break; }
                     zero_run = all_zero ? zero_run + 1 : 0;
-                    if (zero_run >= COVER_ZERO_RUN_LIMIT) {
+                    if (zero_run >= zero_run_limit) {
                         free(racc); free(gacc); free(bacc);
                         longjmp(jerr.jump, 1);
                     }
