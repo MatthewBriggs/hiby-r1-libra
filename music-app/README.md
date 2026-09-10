@@ -108,6 +108,24 @@ Three things cost real time and are worth knowing:
 - Opening the PCM without sizing the buffer, setting a start threshold and
   calling `prepare` looks fine and then parks forever in `wait_for_avail`
   about eleven seconds in: the stream never starts, so nothing drains.
+- This device's own `libjpeg` (dlopened by `cover.c`, not bundled) has a
+  confirmed decode defect: for some source JPEGs, an interior band of
+  scanlines comes back as literal zero bytes while `jpeg_read_scanlines`
+  still reports success and raises no warning — seen both as an undersized
+  embedded thumbnail returning blank interior rows (`cover_load()`'s own
+  size-decline guard) and, separately, as a full-size album cover
+  decoding correctly on top but leaving the rest a flat grey band. Worked
+  around rather than fixed: a run of many consecutive byte-identical
+  all-zero scanlines is essentially impossible from genuine compressed
+  image data (DCT/quantization noise alone rules it out, even over a
+  legitimately near-black region), so `cover_load()` treats a long enough
+  run as this defect and fails the decode outright, falling through to
+  the next art candidate. A real fix would mean building and bundling our
+  own libjpeg for this target instead of dlopening the device's — not
+  attempted here (a MIPS cross-compile + packaging job of its own), but
+  the toolchain used for this project's kernel work (`mips-linux-gnu-gcc`,
+  see `hiby-kernel-build`) could build one if this is ever worth doing
+  properly.
 
 ## Licence
 
