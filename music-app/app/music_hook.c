@@ -7561,6 +7561,26 @@ static void draw_volume(uint16_t *fb) {
     fill_rect(fb, 0, top + VOL_H - 1, FB_W, 1, COL_LINE);
 
     int v = vol_dragging && vol_drag_pct >= 0 ? vol_drag_pct : audio_volume();
+    /* R89: USB Transport Mode pins and locks volume (see its own engage
+     * comment) -- a hardware button press still lands here (vol_ticks is
+     * set unconditionally in the key handler) even though audio_volume_step()
+     * itself is a no-op while locked, which without this looked like a
+     * press that silently did nothing. Dimmed the same way any other
+     * disabled control in this app is (COL_DIM, matching R81's USB Storage
+     * Mode banner), with the label saying why rather than just showing an
+     * unmoving percentage. */
+    if (usb_bypass_active) {
+        draw_text(fb, 24, top + 10, "Volume locked", COL_DIM, TEXT_PX_SMALL, FB_W - 160);
+        draw_text(fb, FB_W - 24 - text_width("USB Transport Mode", TEXT_PX_SMALL),
+                  top + 10, "USB Transport Mode", COL_DIM, TEXT_PX_SMALL, FB_W);
+        int by = vol_bar_y(), bw = FB_W - 48;
+        fill_rect(fb, 24, by, bw, 8, COL_LINE);
+        int filled = bw * v / 100;
+        fill_rect(fb, 24, by, filled, 8, COL_DIM);
+        fill_circle(fb, 24 + filled, by + 4, 13, COL_DIM);
+        return;
+    }
+
     char buf[16];
     snprintf(buf, sizeof(buf), "%d%%", v);
     draw_text(fb, 24, top + 10, "Volume", COL_DIM, TEXT_PX_SMALL, FB_W - 120);
@@ -9145,10 +9165,18 @@ int music_entry(void *a0, void *a1) {
                  * comment in audio.c), which is exactly what's needed to
                  * establish the pinned value itself. */
                 usb_bypass_saved_vol = audio_volume();
-                audio_set_volume(100);
+                /* R89: pinned at 50%, not 100% -- reported live as audible
+                 * popping on a USB DAC (FiiO BTR17) at full digital volume.
+                 * This path sends unattenuated samples straight to whatever
+                 * external DAC/amp is on the other end of the cable, which
+                 * can have meaningfully more analog gain than the R1's own
+                 * internal headphone amp -- 100% here was clipping the
+                 * external amp's own stage, not this app's. 50% leaves real
+                 * headroom without needing per-device calibration. */
+                audio_set_volume(50);
                 audio_set_vol_locked(1);
                 usb_bypass_active = 1;
-                mlog("[music] usb transport mode: engaged (peq/mseb off, vol -> 100%%%s)\n",
+                mlog("[music] usb transport mode: engaged (peq/mseb off, vol -> 50%%%s)\n",
                      usb_bypass_bt_was_on ? ", bluetooth off" : "");
             } else if (!want_bypass && usb_bypass_active) {
                 audio_set_usb_bypass(0);
@@ -10588,7 +10616,7 @@ int music_entry(void *a0, void *a1) {
             seek_toast_ticks--;
             if (seek_toast_ticks == 0) dirty = 1;
         }
-        if (vol_ticks > 0 && touch_down && !qs_open &&
+        if (vol_ticks > 0 && touch_down && !qs_open && !usb_bypass_active &&
             touch_y >= STATUS_H && touch_y < STATUS_H + VOL_H) {
             if (!vol_dragging) { vol_dragging = 1; vol_applied = audio_volume(); }
             int bw = FB_W - 48;
