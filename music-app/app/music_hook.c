@@ -4978,7 +4978,18 @@ static void draw_status(uint16_t *fb) {
     const icon_t *vic = vol <= 0 ? &icon_vol_mute : vol < 34 ? &icon_vol_low
                        : vol < 67 ? &icon_vol_mid  : &icon_vol_high;
     draw_icon(fb, FB_W, FB_H, 24, mid - vic->h / 2, vic, COL_DIM);
-    snprintf(buf, sizeof(buf), "%d%%", vol);
+    /* R95 follow-up: same "steps, not a percentage" change as the volume
+     * toast -- reported live that this readout, top-left of the status
+     * bar, was still showing the old percentage on Bluetooth. */
+    if (audio_using_bt() && audio_bt_vol_max() > 0) {
+        int steps = audio_bt_vol_steps();
+        int raw = audio_bt_vol_raw();
+        int cur = raw >= 0 ? (raw * steps + audio_bt_vol_max() / 2) / audio_bt_vol_max() : 0;
+        if (cur < 0) cur = 0; if (cur > steps) cur = steps;
+        snprintf(buf, sizeof(buf), "%d/%d", cur, steps);
+    } else {
+        snprintf(buf, sizeof(buf), "%d%%", vol);
+    }
     draw_text(fb, 24 + 26, ty, buf, COL_DIM, TEXT_PX_SMALL, FB_W - 24 - 26);
 
     int pct = st_battery_pct();
