@@ -1737,6 +1737,37 @@ static int usb_done_x(void) {
     return FB_W - 24 - text_width("Done", TEXT_PX_BODY);
 }
 
+/* Mass storage exports the card's block device.  It cannot coexist with
+ * even one local reader or writer without risking exFAT corruption. */
+static void set_usb_storage_mode(int mode) {
+    if (mode == 1) {
+        audio_stop();
+        pod_cancel_io();
+        /* These can read cached artwork or write a fetched cover on the SD
+         * card.  Their work is intentionally joined, not abandoned, before
+         * the filesystem is given to the host. */
+        if (art_thread_valid) {
+            pthread_join(art_thread, NULL);
+            art_thread_valid = 0;
+        }
+        if (view_art_thread_valid) {
+            pthread_join(view_art_thread, NULL);
+            view_art_thread_valid = 0;
+        }
+        if (artist_art_thread_valid) {
+            pthread_join(artist_art_thread, NULL);
+            artist_art_thread_valid = 0;
+        }
+        scanner_pause_for_usb(1);
+        index_pause_for_usb(1);
+        while (scanner_scan_running() || index_scan_running()) usleep(10000);
+    } else {
+        scanner_pause_for_usb(0);
+        index_pause_for_usb(0);
+    }
+    st_usb_mode_set(mode);
+}
+
 /* BG47 (revised): just two skip arcs now, -10s left of play/pause and +30s
  * right of it -- not the symmetric +/-10/+/-30 four-button set this
  * started as. 96, not the original 70: matches the audiobook screen's own
@@ -1867,7 +1898,7 @@ static int settings_content_rows(void) {
  * pushed by hand, not by CI against a tagged commit), so this stays a
  * literal that a human edits; the discipline is remembering to, not the
  * mechanism. */
-#define LIBRARY_VERSION "0.50"
+#define LIBRARY_VERSION "0.50.1"
 
 /* A custom-built kernel keeps uname()'s own release string exactly
  * "4.4.94+" on purpose -- that string is also the vermagic every one of the
@@ -3957,6 +3988,36 @@ static void wave_finish_capture(void) {
     wave_save(wave_capture_path, out);
 }
 
+/* Everything a track change needs to do to wave_* state, regardless of
+ * whether it arrived via play_index() (a tap, a skip button, a playlist
+ * pick) or the gapless worker rolling on by itself at a track boundary.
+ * R86 follow-up: the gapless path used to skip this entirely, since it
+ * never went through play_index() -- cur_track moved on but wave_capturing/
+ * wave_capture[]/wave_capture_path kept pointing at the track that just
+ * ended, so peaks sampled during the new track were written into the old
+ * track's buffer at the old track's bucket math. Reported live as the
+ * waveform "often doesn't appear" after the first track in a queue, and
+ * once as a track showing a flat line of dots -- a capture blended from
+ * two different tracks' position/duration mapping normalizes to almost
+ * nothing. Music only, same as play_index()'s own gate: podcast_mode is
+ * checked explicitly since this helper runs before podcast_mode is known
+ * to be off for a caller that isn't play_index(). */
+static void wave_track_changed(const char *path) {
+    wave_finish_capture();
+    wave_loaded = 0;
+    wave_capturing = 0;
+    if (!podcast_mode) {
+        if (wave_load(path, wave_buckets)) {
+            wave_loaded = 1;
+        } else {
+            wave_capturing = 1;
+            memset(wave_capture, 0, sizeof(wave_capture));
+            snprintf(wave_capture_path, sizeof(wave_capture_path), "%s", path);
+            wave_last_bucket = -1;
+        }
+    }
+}
+
 static void play_index(int i) {
     radio_mode = 0;
     audiobook_mode = 0;
@@ -3984,19 +4045,7 @@ static void play_index(int i) {
      * playthrough builds it fresh. podcast_mode is checked explicitly
      * (radio_mode/audiobook_mode are already known 0, set just above) --
      * this feature is Music only, per its own backlog entry. */
-    wave_finish_capture();
-    wave_loaded = 0;
-    wave_capturing = 0;
-    if (!podcast_mode) {
-        if (wave_load(queue[i].path, wave_buckets)) {
-            wave_loaded = 1;
-        } else {
-            wave_capturing = 1;
-            memset(wave_capture, 0, sizeof(wave_capture));
-            snprintf(wave_capture_path, sizeof(wave_capture_path), "%s", queue[i].path);
-            wave_last_bucket = -1;
-        }
-    }
+    wave_track_changed(queue[i].path);
     /* R23: the track's own artist wins when it has one, same reasoning
      * Now Playing's display already uses (BG30) -- q_artist is the
      * album's artist and can genuinely differ per track (a compilation).
@@ -6193,7 +6242,10 @@ static void draw_screen(uint16_t *fb) {
         fill_rect_clip(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
 
         ry = set_row_scan_y() - off;
-        draw_text_clip(fb, 24, ry + 20, "Scan library", COL_TEXT, TEXT_PX_BODY, FB_W - 200, CONTENT_Y, clip_bot);
+        int scan_disabled = st_usb_mode() == 1;
+        draw_text_clip(fb, 24, ry + 20, "Scan library",
+                       scan_disabled ? COL_DIM : COL_TEXT, TEXT_PX_BODY,
+                       FB_W - 200, CONTENT_Y, clip_bot);
         {
             /* One row, two passes underneath (scanner_rescan_now() kicks
              * both -- see its own comment). Reports scanner.c's own count,
@@ -6204,7 +6256,9 @@ static void draw_screen(uint16_t *fb) {
              * still working through what this pass just found. */
             int scanned = 0, written = 0;
             int started = scanner_scan_progress(&scanned, &written);
-            if (scanner_scan_running() || index_scan_running())
+            if (scan_disabled)
+                snprintf(buf, sizeof(buf), "USB Storage active");
+            else if (scanner_scan_running() || index_scan_running())
                 snprintf(buf, sizeof(buf), "Scanning… %d", scanned);
             else if (started)
                 snprintf(buf, sizeof(buf), "%d files found", scanned);
@@ -9161,6 +9215,7 @@ int music_entry(void *a0, void *a1) {
                     if (nxt < 0) break;
                     cur_track = nxt;
                     queue_apply_pending();   /* BG85 -- before art_request() reads q_album */
+                    wave_track_changed(queue[cur_track].path);
                     art_request(queue[cur_track].path,
                                 queue[cur_track].artist[0] ? queue[cur_track].artist : q_artist,
                                 q_album);
@@ -9859,7 +9914,8 @@ int music_entry(void *a0, void *a1) {
                     screen = SC_SETTINGS_BT; reset_scroll();
                 } else if (y >= ry_usb && y < ry_usb + ROW_H) {
                     screen = SC_SETTINGS_USB; reset_scroll();
-                } else if (y >= ry_scan && y < ry_scan + ROW_H) {
+                } else if (y >= ry_scan && y < ry_scan + ROW_H &&
+                           st_usb_mode() != 1) {
                     scanner_rescan_now();
                     dirty = 1;
                 }
@@ -9951,7 +10007,7 @@ int music_entry(void *a0, void *a1) {
                 }
             } else if (screen == SC_SETTINGS_USB) {
                 int idx = (y - CONTENT_Y) / ROW_H;
-                if (idx >= 0 && idx < 2) st_usb_mode_set(idx);
+                if (idx >= 0 && idx < 2) set_usb_storage_mode(idx);
             } else if (screen == SC_TRACKS && !ab_list && !pod_list) {
                 /* R46: tap coordinates are screen-space; the header/track
                  * layout is content-space (see the draw side's own `off`).
@@ -10062,7 +10118,7 @@ int music_entry(void *a0, void *a1) {
                      * fires from an actual tap inside the banner's own
                      * 60px strip, never shadows a real menu row above it. */
                     if (usb_storage && y >= FB_H - 60 && x >= usb_done_x() - 24) {
-                        st_usb_mode_set(0);
+                        set_usb_storage_mode(0);
                     } else if (idx >= TOP_N) { /* nothing there */ }
                     else if (idx == TOP_MUSIC && !usb_storage) {
                         screen = SC_MUSIC_MENU; reset_scroll();
