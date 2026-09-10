@@ -1037,6 +1037,19 @@ static uint16_t np_col_fg(void)     { return (cover_palette_enabled && art_bits)
  * rather than COL_TEXT when the feature is off, so a call site that used
  * to be dim stays dim with cover colours disabled. */
 static uint16_t np_col_dim(void)    { return (cover_palette_enabled && art_bits) ? np_fg     : COL_DIM; }
+/* R96: the mode (shuffle/repeat) and queue buttons' own ring+glyph --
+ * explicit request that both go white (ring and icon alike) whenever the
+ * background is genuinely dark, reverting to the plain COL_DIM grey on a
+ * light background or with the feature off. np_fg is already exactly
+ * "white on a dark background, black on a light one" (see
+ * compute_cover_palette()'s own comment) -- reusing it as the is-dark
+ * signal rather than re-deriving one, and only actually returning white
+ * for the dark case (np_fg's own black value is never what's wanted here,
+ * even on a light background -- COL_DIM is). */
+static uint16_t np_col_circle(void) {
+    if (!(cover_palette_enabled && art_bits)) return COL_DIM;
+    return np_fg == 0xFFFF ? 0xFFFF : COL_DIM;
+}
 /* R92 follow-up: reported live -- the unplayed track/prev-next-button glyphs
  * kept their plain COL_LINE/COL_TEXT even once the background went dark,
  * reading as invisible or low-contrast rather than merely dim. COL_LINE is
@@ -5991,13 +6004,17 @@ static void draw_screen(uint16_t *fb) {
              * weight, since they swap for each other at this exact spot. */
             int pmx = mid - 96 - 82, pmy = cyy;
             int pm_on = shuffle_enabled || repeat_mode != REPEAT_OFF;
-            fill_circle(fb, pmx, pmy, 26, COL_DIM);
+            uint16_t pm_circle = np_col_circle();
+            fill_circle(fb, pmx, pmy, 26, pm_circle);
             fill_circle(fb, pmx, pmy, 25, np_col_bg());
             const icon_t *pmicon = shuffle_enabled ? &icon_mode_shuffle
                                   : repeat_mode != REPEAT_OFF ? &icon_mode_repeat
                                   : &icon_mode_off;
+            /* Engaged (shuffle/repeat on) keeps its existing accent
+             * highlight, unaffected by R96 -- that distinction wasn't
+             * part of what was reported, only the plain/off colour was. */
             draw_icon(fb, FB_W, FB_H, pmx - 13, pmy - 13, pmicon,
-                      pm_on ? np_col_accent() : COL_DIM);
+                      pm_on ? np_col_accent() : pm_circle);
         }
 
         fill_circle(fb, mid, cyy, 42, np_col_accent());
@@ -6020,9 +6037,9 @@ static void draw_screen(uint16_t *fb) {
          * rather than colliding with it. */
         if (!podcast_mode) {
             int qx = mid + 96 + 82, qy = cyy;
-            fill_circle(fb, qx, qy, 26, COL_DIM);
+            fill_circle(fb, qx, qy, 26, np_col_circle());
             fill_circle(fb, qx, qy, 25, np_col_bg());
-            draw_queue_icon(fb, qx - 13, qy - 9, np_col_dim());
+            draw_queue_icon(fb, qx - 13, qy - 9, np_col_circle());
         } else {
             draw_queue_icon(fb, FB_W - 24 - 26, FB_H - 32, COL_DIM);
         }
