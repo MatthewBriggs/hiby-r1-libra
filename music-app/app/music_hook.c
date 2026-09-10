@@ -4669,18 +4669,16 @@ static void play_index(int i) {
     if (i < 0 || i >= queue_n) return;
     cur_track = i;
     queue_apply_pending();   /* BG85 */
-    /* audio_skip_to(), not audio_play(): this is every Next/Prev and queue
-     * tap, and audio_play() stops the worker and closes the output device to
-     * start the new track. Over Bluetooth that tears down the A2DP stream --
-     * measured as a 250-400 ms hole in the transmitted audio at every single
-     * skip. Handing the path to the running worker instead reuses the same
-     * seamless handover the natural end of a track already uses.
-     *
-     * Only here, deliberately: the podcast and audiobook entry points follow
-     * their own start with audio_seek_ms() to restore a resume position, and
-     * an asynchronous handover would race that seek. They keep audio_play()
-     * until the handover can carry a start offset with it. */
-    audio_skip_to(queue[i].path);
+    /* REVERTED, 2026-09-10: this briefly used audio_skip_to() to avoid the
+     * 250-400 ms Bluetooth dropout at every track change (R104). Reported
+     * live within the hour: tracks that would not start until tapped several
+     * times, and a skip that left the previous track playing. The handover
+     * flag is only read inside the `got > 0` branch of worker(), so any
+     * moment the worker is not actively decoding -- paused, output lost, or
+     * already between tracks -- swallows the request silently, with nothing
+     * logged and no fallback. Correctness first: back on audio_play() until
+     * the handover is driven from a point in the loop that always runs. */
+    audio_play(queue[i].path);
     /* R29: finish whatever the previous track's own capture was, then
      * decide what this one shows -- a cache if one already exists (every
      * playthrough after the one that built it), nothing yet while this
