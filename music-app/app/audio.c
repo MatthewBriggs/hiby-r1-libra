@@ -1267,12 +1267,36 @@ static int bt_read_raw(int *max_out) {
     int raw = -1, max = -1;
     while (fgets(line, sizeof(line), p)) {
         int lo, hi;
-        if (sscanf(line, " Limits: Playback %d - %d", &lo, &hi) == 2 && hi > 0)
+        if (sscanf(line, " Limits: Playback %d - %d", &lo, &hi) == 2 && hi > 0) {
             max = hi;
-        char *b = strstr(line, "Playback ");
-        if (b && raw < 0) {
-            int v;
-            if (sscanf(b, "Playback %d [", &v) == 1) raw = v;
+            /* R90 follow-up: reported live as hardware buttons collapsing
+             * volume straight to 0 and staying there, and the on-screen
+             * value showing 0%/muted -- this line also contains the
+             * substring "Playback ", and sscanf("0 - 127", "Playback %d
+             * [", &v) returns 1 (v=0) even though the trailing "[" never
+             * matched: a literal mismatch after a successful %d stops
+             * scanning, it does not un-assign what %d already wrote or
+             * change the return count. raw ended up latched at 0 from
+             * *this* line, before the real "Front Left: Playback 65
+             * [51%]" line below it was ever reached -- every read came
+             * back 0 regardless of the mixer's actual position. Skipping
+             * straight to the next line once this one's already been
+             * used for the range keeps it from ever reaching that parse
+             * at all. */
+            continue;
+        }
+        if (raw < 0) {
+            char *b = strstr(line, "Playback ");
+            if (b) {
+                int v; char bracket = 0;
+                /* %c doesn't skip leading whitespace itself, so the
+                 * literal space in the format does that job -- requiring
+                 * the very next character to be '[' is what tells this
+                 * apart from a line shaped like the Limits one above,
+                 * regardless of exactly how either is phrased. */
+                if (sscanf(b, "Playback %d %c", &v, &bracket) == 2 && bracket == '[')
+                    raw = v;
+            }
         }
     }
     pclose(p);
