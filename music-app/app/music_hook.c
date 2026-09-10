@@ -3336,15 +3336,38 @@ static int cur_playlist_path(char *out, size_t outsz) {
  * queue_remove_display() use for the Now Playing queue. A no-op (not an
  * error) if cur_album no longer names a real playlist on the card -- see
  * cur_playlist_path()'s own comment on when that happens. */
+/* BG111 raised tracks[]/queue[] and the two playlist path scratch buffers
+ * from 256 to 1024 entries so a long audiobook's chapters stop truncating --
+ * right fix, but at LIB_PATH_LEN each those two scratch buffers are 393 KB
+ * apiece sitting in .bss for the entire life of the app, on a device with
+ * 57 MB of RAM total. Neither one needs to persist: one writes tracks[] out
+ * to an .m3u, the other reads an .m3u back into tracks[], both on the UI
+ * thread and neither while the other runs. Taken for the moment they are
+ * used instead, which hands ~786 KB back to everything else.
+ *
+ * MemFree sits near 1.3 MB on this device but MemAvailable is ~25 MB -- the
+ * difference is reclaimable page cache, so an allocation this size succeeds
+ * comfortably. It is still checked: failing to allocate means doing nothing
+ * rather than truncating a playlist someone just reordered. */
+#define PL_SCRATCH_N (PAGE_MAX * 32)
+typedef char pl_path_t[LIB_PATH_LEN];
+
+static pl_path_t *pl_scratch_get(const char *what) {
+    pl_path_t *p = malloc(sizeof(pl_path_t) * PL_SCRATCH_N);
+    if (!p) mlog("[music] %s: no memory for %d-path scratch\n", what, PL_SCRATCH_N);
+    return p;
+}
+
 static void playlist_persist(void) {
     char path[LIB_PATH_LEN];
     if (!cur_playlist_path(path, sizeof(path))) return;
-    static char paths[PAGE_MAX * 32][LIB_PATH_LEN];   /* BG111: kept in lockstep with tracks[] */
-    int n = track_n < (int)(sizeof(paths) / sizeof(paths[0])) ?
-            track_n : (int)(sizeof(paths) / sizeof(paths[0]));
+    pl_path_t *paths = pl_scratch_get("playlist_persist");
+    if (!paths) return;
+    int n = track_n < PL_SCRATCH_N ? track_n : PL_SCRATCH_N;
     for (int i = 0; i < n; i++)
-        snprintf(paths[i], sizeof(paths[i]), "%s", tracks[i].path);
+        snprintf(paths[i], LIB_PATH_LEN, "%s", tracks[i].path);
     pl_write(path, paths, n);
+    free(paths);
 }
 
 /* R70: moves tracks[from] to tracks[to], shifting between, and persists.
@@ -11026,13 +11049,16 @@ int music_entry(void *a0, void *a1) {
                     kb_open("Playlist name", KB_PURPOSE_NEW_PLAYLIST_NAME, "");
                 } else if (screen == SC_PLAYLISTS && smooth_row - 1 < playlist_n) {
                     int pi = smooth_row - 1;   /* R71: row 0 is "New Playlist", not playlists[0] */
-                    static char paths[PAGE_MAX * 32][LIB_PATH_LEN];   /* BG111: kept in lockstep with tracks[] */
-                    int want = (int)(sizeof(paths) / sizeof(paths[0]));
-                    int got = pl_read(playlists[pi].path, paths, want);
+                    pl_path_t *paths = pl_scratch_get("open playlist");
+                    int got = 0;
                     track_n = 0;
-                    for (int k = 0; k < got; k++)
-                        if (lib_track_by_path(paths[k], &tracks[track_n]) == 0)
-                            track_n++;
+                    if (paths) {
+                        got = pl_read(playlists[pi].path, paths, PL_SCRATCH_N);
+                        for (int k = 0; k < got; k++)
+                            if (lib_track_by_path(paths[k], &tracks[track_n]) == 0)
+                                track_n++;
+                        free(paths);
+                    }
                     /* A playlist is an order someone chose; leave it alone. */
                     snprintf(cur_album, sizeof(cur_album), "%s", playlists[pi].name);
                     cur_artist[0] = '\0';

@@ -297,8 +297,18 @@ uint16_t *cover_load(const char *jpeg_path, const char *cache_key, int px) {
 
     struct jpeg_decompress_struct cinfo;
     struct jump_err jerr;
-    uint16_t *out = NULL;
-    JSAMPLE *row = NULL;
+    /* volatile: both are assigned after the setjmp() below and freed in
+     * its handler, and a non-volatile local modified between setjmp()
+     * and longjmp() has an indeterminate value once the jump lands
+     * (C99 7.13.2.1) -- the compiler is free to keep it in a register
+     * that longjmp() restores to what it held at setjmp() time. The
+     * handler would then free a stale NULL and leak the buffers, or
+     * free something indeterminate. Not academic here: the zero-scanline
+     * rejection added for this device's libjpeg defect longjmps on
+     * purpose, so this path runs whenever a cover fails to decode, and
+     * `out` is px*px*2 bytes -- 460 KB at ART_PX. */
+    uint16_t * volatile out = NULL;
+    JSAMPLE * volatile row = NULL;
 
     memset(&cinfo, 0, sizeof(cinfo));
     cinfo.err = x_std_error(&jerr.pub);
@@ -561,9 +571,11 @@ int cover_downscale_max(const char *jpeg_path, int max_dim) {
 
     struct jpeg_decompress_struct cinfo;
     struct jump_err jerr;
-    JSAMPLE *row = NULL;
-    JSAMPLE *outbuf = NULL;
-    long *racc = NULL, *gacc = NULL, *bacc = NULL;
+    /* volatile for the same reason as cover_load()'s own buffers above:
+     * assigned after setjmp(), freed in its handler. */
+    JSAMPLE * volatile row = NULL;
+    JSAMPLE * volatile outbuf = NULL;
+    long * volatile racc = NULL, * volatile gacc = NULL, * volatile bacc = NULL;
     int target_w = 0, target_h = 0;
 
     memset(&cinfo, 0, sizeof(cinfo));
