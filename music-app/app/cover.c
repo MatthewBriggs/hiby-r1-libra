@@ -412,6 +412,33 @@ uint16_t *cover_load(const char *jpeg_path, const char *cache_key, int px) {
     int next_src_row = 0;
     int rows = 0;        /* source rows currently folded into racc/gacc/bacc */
     int have_rows = 0;   /* whether racc/gacc/bacc hold anything real yet */
+    /* BG46 follow-up 2: the same device-libjpeg defect documented above --
+     * "literal zero-byte scanlines for whole interior row-bands...
+     * jpeg_read_scanlines still reporting success throughout" -- but for a
+     * source that passes the size check, so that guard alone doesn't
+     * catch it. Confirmed live on a real file (Elbow's "Audio Vertigo"
+     * cover): the top ~55% of Now Playing's art decoded correctly, the
+     * rest sat at the plain grey placeholder colour, in a clean horizontal
+     * split -- exactly what "a whole row-band came back as raw zero
+     * bytes" would produce once box-filtered and blitted.
+     *
+     * Can't reject on "this row is black": a great many real covers
+     * legitimately have large black regions (confirmed elsewhere this
+     * session -- Elbow's own cover among them), and rejecting the first
+     * such row would drop good decodes far more often than it catches bad
+     * ones. What a real decode essentially never produces, even over a
+     * near-black region, is *many consecutive scanlines byte-for-byte
+     * identical to all-zero* -- DCT/quantization noise means genuine dark
+     * content still varies pixel to pixel and row to row. A defect that
+     * leaves the decoder's own output buffer untouched, on the other
+     * hand, is uniformly, exactly zero with no noise at all. Long consecutive
+     * run of that specific shape is treated as the defect and fails the
+     * whole decode -- cover_load() returns NULL, and the caller already
+     * treats that as "try the next art candidate" (a network-fetched cover,
+     * typically), the same fallback BG46's own size-decline case above
+     * already relies on. */
+    int zero_run = 0;
+    #define COVER_ZERO_RUN_LIMIT 8
     for (int y = 0; y < px; y++) {
         int row_end = (int)((int64_t)(y + 1) * side / px);
         if (row_end > side) row_end = side;
@@ -444,6 +471,16 @@ uint16_t *cover_load(const char *jpeg_path, const char *cache_key, int px) {
             while (next_src_row < row_end && cinfo.output_scanline < cinfo.output_height) {
                 JSAMPROW rp = row;
                 x_read_scanlines(&cinfo, &rp, 1);
+                {
+                    int all_zero = 1;
+                    for (size_t i = 0; i < (size_t)w * comps; i++)
+                        if (row[i] != 0) { all_zero = 0; break; }
+                    zero_run = all_zero ? zero_run + 1 : 0;
+                    if (zero_run >= COVER_ZERO_RUN_LIMIT) {
+                        free(racc); free(gacc); free(bacc);
+                        longjmp(jerr.jump, 1);
+                    }
+                }
                 for (int sx = 0; sx < w; sx++) {
                     const JSAMPLE *p = row + (size_t)sx * comps;
                     racc[sx] += p[0];

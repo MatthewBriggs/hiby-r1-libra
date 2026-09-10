@@ -822,11 +822,21 @@ static void derive_palette_from_bits(const uint16_t *bits, uint16_t *out_bg,
  * wave_cache_path() already uses for a track path) since that's the
  * granularity the whole feature themes at -- every track on an album
  * shares one palette, the same reasoning art_request()'s own R84 same-
- * album skip already established for the art bitmap itself. 6 bytes: three
- * raw RGB565 values, no version/parsing needed -- a change to the
- * derivation algorithm just means deleting the directory once, the same
- * "self-heals, no migration" shape every other cache in this file uses. */
+ * album skip already established for the art bitmap itself.
+ *
+ * R94 follow-up: a version byte, not the versionless "just delete the
+ * directory once" this comment originally said -- reported live as a
+ * cover that now decodes correctly (see cover.c's own zero-scanline-band
+ * fix) still theming wrong, because the *palette* cached from the old,
+ * corrupted decode had no way to know it was ever built from bad input.
+ * Bumping PAL_CACHE_VERSION invalidates every existing entry the same way
+ * WAVE_CACHE_VERSION already does for the waveform cache -- the right
+ * lever for exactly this "derive_palette_from_bits()'s own output for the
+ * same input just changed" case, which a per-file mtime check (the cover
+ * art itself didn't change; how it's read did) couldn't have caught
+ * anyway. */
 #define PAL_CACHE_DIR "/data/mnt/sd_0/.cover_palettes"
+#define PAL_CACHE_VERSION 2
 static void pal_cache_path(const char *artist, const char *album, char *out, size_t n) {
     unsigned long h = 5381;
     for (const unsigned char *p = (const unsigned char *)artist; *p; p++)
@@ -843,8 +853,10 @@ static int pal_cache_load(const char *artist, const char *album,
     pal_cache_path(artist, album, p, sizeof(p));
     FILE *f = fopen(p, "rb");
     if (!f) return 0;
+    uint8_t ver;
+    int ok = fread(&ver, 1, 1, f) == 1 && ver == PAL_CACHE_VERSION;
     uint16_t v[3];
-    int ok = fread(v, sizeof(v[0]), 3, f) == 3;
+    ok = ok && fread(v, sizeof(v[0]), 3, f) == 3;
     fclose(f);
     if (ok) { *bg = v[0]; *accent = v[1]; *fg = v[2]; }
     return ok;
@@ -858,8 +870,9 @@ static void pal_cache_save(const char *artist, const char *album,
     snprintf(tmp, sizeof(tmp), "%s.tmp", p);
     FILE *f = fopen(tmp, "wb");
     if (!f) return;
+    uint8_t ver = PAL_CACHE_VERSION;
     uint16_t v[3] = { bg, accent, fg };
-    int ok = fwrite(v, sizeof(v[0]), 3, f) == 3;
+    int ok = fwrite(&ver, 1, 1, f) == 1 && fwrite(v, sizeof(v[0]), 3, f) == 3;
     fclose(f);
     if (!ok || rename(tmp, p) != 0) unlink(tmp);
 }
