@@ -59,6 +59,11 @@ void audio_volume_set(int pct);      /* absolute, for the slider */
  * Default 32 if never set. */
 void audio_set_bt_vol_steps(int n);
 int  audio_bt_vol_steps(void);
+/* Raw mixer state, for a "current/total steps" display instead of a percent
+ * one on Bluetooth -- -1/0 respectively when there's nothing to show yet
+ * (no mixer found this connection). */
+int  audio_bt_vol_raw(void);
+int  audio_bt_vol_max(void);
 int  audio_using_bt(void);
 int  audio_using_usb(void);
 /* Settings' "disable PEQ, MSEB and Bluetooth when playing over USB" -- skips

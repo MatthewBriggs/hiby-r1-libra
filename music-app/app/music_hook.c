@@ -728,39 +728,19 @@ static void pal_bin_rgb(int bin, int *r, int *g, int *b) {
     *b = ((bin & 0xF) << 4) | 8;
 }
 
-/* Recomputes np_bg/np_accent/np_fg from art_bits, only when it has actually
- * changed (np_palette_seq vs art_seq_v -- the same R84 same-album-skip
- * signal Now Playing's own art already uses, so this costs nothing on a
- * same-album track change). Dark and light candidates are pooled into
- * separate histograms by luma, scored by count*saturation so a common but
- * grey pixel can't win over a rarer but genuinely-coloured one (see
- * pal_sat()'s own comment -- this is the fix for "always ended up plain
- * white or black"), then the winning accent is pushed in HSL lightness
- * away from the winning background until they actually contrast, rather
- * than trusting whatever the histogram happened to pick (the fix for "the
- * seek bar looked awful"). */
-static void compute_cover_palette(void) {
-    int seq = art_seq();
-    if (seq == np_palette_seq) return;
-    np_palette_seq = seq;
-
-    pthread_mutex_lock(&art_lock);
-    uint16_t *bits = art_bits;
-    /* Sampled into a local scratch copy so the lock isn't held through the
-     * whole histogram pass -- this runs on the UI thread, right before a
-     * draw, and art_worker() replacing art_bits mid-scan would otherwise
-     * block a fresh cover fetch on however long that takes. ART_PX*ART_PX
-     * uint16_t -- the same size Now Playing's own blit already reads
-     * whole every frame, so one more copy of it is not a new cost class. */
-    static uint16_t *scratch;
-    if (bits) {
-        if (!scratch) scratch = malloc((size_t)ART_PX * ART_PX * sizeof(uint16_t));
-        if (scratch) memcpy(scratch, bits, (size_t)ART_PX * ART_PX * sizeof(uint16_t));
-        else bits = NULL;
-    }
-    pthread_mutex_unlock(&art_lock);
-    if (!bits) return;   /* scratch alloc failed: leave last-known colours alone */
-
+/* Pure function: given an ART_PX*ART_PX bitmap, derive bg/accent/fg. No
+ * globals touched, so this is equally usable live (compute_cover_palette(),
+ * from art_bits) and offline (cover_prewarm_worker(), from a bitmap decoded
+ * for an album that was never played). Dark and light candidates are
+ * pooled into separate histograms by luma, scored by count*saturation so a
+ * common but grey pixel can't win over a rarer but genuinely-coloured one
+ * (see pal_sat()'s own comment -- this is the fix for "always ended up
+ * plain white or black"), then the winning accent is pushed in HSL
+ * lightness away from the winning background until they actually
+ * contrast, rather than trusting whatever the histogram happened to pick
+ * (the fix for "the seek bar looked awful"). */
+static void derive_palette_from_bits(const uint16_t *bits, uint16_t *out_bg,
+                                     uint16_t *out_accent, uint16_t *out_fg) {
     static uint32_t *hist_dark, *hist_light;
     if (!hist_dark)  hist_dark  = calloc(PAL_BINS, sizeof(uint32_t));
     if (!hist_light) hist_light = calloc(PAL_BINS, sizeof(uint32_t));
@@ -771,7 +751,7 @@ static void compute_cover_palette(void) {
     int total = ART_PX * ART_PX;
     for (int i = 0; i < total; i += 4) {   /* every 4th pixel: plenty for a histogram */
         int r, g, b;
-        rgb565_to_rgb8(scratch[i], &r, &g, &b);
+        rgb565_to_rgb8(bits[i], &r, &g, &b);
         float l = pal_luma(r, g, b);
         int bin = pal_bin_of(r, g, b);
         if (l < 0.45f)      hist_dark[bin]++;
@@ -817,9 +797,189 @@ static void compute_cover_palette(void) {
         hsl_to_rgb8(ah, as, al, &acr, &acg, &acb);
     }
 
-    np_bg     = rgb8_to_rgb565(bgr, bgg, bgb);
-    np_accent = rgb8_to_rgb565(acr, acg, acb);
-    np_fg     = pal_luma(bgr, bgg, bgb) > 0.5f ? 0x0000 : 0xFFFF;
+    *out_bg     = rgb8_to_rgb565(bgr, bgg, bgb);
+    *out_accent = rgb8_to_rgb565(acr, acg, acb);
+    *out_fg     = pal_luma(bgr, bgg, bgb) > 0.5f ? 0x0000 : 0xFFFF;
+}
+
+/* R94: on-disk cache so an album's palette only ever needs deriving once --
+ * either here, live, the first time it's actually played, or ahead of time
+ * by cover_prewarm_worker() for a recently-added album that was never
+ * opened at all. Keyed on artist+album (a djb2 hash, same shape
+ * wave_cache_path() already uses for a track path) since that's the
+ * granularity the whole feature themes at -- every track on an album
+ * shares one palette, the same reasoning art_request()'s own R84 same-
+ * album skip already established for the art bitmap itself. 6 bytes: three
+ * raw RGB565 values, no version/parsing needed -- a change to the
+ * derivation algorithm just means deleting the directory once, the same
+ * "self-heals, no migration" shape every other cache in this file uses. */
+#define PAL_CACHE_DIR "/data/mnt/sd_0/.cover_palettes"
+static void pal_cache_path(const char *artist, const char *album, char *out, size_t n) {
+    unsigned long h = 5381;
+    for (const unsigned char *p = (const unsigned char *)artist; *p; p++)
+        h = ((h << 5) + h) ^ *p;
+    h = ((h << 5) + h) ^ '\x1f';
+    for (const unsigned char *p = (const unsigned char *)album; *p; p++)
+        h = ((h << 5) + h) ^ *p;
+    snprintf(out, n, "%s/%08lx.pal", PAL_CACHE_DIR, h & 0xFFFFFFFFul);
+}
+static int pal_cache_load(const char *artist, const char *album,
+                          uint16_t *bg, uint16_t *accent, uint16_t *fg) {
+    if (!artist[0] || !album[0]) return 0;   /* podcasts/radio: no stable key */
+    char p[512];
+    pal_cache_path(artist, album, p, sizeof(p));
+    FILE *f = fopen(p, "rb");
+    if (!f) return 0;
+    uint16_t v[3];
+    int ok = fread(v, sizeof(v[0]), 3, f) == 3;
+    fclose(f);
+    if (ok) { *bg = v[0]; *accent = v[1]; *fg = v[2]; }
+    return ok;
+}
+static void pal_cache_save(const char *artist, const char *album,
+                           uint16_t bg, uint16_t accent, uint16_t fg) {
+    if (!artist[0] || !album[0]) return;
+    mkdir(PAL_CACHE_DIR, 0755);
+    char p[512], tmp[520];
+    pal_cache_path(artist, album, p, sizeof(p));
+    snprintf(tmp, sizeof(tmp), "%s.tmp", p);
+    FILE *f = fopen(tmp, "wb");
+    if (!f) return;
+    uint16_t v[3] = { bg, accent, fg };
+    int ok = fwrite(v, sizeof(v[0]), 3, f) == 3;
+    fclose(f);
+    if (!ok || rename(tmp, p) != 0) unlink(tmp);
+}
+
+/* Recomputes np_bg/np_accent/np_fg for whatever art_bits currently holds,
+ * only when it has actually changed (np_palette_seq vs art_seq_v -- the
+ * same R84 same-album-skip signal Now Playing's own art already uses, so
+ * this costs nothing on a same-album track change). Checks the on-disk
+ * cache first -- a hit (this album was played before, or cover_prewarm_
+ * worker() got to it first) skips the histogram pass entirely, which is
+ * what makes a freshly-scanned album's very first playthrough show its
+ * real theme immediately rather than the plain default for one frame
+ * while this runs. */
+static void compute_cover_palette(void) {
+    int seq = art_seq();
+    if (seq == np_palette_seq) return;
+    np_palette_seq = seq;
+
+    if (pal_cache_load(art_want_artist, art_want_album, &np_bg, &np_accent, &np_fg))
+        return;
+
+    pthread_mutex_lock(&art_lock);
+    uint16_t *bits = art_bits;
+    /* Sampled into a local scratch copy so the lock isn't held through the
+     * whole histogram pass -- this runs on the UI thread, right before a
+     * draw, and art_worker() replacing art_bits mid-scan would otherwise
+     * block a fresh cover fetch on however long that takes. ART_PX*ART_PX
+     * uint16_t -- the same size Now Playing's own blit already reads
+     * whole every frame, so one more copy of it is not a new cost class. */
+    static uint16_t *scratch;
+    if (bits) {
+        if (!scratch) scratch = malloc((size_t)ART_PX * ART_PX * sizeof(uint16_t));
+        if (scratch) memcpy(scratch, bits, (size_t)ART_PX * ART_PX * sizeof(uint16_t));
+        else bits = NULL;
+    }
+    pthread_mutex_unlock(&art_lock);
+    if (!bits) return;   /* scratch alloc failed: leave last-known colours alone */
+
+    derive_palette_from_bits(bits, &np_bg, &np_accent, &np_fg);
+    pal_cache_save(art_want_artist, art_want_album, np_bg, np_accent, np_fg);
+}
+
+/* R94: precomputes recently-added albums' palettes right after a library
+ * scan, so opening one of them for the first time already has its theme
+ * ready instead of showing the plain default for the one frame
+ * compute_cover_palette()'s own live histogram pass would otherwise take.
+ * Own scratch path (art.h's own art_candidate() doc comment already
+ * anticipates this: "the scanner's background cover pre-warm pass...can
+ * run at any time relative to whichever UI art loader happens to be
+ * active") -- ART_SCRATCH is shared by art_worker()/view_art_worker(), and
+ * this can genuinely race either of those since it runs unprompted after
+ * any scan, not just when the user is looking at Now Playing. */
+#define COVER_PREWARM_N 10   /* matches RECENT_ALBUMS_N's own "last 10" */
+#define COVER_PREWARM_SCRATCH "/tmp/.music_art_prewarm.jpg"
+typedef struct {
+    char artist[LIB_NAME_LEN];
+    char album[LIB_NAME_LEN];
+    char track[LIB_PATH_LEN];
+} cover_prewarm_item_t;
+static cover_prewarm_item_t cover_prewarm_items[COVER_PREWARM_N];
+static int       cover_prewarm_n;
+static pthread_t cover_prewarm_thread;
+static int       cover_prewarm_thread_valid;
+
+static void *cover_prewarm_worker(void *arg) {
+    (void)arg;
+    for (int i = 0; i < cover_prewarm_n; i++) {
+        cover_prewarm_item_t *it = &cover_prewarm_items[i];
+        uint16_t bg, accent, fg;
+        if (pal_cache_load(it->artist, it->album, &bg, &accent, &fg))
+            continue;   /* a live play already cached this one since the scan */
+
+        char jpg[LIB_PATH_LEN], key[LIB_PATH_LEN];
+        uint16_t *bits = NULL;
+        for (int n = 0; !bits; n++) {
+            int rc = art_candidate(it->track, n, jpg, sizeof(jpg), key, sizeof(key),
+                                   COVER_PREWARM_SCRATCH);
+            if (rc == -1) break;
+            if (rc == ART_SKIP) continue;
+            bits = cover_load_capped(jpg, key, ART_PX);
+        }
+        /* Local-candidate only, deliberately -- no Last.fm/Spotify fallback
+         * here the way view_art_worker() has for a manually-opened album.
+         * This runs unattended right after any scan, including one that
+         * just found a large batch of new music; spending a network round
+         * trip per album with no local cover, for albums nobody has
+         * necessarily even looked at yet, is a cost this background pass
+         * has no business taking on its own initiative. A played track
+         * still gets the fetched-cover treatment normally, through
+         * art_worker()/compute_cover_palette() same as always. */
+        if (bits) {
+            derive_palette_from_bits(bits, &bg, &accent, &fg);
+            pal_cache_save(it->artist, it->album, bg, accent, fg);
+            free(bits);
+        }
+    }
+    return NULL;
+}
+
+/* UI-thread only: lib_albums_recent_added()/lib_tracks_for_album() touch
+ * g_db, which every other art-adjacent worker in this file (art_worker(),
+ * view_art_worker(), artist_art_worker()) avoids doing off the UI thread --
+ * the snapshot into cover_prewarm_items[] happens here, synchronously
+ * (cheap: at most 10 small queries), and only the slow part -- decoding up
+ * to 10 covers and hashing them -- runs on cover_prewarm_worker()'s own
+ * thread. */
+static void cover_prewarm_start(void) {
+    if (!cover_palette_enabled) return;
+    if (cover_prewarm_thread_valid) {
+        pthread_join(cover_prewarm_thread, NULL);
+        cover_prewarm_thread_valid = 0;
+    }
+    lib_row_t rows[COVER_PREWARM_N];
+    int n = lib_albums_recent_added(rows, COVER_PREWARM_N);
+    cover_prewarm_n = 0;
+    for (int i = 0; i < n && cover_prewarm_n < COVER_PREWARM_N; i++) {
+        lib_track_t one[1];
+        if (lib_tracks_for_album(rows[i].owner, rows[i].name, one, 1, rows[i].count) < 1)
+            continue;
+        cover_prewarm_item_t *it = &cover_prewarm_items[cover_prewarm_n];
+        /* Same artist-tag-first, album-artist-fallback art_request() itself
+         * uses at play time (see play_index()'s own call) -- has to match
+         * exactly, since this is the cache key compute_cover_palette()
+         * will look this album up under later. */
+        snprintf(it->artist, sizeof(it->artist), "%s",
+                one[0].artist[0] ? one[0].artist : rows[i].owner);
+        snprintf(it->album, sizeof(it->album), "%s", rows[i].name);
+        snprintf(it->track, sizeof(it->track), "%s", one[0].path);
+        cover_prewarm_n++;
+    }
+    if (cover_prewarm_n > 0 &&
+        pthread_create(&cover_prewarm_thread, NULL, cover_prewarm_worker, NULL) == 0)
+        cover_prewarm_thread_valid = 1;
 }
 
 /* Drop-in replacements for COL_BG/COL_ACCENT/COL_TEXT at any Now Playing
@@ -7883,7 +8043,24 @@ static void draw_volume(uint16_t *fb) {
     }
 
     char buf[16];
-    snprintf(buf, sizeof(buf), "%d%%", v);
+    /* R95: steps, not a percentage, on Bluetooth -- the mixer only has
+     * bt_vol_steps() real positions to begin with (see audio_volume_step()'s
+     * own comment), so a percentage was always an approximation of a
+     * number that already exists exactly. Dragging the slider still reports
+     * vol_drag_pct as a plain 0-100 while the finger is down (it's a
+     * continuous surface either way), converted to the nearest step just
+     * for display here rather than changing what the drag itself tracks. */
+    if (audio_using_bt() && audio_bt_vol_max() > 0) {
+        int steps = audio_bt_vol_steps();
+        int raw = vol_dragging && vol_drag_pct >= 0
+                ? (vol_drag_pct * audio_bt_vol_max() + 50) / 100
+                : audio_bt_vol_raw();
+        int cur = raw >= 0 ? (raw * steps + audio_bt_vol_max() / 2) / audio_bt_vol_max() : 0;
+        if (cur < 0) cur = 0; if (cur > steps) cur = steps;
+        snprintf(buf, sizeof(buf), "%d/%d", cur, steps);
+    } else {
+        snprintf(buf, sizeof(buf), "%d%%", v);
+    }
     draw_text(fb, 24, top + 10, "Volume", COL_DIM, TEXT_PX_SMALL, FB_W - 120);
     int tw = text_width(buf, TEXT_PX_SMALL);
     draw_text(fb, FB_W - 24 - tw, top + 10, buf, COL_TEXT, TEXT_PX_SMALL, FB_W);
@@ -9501,6 +9678,21 @@ int music_entry(void *a0, void *a1) {
             }
         }
 
+        /* R94: fires once, on a scan-running 1 -> 0 transition, whichever
+         * pass (scanner.c's own MEDIA_TABLE walk or index.c's track_index/
+         * album_cache rebuild) is the one still running when the other
+         * finishes -- lib_albums_recent_added() reads album_cache, so
+         * waiting for index_scan_running() specifically (not just
+         * scanner_scan_running()) matters: starting the moment the file
+         * walk alone finishes would read a cache that hasn't caught up to
+         * it yet. */
+        {
+            static int scan_was_running;
+            int scan_running = scanner_scan_running() || index_scan_running();
+            if (scan_was_running && !scan_running) cover_prewarm_start();
+            scan_was_running = scan_running;
+        }
+
         /* BG38 (part 2): drain bt_poll's fuzzy-matched profile, if it found
          * one since the last time round. The switch itself has to happen
          * here, not on that thread -- see the comment on bt_match_profile(). */
@@ -10263,6 +10455,11 @@ int music_entry(void *a0, void *a1) {
                 } else if (y >= ry_coverpalette && y < ry_coverpalette + coverpalette_h) {
                     cover_palette_enabled = !cover_palette_enabled;
                     np_palette_seq = -1;   /* force a recompute on next draw */
+                    /* R94: a scan that ran while this was off never
+                     * prewarmed anything -- catch up right when it's
+                     * switched on rather than waiting for the next
+                     * scan to happen to run again. */
+                    if (cover_palette_enabled) cover_prewarm_start();
                     save_conf();
                 } else if (y >= ry_about && y < ry_about + ROW_H) {
                     screen = SC_SETTINGS_ABOUT; reset_scroll();

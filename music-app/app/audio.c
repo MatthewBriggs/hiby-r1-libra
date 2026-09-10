@@ -1217,6 +1217,8 @@ void audio_set_bt_vol_steps(int n) {
     bt_vol_steps = n;
 }
 int audio_bt_vol_steps(void) { return bt_vol_steps; }
+int audio_bt_vol_raw(void) { return bt_vol_raw; }
+int audio_bt_vol_max(void) { return bt_vol_max; }
 
 static int bt_raw_to_pct(int raw) {
     return bt_vol_max > 0 ? (raw * 100 + bt_vol_max / 2) / bt_vol_max : 0;
