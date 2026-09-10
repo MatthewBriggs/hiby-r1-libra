@@ -4978,17 +4978,13 @@ static void draw_status(uint16_t *fb) {
     const icon_t *vic = vol <= 0 ? &icon_vol_mute : vol < 34 ? &icon_vol_low
                        : vol < 67 ? &icon_vol_mid  : &icon_vol_high;
     draw_icon(fb, FB_W, FB_H, 24, mid - vic->h / 2, vic, COL_DIM);
-    /* R95 follow-up: same "steps, not a percentage" change as the volume
-     * toast -- reported live that this readout, top-left of the status
-     * bar, was still showing the old percentage on Bluetooth. */
-    if (audio_using_bt() && audio_bt_vol_max() > 0) {
+    /* R95 follow-up: current/total steps for every output -- explicit
+     * correction after the first cut only changed this on Bluetooth. */
+    {
         int steps = audio_bt_vol_steps();
-        int raw = audio_bt_vol_raw();
-        int cur = raw >= 0 ? (raw * steps + audio_bt_vol_max() / 2) / audio_bt_vol_max() : 0;
+        int cur = (vol * steps + 50) / 100;
         if (cur < 0) cur = 0; if (cur > steps) cur = steps;
         snprintf(buf, sizeof(buf), "%d/%d", cur, steps);
-    } else {
-        snprintf(buf, sizeof(buf), "%d%%", vol);
     }
     draw_text(fb, 24 + 26, ty, buf, COL_DIM, TEXT_PX_SMALL, FB_W - 24 - 26);
 
@@ -6615,7 +6611,7 @@ static void draw_screen(uint16_t *fb) {
 
         ry = set_row_btvolsteps_y() - off;
         fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
-        draw_text_clip(fb, 24, ry + 20, "Bluetooth volume steps", COL_TEXT, TEXT_PX_BODY, FB_W - 200, CONTENT_Y, clip_bot);
+        draw_text_clip(fb, 24, ry + 20, "Volume steps", COL_TEXT, TEXT_PX_BODY, FB_W - 200, CONTENT_Y, clip_bot);
         snprintf(buf, sizeof(buf), "%d", audio_bt_vol_steps());
         draw_right_col_clip(fb, ry + ROW_H / 2 - TEXT_PX_SMALL / 2, buf, COL_ACCENT, CONTENT_Y, clip_bot);
 
@@ -8054,23 +8050,17 @@ static void draw_volume(uint16_t *fb) {
     }
 
     char buf[16];
-    /* R95: steps, not a percentage, on Bluetooth -- the mixer only has
-     * bt_vol_steps() real positions to begin with (see audio_volume_step()'s
-     * own comment), so a percentage was always an approximation of a
-     * number that already exists exactly. Dragging the slider still reports
-     * vol_drag_pct as a plain 0-100 while the finger is down (it's a
-     * continuous surface either way), converted to the nearest step just
-     * for display here rather than changing what the drag itself tracks. */
-    if (audio_using_bt() && audio_bt_vol_max() > 0) {
+    /* R95 follow-up: current/total steps for every output, not just
+     * Bluetooth -- explicit correction after the first cut only changed
+     * this on BT. Derived from the same 0-100 v every output already
+     * agrees on (wired's own software gain included), rather than reading
+     * the BT-only raw mixer value this used to -- one formula instead of
+     * a per-output branch. */
+    {
         int steps = audio_bt_vol_steps();
-        int raw = vol_dragging && vol_drag_pct >= 0
-                ? (vol_drag_pct * audio_bt_vol_max() + 50) / 100
-                : audio_bt_vol_raw();
-        int cur = raw >= 0 ? (raw * steps + audio_bt_vol_max() / 2) / audio_bt_vol_max() : 0;
+        int cur = (v * steps + 50) / 100;
         if (cur < 0) cur = 0; if (cur > steps) cur = steps;
         snprintf(buf, sizeof(buf), "%d/%d", cur, steps);
-    } else {
-        snprintf(buf, sizeof(buf), "%d%%", v);
     }
     draw_text(fb, 24, top + 10, "Volume", COL_DIM, TEXT_PX_SMALL, FB_W - 120);
     int tw = text_width(buf, TEXT_PX_SMALL);
