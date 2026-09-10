@@ -829,6 +829,15 @@ static void compute_cover_palette(void) {
 static uint16_t np_col_bg(void)     { return (cover_palette_enabled && art_bits) ? np_bg     : COL_BG; }
 static uint16_t np_col_accent(void) { return (cover_palette_enabled && art_bits) ? np_accent : COL_ACCENT; }
 static uint16_t np_col_fg(void)     { return (cover_palette_enabled && art_bits) ? np_fg     : COL_TEXT; }
+/* R92 follow-up: reported live -- "on dark backgrounds, all text should be
+ * white". Secondary text (artist/album, track count, the clock) was left
+ * at plain COL_DIM regardless of the art, which stayed a fixed grey no
+ * matter how dark the background got. np_fg is already exactly "white on
+ * a dark background, black on a light one" (see compute_cover_palette()'s
+ * own comment) -- this is the same colour, just falling back to COL_DIM
+ * rather than COL_TEXT when the feature is off, so a call site that used
+ * to be dim stays dim with cover colours disabled. */
+static uint16_t np_col_dim(void)    { return (cover_palette_enabled && art_bits) ? np_fg     : COL_DIM; }
 /* R92 follow-up: reported live -- the unplayed track/prev-next-button glyphs
  * kept their plain COL_LINE/COL_TEXT even once the background went dark,
  * reading as invisible or low-contrast rather than merely dim. COL_LINE is
@@ -5551,8 +5560,8 @@ static void draw_screen(uint16_t *fb) {
          * q_artist (see pod_play_episode()), so this line is blank for one
          * rather than showing the feed name twice. */
         draw_text(fb, 24, ty + 44, t->artist[0] ? t->artist : q_artist,
-                  COL_DIM, TEXT_PX_BODY, FB_W - 24);
-        draw_text(fb, 24, ty + 82, podcast_mode ? cur_feed : q_album, COL_DIM, TEXT_PX_SMALL, FB_W - 110);
+                  np_col_dim(), TEXT_PX_BODY, FB_W - 24);
+        draw_text(fb, 24, ty + 82, podcast_mode ? cur_feed : q_album, np_col_dim(), TEXT_PX_SMALL, FB_W - 110);
         /* Position in the queue, not the track's own number. Those are not the
          * same thing and showing one against the other produced "11 of 3" on a
          * playlist — and "11 of 9" on an album whose numbering has gaps, which
@@ -5560,7 +5569,7 @@ static void draw_screen(uint16_t *fb) {
          * (see podcast_mode's comment), so "1 of 1" would say nothing true. */
         if (!podcast_mode) {
             snprintf(buf, sizeof(buf), "%d of %d", cur_track + 1, queue_n);
-            draw_right(fb, ty + 82, buf);
+            draw_right_col(fb, ty + 82, buf, np_col_dim());
         }
 
         /* BG80 (extended here): audio_pos_ms() reads 0/stale for however
@@ -5678,7 +5687,7 @@ static void draw_screen(uint16_t *fb) {
             }
         }
         snprintf(buf, sizeof(buf), "%d:%02d", pos / 60000, (pos / 1000) % 60);
-        draw_text(fb, 24, clock_y, buf, COL_DIM, TEXT_PX_SMALL, FB_W);
+        draw_text(fb, 24, clock_y, buf, np_col_dim(), TEXT_PX_SMALL, FB_W);
         int rem = dur - pos; if (rem < 0) rem = 0;
         /* Real-world time, not content time -- same reasoning as the
          * audiobook screen's Book/Chapter countdowns: position/duration
@@ -5689,7 +5698,7 @@ static void draw_screen(uint16_t *fb) {
         if (podcast_mode)
             rem = (int)(rem / (pod_speed_permille / 1000.0));
         snprintf(buf, sizeof(buf), "-%d:%02d", rem / 60000, (rem / 1000) % 60);
-        draw_right(fb, clock_y, buf);
+        draw_right_col(fb, clock_y, buf, np_col_dim());
 
         /* BG40: was +58, tight enough against the clock row above (ends
          * around by+36) that the gap read as uneven next to the bigger one
@@ -5789,11 +5798,22 @@ static void draw_screen(uint16_t *fb) {
             fill_rect(fb, mid + 5,  cyy - 18, 10, 36, np_col_bg());
         }
 
-        /* R83: the route/battery readout and the format/kbps line that used
-         * to run either side of this row both moved to the quick-settings
-         * top bar (qs_format_info()) -- visible from wherever quick
-         * settings is pulled down, not just this one screen. */
-        draw_queue_icon(fb, FB_W - 24 - 26, FB_H - 32, COL_DIM);
+        /* R93: moved from the bottom-right corner (a leftover from when the
+         * header owned that spot) into the transport row itself, mirroring
+         * the mode button's own ring-then-icon circle on the opposite side
+         * of the skip buttons, per explicit request. Same radii/cutout as
+         * that button so the two read as a matched pair. Music only --
+         * podcast_mode's row already fills that same slot with its own
+         * info-circle (pod_info_x()), so it keeps the plain corner icon
+         * rather than colliding with it. */
+        if (!podcast_mode) {
+            int qx = mid + 96 + 82, qy = cyy;
+            fill_circle(fb, qx, qy, 26, COL_DIM);
+            fill_circle(fb, qx, qy, 25, np_col_bg());
+            draw_queue_icon(fb, qx - 13, qy - 9, np_col_dim());
+        } else {
+            draw_queue_icon(fb, FB_W - 24 - 26, FB_H - 32, COL_DIM);
+        }
         return;
     }
 
@@ -9880,29 +9900,13 @@ int music_entry(void *a0, void *a1) {
                 int cyy = 120 + 190;
                 if (y > cyy - 48 && y < cyy + 48) audio_toggle();
             } else if (screen == SC_PLAYING && y >= STATUS_H) {
-                /* The queue control sits in the corner the header used to own. */
-                if (y > FB_H - 56 && x > FB_W - 76) {
-                    /* BG71: plain music gets its own queue view now -- the
-                     * old go_back()-into-SC_TRACKS reuse showed the *album*
-                     * (now a rich cover/bio page, R46) rather than the
-                     * actual upcoming play order, which silently diverges
-                     * from it the moment shuffle is on.
-                     *
-                     * R58: podcast_mode used to special-case this button
-                     * straight to go_back(), on the assumption a podcast's
-                     * queue was always exactly its one playing episode (see
-                     * podcast_mode's own comment) -- true when that was
-                     * written, no longer true now that the episode list's
-                     * own long-press sheet can queue_play_next()/
-                     * queue_insert() another episode the same way music's
-                     * track list already could. SC_QUEUE draws queue[]
-                     * generically (name + duration only), so it needs
-                     * nothing podcast-specific to show an episode queue
-                     * correctly. */
-                    screen = SC_QUEUE; reset_scroll();
-                    queue_via_back = 0;   /* reached deliberately -- back returns to Now Playing */
-                }
-                else {
+                /* R93: the queue control used to sit in the corner the
+                 * header once owned, hit-tested separately from everything
+                 * else in this block -- now it's drawn inline in the
+                 * transport row itself (mirroring the mode button), so its
+                 * tap zone moved into that same row's own x-dispatch below
+                 * instead of a standalone corner check. */
+                {
                 /* The bar is only 6 px tall; the target has to be the band
                  * around it or it is unhittable with a finger. */
                 int bary = bar_y();
@@ -9916,7 +9920,25 @@ int music_entry(void *a0, void *a1) {
                 }
 
                 int cyy = bary + 70 + CTRL_NUDGE_PX;      /* BG40: matches the draw-side offset (R83) */
-                if (y > cyy - 48 && y < cyy + 48) {
+                /* R93: podcast_mode's row has no spare slot for the queue
+                 * circle music/the mode button get (see the draw side's own
+                 * comment) -- it keeps the plain corner icon, so this is the
+                 * one case still hit-tested as a standalone corner rather
+                 * than a zone inside the transport row below.
+                 *
+                 * BG71: plain music/podcasts get their own queue view --
+                 * the old go_back()-into-SC_TRACKS reuse showed the
+                 * *album* (a rich cover/bio page, R46) rather than the
+                 * actual upcoming play order, which silently diverges from
+                 * it the moment shuffle is on. R58: an episode is never
+                 * queued alongside a next one on its own, but the episode
+                 * list's own long-press sheet can still queue_play_next()/
+                 * queue_insert() another one, so this is never empty of
+                 * anything worth seeing even for a podcast. */
+                if (podcast_mode && y > FB_H - 56 && x > FB_W - 76) {
+                    screen = SC_QUEUE; reset_scroll();
+                    queue_via_back = 0;   /* reached deliberately -- back returns to Now Playing */
+                } else if (y > cyy - 48 && y < cyy + 48) {
                     /* BG47 (revised): real hit zones under the drawn arcs/
                      * ring, not blind thirds -- boundaries are the
                      * midpoints between adjacent element centres, same
@@ -9954,6 +9976,7 @@ int music_entry(void *a0, void *a1) {
                          * moved in to offset 96. */
                         int mid2 = FB_W / 2;
                         int pmx = mid2 - 96 - 82, prevx = mid2 - 96, nextx = mid2 + 96;
+                        int queuex = mid2 + 96 + 82;   /* R93: mirrors pmx */
                         if (x < (pmx + prevx) / 2) {
                             /* R47: Normal -> Shuffle -> Repeat -> Normal.
                              * Repeat means the current track, not the whole
@@ -9975,8 +9998,11 @@ int music_entry(void *a0, void *a1) {
                             play_index(prev_track_index());
                         } else if (x < (mid2 + nextx) / 2) {
                             audio_toggle();
-                        } else {
+                        } else if (x < (nextx + queuex) / 2) {
                             play_index(next_track_index());
+                        } else {
+                            screen = SC_QUEUE; reset_scroll();
+                            queue_via_back = 0;   /* reached deliberately -- back returns to Now Playing */
                         }
                     }
                 }
