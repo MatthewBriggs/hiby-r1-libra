@@ -501,7 +501,8 @@ static volatile int art_force_fresh;
  * refreshed art would be drawn under the colours derived from the bad decode
  * it replaced. */
 static void art_refresh_request(const char *track, const char *artist,
-                                const char *album, int for_view);
+                                const char *album, const char *album_artist,
+                                int for_view);
 
 static uint16_t *cover_load_capped(const char *jpg, const char *key, int px,
                                    const char *local_scratch, int fresh) {
@@ -533,6 +534,10 @@ static char      art_want[512];       /* track the loader should be showing */
  * at all (podcasts, audiobooks, radio: none of these are "albums" Last.fm
  * would sensibly match against). */
 static char      art_want_artist[LIB_NAME_LEN];
+/* Separate from art_want_artist on purpose -- see art_request()'s own
+ * R23/BG-orphee comment for why the two can legitimately differ and
+ * only one of them is safe to use for "is this still the same album". */
+static char      art_want_album_artist[LIB_NAME_LEN];
 static char      art_want_album[LIB_NAME_LEN];
 /* Bluetooth codec and battery are read on their own thread. They were read
  * from the drawing path, and both shell out — bluealsa-cli and dbus-send. A
@@ -680,6 +685,14 @@ static void *bt_poll(void *arg) {
 static pthread_t art_thread;
 static int       art_thread_valid;
 static int       art_seq_v;      /* bumped when the bitmap changes */
+/* Set when a request is dispatched, cleared when art_worker() finishes --
+ * whether that landed a bitmap or gave up. art_seq_v alone can't answer
+ * "has this track's art finished loading": art_request() bumps it the
+ * moment art_bits is cleared to NULL for a new album, well before the
+ * worker has even started. Exists for one reader: the resume-from-idle
+ * splash, which needs to know when it is safe to reveal the real screen
+ * without a blank cover flashing first (see its own comment). */
+static volatile int art_done = 1;
 
 static int art_seq(void) {
     pthread_mutex_lock(&art_lock);
@@ -958,7 +971,7 @@ static void compute_cover_palette(void) {
     if (seq == np_palette_seq) return;
     np_palette_seq = seq;
 
-    if (pal_cache_load(art_want_artist, art_want_album, &np_bg, &np_accent, &np_fg)) {
+    if (pal_cache_load(art_want_album_artist, art_want_album, &np_bg, &np_accent, &np_fg)) {
         np_palette_valid = 1;
         return;
     }
@@ -981,7 +994,7 @@ static void compute_cover_palette(void) {
     if (!bits) { np_palette_valid = 0; return; }   /* nothing cached, art not loaded yet either */
 
     derive_palette_from_bits(bits, &np_bg, &np_accent, &np_fg);
-    pal_cache_save(art_want_artist, art_want_album, np_bg, np_accent, np_fg);
+    pal_cache_save(art_want_album_artist, art_want_album, np_bg, np_accent, np_fg);
     np_palette_valid = 1;
 }
 
@@ -1173,12 +1186,14 @@ static void *art_worker(void *arg) {
     (void)arg;
     art_worker_yield_priority("art");
     char track[512], artist[LIB_NAME_LEN], album[LIB_NAME_LEN];
+    char album_artist[LIB_NAME_LEN];
     int fresh = art_force_fresh;
     art_force_fresh = 0;
     pthread_mutex_lock(&art_lock);
     snprintf(track, sizeof(track), "%s", art_want);
     snprintf(artist, sizeof(artist), "%s", art_want_artist);
     snprintf(album, sizeof(album), "%s", art_want_album);
+    snprintf(album_artist, sizeof(album_artist), "%s", art_want_album_artist);
     pthread_mutex_unlock(&art_lock);
 
     char jpg[512], key[512];
@@ -1254,12 +1269,15 @@ static void *art_worker(void *arg) {
      * spawning a new worker at all for a same-album track change without
      * a worker already in flight from the track *before* that one getting
      * wrongly discarded here once art_want itself has moved on further. */
-    int stale = (artist[0] && album[0])
-              ? (strcmp(artist, art_want_artist) != 0 || strcmp(album, art_want_album) != 0)
+    /* BG-orphee: compares album_artist, same reasoning as art_request()'s
+     * own same_album check just above -- see its comment. */
+    int stale = (album_artist[0] && album[0])
+              ? (strcmp(album_artist, art_want_album_artist) != 0 || strcmp(album, art_want_album) != 0)
               : (strcmp(track, art_want) != 0);
     if (stale) { free(bits); }
     else { free(art_bits); art_bits = bits; art_seq_v++; }
     pthread_mutex_unlock(&art_lock);
+    art_done = 1;
     return NULL;
 }
 
@@ -1269,7 +1287,8 @@ static void title_reset(void);
 /* artist/album: only a regular music track has both -- pass "" from
  * anywhere else (podcasts, audiobooks, radio) to leave the Last.fm
  * fallback in art_worker() off for those. */
-static void art_request(const char *track, const char *artist, const char *album) {
+static void art_request(const char *track, const char *artist, const char *album,
+                        const char *album_artist) {
     /* New track, new title: a scroll position carried over from the last one
      * would leave the new name starting halfway along. Called from every path
      * that changes what is playing, chapters included. */
@@ -1279,7 +1298,7 @@ if (art_thread_valid) { pthread_join(art_thread, NULL); art_thread_valid = 0; }
     /* R84: reported live as the cover disappearing and reappearing between
      * tracks of the same album -- not a redraw glitch, this was genuinely
      * blanking art_bits and re-decoding/re-fetching identical artwork on
-     * every track change, same album or not. Same artist+album as the
+     * every track change, same album or not. Same album_artist+album as the
      * still-current request means the same cover, so art_bits (read by
      * both Now Playing and the mini player -- see BG70's own comment)
      * stays exactly as it is and no worker gets spawned at all. art_want
@@ -1287,9 +1306,26 @@ if (art_thread_valid) { pthread_join(art_thread, NULL); art_thread_valid = 0; }
      * flight from the previous track -- a slow Last.fm/Spotify fetch,
      * say -- isn't discarded by its own "has the user moved on" check
      * once it finishes; it's fetching the same album's art regardless of
-     * which of that album's tracks is current by the time it lands. */
-    int same_album = artist && artist[0] && album && album[0] &&
-                     !strcmp(artist, art_want_artist) && !strcmp(album, art_want_album);
+     * which of that album's tracks is current by the time it lands.
+     *
+     * BG-orphee: this compares album_artist, not the track's own artist
+     * R23 passes through as `artist` -- reported live as the cover (and,
+     * worse, the cover-colour palette below, which keys on the same pair)
+     * reloading on every single track of an album where the *tag* genuinely
+     * varies per track (Johann Johannsson's "Orphee", credited to a
+     * different soloist -- Clarice Jensen, Anthony Weeden, Paul Hillier --
+     * on several tracks) despite it being one release with one cover
+     * throughout. R23 already established that `artist` legitimately isn't
+     * a stable per-album identity for exactly this reason (a compilation);
+     * album_artist -- the album's own artist tag, not any one track's --
+     * is what stays constant across a release regardless of who the tags
+     * credit per track, which is what "same album" actually needs to mean
+     * here. `artist` is kept as its own parameter rather than folded away:
+     * it is still the right thing to display and the right thing to search
+     * Last.fm/Spotify with (R23's own reasoning for preferring it holds for
+     * both of those), just not what decides whether art needs reloading. */
+    int same_album = album_artist && album_artist[0] && album && album[0] &&
+                     !strcmp(album_artist, art_want_album_artist) && !strcmp(album, art_want_album);
     if (!same_album) {
         free(art_bits);
         art_bits = NULL;
@@ -1298,10 +1334,15 @@ if (art_thread_valid) { pthread_join(art_thread, NULL); art_thread_valid = 0; }
     snprintf(art_want, sizeof(art_want), "%s", track);
     snprintf(art_want_artist, sizeof(art_want_artist), "%s", artist ? artist : "");
     snprintf(art_want_album, sizeof(art_want_album), "%s", album ? album : "");
+    snprintf(art_want_album_artist, sizeof(art_want_album_artist), "%s",
+             album_artist ? album_artist : "");
     pthread_mutex_unlock(&art_lock);
     if (same_album) return;
+    art_done = 0;
     if (pthread_create(&art_thread, NULL, art_worker, NULL) == 0)
         art_thread_valid = 1;
+    else
+        art_done = 1;   /* never actually started -- nothing to wait for */
 }
 
 /* BG70: a completely separate bitmap from art_bits above, not a save/
@@ -1454,14 +1495,19 @@ static void view_art_clear(void) {
 }
 
 static void art_refresh_request(const char *track, const char *artist,
-                                const char *album, int for_view) {
+                                const char *album, const char *album_artist,
+                                int for_view) {
     char pal[512];
-    pal_cache_path(artist, album, pal, sizeof(pal));
+    /* view_art has no separate album-identity concept of its own (see its
+     * own request function -- it always blanks on a new request, per-track,
+     * no "same album" case to get wrong), so album_artist is only used to
+     * key the palette when this is the played-track path. */
+    pal_cache_path(for_view ? artist : album_artist, album, pal, sizeof(pal));
     unlink(pal);
     np_palette_valid = 0;
     art_force_fresh = 1;
     if (for_view) view_art_request(track, artist, album);
-    else          art_request(track, artist, album);
+    else          art_request(track, artist, album, album_artist);
 }
 
 static void view_blit_art_clip(uint16_t *fb, int x, int y, int clip_top, int clip_bot) {
@@ -2489,7 +2535,7 @@ static int settings_content_rows(void) {
  * pushed by hand, not by CI against a tagged commit), so this stays a
  * literal that a human edits; the discipline is remembering to, not the
  * mechanism. */
-#define LIBRARY_VERSION "0.51.1"
+#define LIBRARY_VERSION "0.51.2"
 
 /* A custom-built kernel keeps uname()'s own release string exactly
  * "4.4.94+" on purpose -- that string is also the vermagic every one of the
@@ -3928,7 +3974,7 @@ static void pod_play_episode(int idx) {
     if (pod_speed_permille <= 0) pod_speed_permille = 1000;
     audio_set_speed(pod_speed_permille);
     audio_play(pod_eps[idx].path);
-    art_request(pod_eps[idx].path, "", "");
+    art_request(pod_eps[idx].path, "", "", "");
     was_active = 1;
     if (resume > 0 && resume != POD_FINISHED) audio_seek_ms(resume);
     pod_notes_showing = 0;
@@ -4329,7 +4375,7 @@ static void play_station(int i) {
     podcast_mode = 0;
     audio_set_speed(1000);           /* a stream has no WSOLA use for it */
     snprintf(radio_name, sizeof(radio_name), "%s", stations[i].name);
-    art_request("", "", "");         /* clears whatever art was showing */
+    art_request("", "", "", "");         /* clears whatever art was showing */
     audio_play(stations[i].url);
     was_active = 1;
     mlog("[music] station %s\n", stations[i].name);
@@ -4691,7 +4737,7 @@ static void play_index(int i) {
      * album's artist and can genuinely differ per track (a compilation).
      * Last.fm matches on the album though, so q_album, not the track's
      * own title, is always the right second half of the pair. */
-    art_request(queue[i].path, queue[i].artist[0] ? queue[i].artist : q_artist, q_album);
+    art_request(queue[i].path, queue[i].artist[0] ? queue[i].artist : q_artist, q_album, q_artist);
     queue_follower();
     was_active = 1;
     /* R30's "recently heard" side. q_album is the queue's album, set by
@@ -4774,7 +4820,7 @@ static void ab_play_chapter(int i) {
     if (strcmp(ab_playing, path) != 0 || !audio_is_active()) {
         snprintf(ab_playing, sizeof(ab_playing), "%s", path);
         audio_play(path);
-        art_request(path, "", "");
+        art_request(path, "", "", "");
     }
     audio_seek_ms((int)ab_book.chap[i].file_start_ms);
     audio_set_next(ab_next_file(i));
@@ -8963,21 +9009,11 @@ static uint16_t rs_lerp(uint16_t a, uint16_t b, int t) {
                        (ab + (((bb - ab) * t) >> 8)));
 }
 
-/* The saved screen, blurred and dimmed. Painted before lib_open() so it is
- * on the panel for the whole of the library open and the restore below
- * rather than after them.
- *
- * Dimmed as well as blurred: it has to be unmistakably not a live screen,
- * which is the whole point -- a sharp copy of the last frame is exactly
- * what a frozen device looks like. */
-static void resume_splash(uint16_t *fb) {
-    FILE *f = fopen(RESUME_THUMB, "rb");
-    if (!f) return;
-    size_t got = fread(rs_thumb, 1, sizeof(rs_thumb), f);
-    fclose(f);
-    unlink(RESUME_THUMB);
-    if (got != sizeof(rs_thumb)) return;
-
+/* rs_thumb -> a full-panel image, by bilinear upsample -- a 120x200 source
+ * stretched to 480x800 is inherently soft, which is what stands in for an
+ * actual blur here. dim halves every channel on top of that; both users
+ * below share this loop rather than each keeping their own copy of it. */
+static void resume_upscale(uint16_t *fb, int dim) {
     for (int y = 0; y < FB_H; y++) {
         int syq = (y << (8 - RS_SHIFT));
         int sy = syq >> 8, fy = syq & 0xFF;
@@ -8991,13 +9027,96 @@ static void resume_splash(uint16_t *fb) {
             if (sx > RS_W - 2) { sx = RS_W - 2; fx = 255; }
             uint16_t p = rs_lerp(rs_lerp(r0[sx], r0[sx + 1], fx),
                                  rs_lerp(r1[sx], r1[sx + 1], fx), fy);
-            /* Halve every channel in place -- one shift each, no second
-             * pass over the frame. */
-            out[x] = (uint16_t)(((((p >> 11) & 0x1F) >> 1) << 11) |
-                                ((((p >> 5) & 0x3F) >> 1) << 5)  |
-                                 ((p & 0x1F) >> 1));
+            if (dim)
+                /* Halve every channel in place -- one shift each, no second
+                 * pass over the frame. */
+                p = (uint16_t)(((((p >> 11) & 0x1F) >> 1) << 11) |
+                               ((((p >> 5) & 0x3F) >> 1) << 5)  |
+                                ((p & 0x1F) >> 1));
+            out[x] = p;
         }
     }
+}
+
+/* The saved screen, blurred and dimmed. Painted before lib_open() so it is
+ * on the panel for the whole of the library open and the restore below
+ * rather than after them.
+ *
+ * Dimmed as well as blurred: it has to be unmistakably not a live screen,
+ * which is the whole point -- a sharp copy of the last frame is exactly
+ * what a frozen device looks like. rs_thumb is left populated on return
+ * (not cleared, not re-read from disk anywhere else): resume_bridge_splash()
+ * below reuses this exact same read for its own, undimmed upscale, once
+ * restore has decided what is actually coming back. */
+static void resume_splash(uint16_t *fb) {
+    FILE *f = fopen(RESUME_THUMB, "rb");
+    if (!f) return;
+    size_t got = fread(rs_thumb, 1, sizeof(rs_thumb), f);
+    fclose(f);
+    unlink(RESUME_THUMB);
+    if (got != sizeof(rs_thumb)) return;
+    resume_upscale(fb, 1);
+}
+
+/* The bridge between "frozen, dimmed splash" and "the real screen, playing
+ * again": full brightness, same soft upscale, painted the moment restore has
+ * decided what track/chapter/episode is coming back -- which is also the
+ * moment art_request() fires for it and art_bits goes back to NULL. Without
+ * this, the very next dirty frame painted the real Now Playing screen with
+ * no cover at all (the fresh decode hadn't landed yet), which read as the
+ * artwork flashing away and back. This is not that flash: the old cover is
+ * still the same pixels, just soft, until the sharp one is ready to replace
+ * it directly -- see resume_wait_art in the frame loop. */
+static void resume_bridge_splash(uint16_t *fb) {
+    resume_upscale(fb, 0);
+}
+
+/* Blends the currently-visible page toward a fully-rendered `target` frame
+ * over a handful of steps, alternating pages the same way an ordinary dirty
+ * frame does below, so a jump between two very different images -- dim to
+ * full brightness, or the soft bridge splash to the sharp real screen --
+ * reads as a quick fade rather than a cut. Reported live as "a bit rough"
+ * with both of those done as a single hard swap.
+ *
+ * Blocking and self-paced (its own usleep, not the input-driven loop this
+ * runs before): both call sites are between real frames, at a point where
+ * there is nothing else to service meanwhile. */
+#define RESUME_FADE_STEPS   8
+#define RESUME_FADE_STEP_US 28000
+
+static void resume_fade_to(uint16_t *base, size_t page_px, int fbfd,
+                           struct fb_var_screeninfo *v, int *page,
+                           const uint16_t *target) {
+    uint16_t *from = malloc(page_px * sizeof(uint16_t));
+    if (!from) {
+        /* No memory for the blend buffer -- land directly rather than not
+         * transitioning at all. */
+        memcpy(base + (size_t)(*page) * page_px, target, page_px * sizeof(uint16_t));
+        memcpy(base + (size_t)(*page ^ 1) * page_px, target, page_px * sizeof(uint16_t));
+        return;
+    }
+    memcpy(from, base + (size_t)(*page) * page_px, page_px * sizeof(uint16_t));
+
+    for (int step = 1; step <= RESUME_FADE_STEPS; step++) {
+        int t = step * 256 / RESUME_FADE_STEPS;
+        if (t > 256) t = 256;
+        int next = *page ^ 1;
+        uint16_t *out = base + (size_t)next * page_px;
+        for (size_t i = 0; i < page_px; i++) out[i] = rs_lerp(from[i], target[i], t);
+        v->yoffset = (uint32_t)(next * FB_H);
+        if (ioctl(fbfd, FBIOPAN_DISPLAY, v) < 0) break;
+        *page = next;
+        usleep(RESUME_FADE_STEP_US);
+    }
+    /* Land exactly on target either way -- t=256 above already reduces to
+     * an exact copy, but pin both pages explicitly so nothing screenshotting
+     * the spare page mid-fade (there is no such caller today, but see the
+     * screenshot-mirroring comment on the ordinary draw path) ever reads a
+     * partially-blended frame, and so repeated blending can't leave banding
+     * behind. */
+    memcpy(base + (size_t)(*page) * page_px, target, page_px * sizeof(uint16_t));
+    memcpy(base + (size_t)(*page ^ 1) * page_px, target, page_px * sizeof(uint16_t));
+    free(from);
 }
 
 /* Rebuild what was loaded, then land on the screen it was being viewed
@@ -9832,7 +9951,14 @@ int music_entry(void *a0, void *a1) {
     /* Both pages, then pan to a known one: whichever the boot logo left
      * displayed is not something to assume, and the first real frame flips
      * to page 0 anyway (`page` starts at 0), so leaving page 1 unpainted
-     * would show a torn half-splash for one frame at that flip. */
+     * would show a torn half-splash for one frame at that flip.
+     *
+     * `page` itself lives here rather than down with frames/running/dirty
+     * below (where it used to be declared) because the two fades between
+     * here and the main loop starting need to track it exactly the same
+     * way the loop's own dirty-frame flip does -- one shared variable, not
+     * a second copy that could drift from what is actually on screen. */
+    int page = 0;
     int resuming = resume_pending();
     if (resuming) {
         resume_splash(base);
@@ -9843,7 +9969,30 @@ int music_entry(void *a0, void *a1) {
     }
 
     if (lib_open() != 0) mlog("[music] library open failed\n");
-    if (resuming) resume_try_restore();
+    /* Whether the frame loop should hold the bridge splash up rather than
+     * paint the real (still cover-less) Now Playing screen on its first
+     * dirty pass -- see resume_bridge_splash()'s own comment. Only ever
+     * true once restore has actually put something on the way back:
+     * art_done reads false the instant art_request() dispatches a fresh
+     * decode, and stays false only for that -- an idle SC_MENU restore
+     * with nothing playing leaves it true (nothing was ever requested) and
+     * the ordinary boot path skips all of this once resuming is false. */
+    int resume_wait_art = 0;
+    if (resuming) {
+        resume_try_restore();
+        if (!art_done) {
+            resume_wait_art = 1;
+            uint16_t *bridge = malloc(page_px * sizeof(uint16_t));
+            if (bridge) {
+                resume_upscale(bridge, 0);
+                resume_fade_to(base, page_px, fbfd, &v, &page, bridge);
+                free(bridge);
+            } else {
+                resume_bridge_splash(base);
+                memcpy(base + page_px, base, page_px * 2);
+            }
+        }
+    }
 
     /* Touch, by name for the same reason as scan_inputs()'s table above. */
     char tnode[32];
@@ -9876,7 +10025,8 @@ int music_entry(void *a0, void *a1) {
      * static, and this app exists partly because the stock one is not smooth.
      * A frame is produced only when something actually changed: a gesture, the
      * clock ticking over a second, or artwork arriving. */
-    int page = 0, frames = 0, running = 1, dirty = 1;
+    int frames = 0, running = 1, dirty = 1;   /* page declared above, before the resume fades */
+    int resume_wait_ticks = 0;   /* safety cap -- see the check below */
     int last_sec = -1, art_seen = 0, view_art_seen = 0, status_tick = 0, idle = 0, rescan_tick = 0;
     int sleep_idle = 0, auto_off_idle = 0;
     int ab_pos_tick = 0;
@@ -9997,7 +10147,7 @@ int music_entry(void *a0, void *a1) {
                     cur_track = j;
                     snprintf(ab_playing, sizeof(ab_playing), "%s",
                              ab_book.files[ab_book.chap[j].file]);
-                    art_request(ab_playing, "", "");
+                    art_request(ab_playing, "", "", "");
                     mlog("[music] rolled into %s\n", ab_book.chap[j].title);
                     dirty = 1;
                 }
@@ -10015,7 +10165,7 @@ int music_entry(void *a0, void *a1) {
                     wave_track_changed(queue[cur_track].path);
                     art_request(queue[cur_track].path,
                                 queue[cur_track].artist[0] ? queue[cur_track].artist : q_artist,
-                                q_album);
+                                q_album, q_artist);
                     mlog("[music] rolled into %s\n", queue[cur_track].name);
                     dirty = 1;
                 }
@@ -12107,7 +12257,7 @@ int music_entry(void *a0, void *a1) {
                     if (!g_view_art_gone_frame && content_y >= 0 && content_y < ART_PX &&
                         !browsing_is_playlist && track_n > 0) {
                         hold_fired = 1;
-                        art_refresh_request(tracks[0].path, cur_artist, cur_album, 1);
+                        art_refresh_request(tracks[0].path, cur_artist, cur_album, cur_artist, 1);
                         snprintf(sheet_note, sizeof(sheet_note), "Refreshing artwork");
                         dirty = 1; idle = 0;
                         continue;
@@ -12224,6 +12374,34 @@ int music_entry(void *a0, void *a1) {
             if (sec != last_sec) { last_sec = sec; dirty = 1; }
             int seq = art_seq();
             if (seq != art_seen) { art_seen = seq; dirty = 1; }
+            /* Bridge splash still up from resume: hold it, not the real
+             * (still cover-less) screen, until the restored track's art has
+             * actually finished loading -- ~90 ticks (3s at 30Hz) is a
+             * belt-and-braces cap, not the expected case; art_worker()
+             * always sets art_done whether it found something or gave up,
+             * so this is only reached if that never runs at all. */
+            if (resume_wait_art) {
+                if (art_done || ++resume_wait_ticks > 90) {
+                    resume_wait_art = 0;
+                    /* The bridge splash's own replacement, faded in rather
+                     * than swapped -- reported live as "a bit rough" done
+                     * as a hard cut. Rendered into a scratch buffer first
+                     * (draw_ui() takes any FB_W*FB_H buffer, not only an
+                     * on-screen page) so resume_fade_to() has a finished
+                     * target to blend toward from the very first step. */
+                    uint16_t *real = malloc(page_px * sizeof(uint16_t));
+                    if (real) {
+                        draw_ui(real);
+                        resume_fade_to(base, page_px, fbfd, &v, &page, real);
+                        free(real);
+                        dirty = 0;
+                    }
+                    /* No memory for the blend buffer: leave dirty as it is
+                     * (art finishing already set it above) and let the
+                     * ordinary path below paint the real screen as a hard
+                     * cut rather than not painting it at all. */
+                }
+            }
             /* BG70: the album-detail screen's own cover fetch, independent
              * of the playing track's -- needs its own redraw trigger the
              * same way, or a slow network fetch would only ever show up
@@ -12385,7 +12563,7 @@ int music_entry(void *a0, void *a1) {
             dirty = 0;
         }
 
-        if (dirty) {
+        if (dirty && !resume_wait_art) {
             /* BG98 follow-up: how long between set_locked(0) returning (in
              * handle_keys(), possibly several hundred lines and one loop
              * lap's worth of other per-tick work ago) and actually reaching

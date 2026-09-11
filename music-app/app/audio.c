@@ -1666,11 +1666,25 @@ static void *pcm_open(unsigned rate, int channels, int deep, int want_fmt) {
  * device put down and forgotten stops drawing through the amp. */
 #define PCM_IDLE_CLOSE_TICKS 83
 /* BG90: bt_sink_connected() forks a `bluealsa-cli` subprocess, unlike the
- * plain readlink usb_card() does -- checked once every this-many passes of
- * the ~1s-cadence poll below, not every pass, so putting Bluetooth
- * headphones on mid-playback still switches over within a few seconds
- * without that cost every second. */
-#define BT_POLL_EVERY 5
+ * plain readlink usb_card() does, so it is checked once every this-many
+ * passes of the ~1s-cadence poll below rather than every pass.
+ *
+ * Was 5 (~5s). Reported live 2026-09-11 as "takes a second or two to switch
+ * from 3.5mm to BT" after a boot reconnect; music.log showed the switch
+ * landing on the poll tick, up to 5s after the A2DP PCM appeared:
+ *
+ *     21.749  bt_sink_connected() took 17 ms
+ *     26.867  bt_sink_connected() took 20 ms
+ *     31.982  bt_sink_connected() took 21 ms
+ *     31.982  output changed, reopening
+ *
+ * BG90 chose 5 on the assumption the fork was expensive; BG98's own
+ * instrumentation (those log lines) since measured it at 17-21ms. At a ~1s
+ * cadence that is ~2% of one core, and it is paid only while playing out of
+ * the jack -- the whole block is skipped once output is already Bluetooth or
+ * USB, and while the screen is locked. Worth 2% to have the headset take over
+ * within a second of connecting. Raise this again if decode ever starves. */
+#define BT_POLL_EVERY 1
 
 static int    g_seek_to_ms = -1;   /* set by audio_seek_ms, consumed by the worker */
 
