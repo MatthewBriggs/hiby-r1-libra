@@ -4597,6 +4597,10 @@ static uint8_t  wave_buckets[WAVE_BUCKETS];   /* currently displayed, valid only
 static int      wave_loaded;
 static int      wave_capturing;
 static uint32_t wave_capture[WAVE_BUCKETS];   /* raw running peak per bucket, this playthrough */
+static uint8_t  wave_touched[WAVE_BUCKETS];   /* 1 once a bucket has been sampled at all, separate
+                                                  from wave_capture[]'s value -- real silence also
+                                                  writes 0, so the peak alone can't tell "sampled,
+                                                  quiet" from "never sampled". */
 static char     wave_capture_path[LIB_PATH_LEN];
 static int      wave_last_bucket;             /* highest bucket touched so far, -1 = none yet */
 
@@ -4656,6 +4660,18 @@ static void wave_finish_capture(void) {
      * chance to be completed later, since a cache file existing at all is
      * what stops a future play from capturing again. */
     if (wave_last_bucket < WAVE_BUCKETS - 4) return;
+    /* Reaching a late bucket is not the same as having sampled every bucket
+     * along the way: a forward seek, or resuming past a stretch only ever
+     * partly sampled earlier, jumps straight to a late bucket without ever
+     * touching the ones in between, which still satisfies the check above.
+     * Reported live: a Bruckner movement's cached waveform had real data for
+     * the first few seconds, then 88 of 144 buckets flat zero, then real
+     * data again from ~63% onward -- exactly that shape, from a mid-track
+     * seek. Require near-total coverage of 0..wave_last_bucket, not just
+     * that the far end was reached. */
+    int touched = 0;
+    for (int i = 0; i <= wave_last_bucket; i++) if (wave_touched[i]) touched++;
+    if (touched < wave_last_bucket + 1 - 4) return;
     uint32_t maxv = 0;
     for (int i = 0; i < WAVE_BUCKETS; i++) if (wave_capture[i] > maxv) maxv = wave_capture[i];
     if (maxv == 0) return;   /* silence throughout, e.g. output was lost -- nothing real to show */
@@ -4689,6 +4705,7 @@ static void wave_track_changed(const char *path) {
         } else {
             wave_capturing = 1;
             memset(wave_capture, 0, sizeof(wave_capture));
+            memset(wave_touched, 0, sizeof(wave_touched));
             snprintf(wave_capture_path, sizeof(wave_capture_path), "%s", path);
             wave_last_bucket = -1;
         }
@@ -11512,6 +11529,7 @@ int music_entry(void *a0, void *a1) {
                 if (b >= WAVE_BUCKETS) b = WAVE_BUCKETS - 1;
                 int32_t peak = audio_current_peak();
                 if (peak > (int32_t)wave_capture[b]) wave_capture[b] = (uint32_t)peak;
+                wave_touched[b] = 1;
                 if (b > wave_last_bucket) wave_last_bucket = b;
             }
         }
