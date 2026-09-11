@@ -1829,7 +1829,7 @@ _wl_power_on
 """
 
 
-BRCM_MODULES = ("brcmutil.ko", "brcmfmac.ko")
+BRCM_MODULES = ("r1_wlan_up.ko", "brcmutil.ko", "brcmfmac.ko")
 BRCM_FIRMWARE = ("brcmfmac43430-sdio.bin", "brcmfmac43430-sdio.txt")
 
 
@@ -1881,16 +1881,11 @@ def switch_to_brcmfmac(root, modules_dir, firmware_dir):
         with open(msc, "w") as fh:
             fh.write(t)
 
-    # 1b. Power the rail before soc_msc probes mmc0.
-    with open(init) as fh:
-        t = fh.read()
-    if "_wl_power_on" not in t:
-        anchor = "sh soc_gpio.sh\n"
-        if t.count(anchor) != 1:
-            return "no 'sh soc_gpio.sh' line to anchor the rail power-up"
-        t = t.replace(anchor, anchor + RAIL_BLOCK, 1)
-        with open(init, "w") as fh:
-            fh.write(t)
+    # 1b. The rail power-up and the SDIO detect trigger now live in
+    # r1_wlan_up.ko, loaded below. Doing it from the shell was measured
+    # insufficient on BRCM_6 (gpio35 verified high before soc_msc probed, mmc0
+    # still enumerated nothing) because nothing calls
+    # ingenic_mmc_manual_detect() -- mmc0 is non-removable and scans once.
 
     # 2 + 3. cywdhd out, brcmfmac in
     with open(init) as fh:
@@ -1908,7 +1903,12 @@ def switch_to_brcmfmac(root, modules_dir, firmware_dir):
 
     loader = os.path.join(root, "module_driver/brcmfmac.sh")
     with open(loader, "w") as fh:
-        fh.write("insmod brcmutil.ko\n"
+        fh.write("# r1_wlan_up powers WL_REG_ON and calls\n"
+                 "# ingenic_mmc_manual_detect() so the non-removable mmc0 host\n"
+                 "# actually enumerates the chip. Must precede brcmfmac, which\n"
+                 "# has nothing to bind to otherwise.\n"
+                 "insmod r1_wlan_up.ko\n"
+                 "insmod brcmutil.ko\n"
                  "insmod brcmfmac.ko\n")
     os.chmod(loader, 0o755)
 
@@ -1963,6 +1963,42 @@ def bt_enable_ssp(text):
              "hcitool cmd 0x03 0x0056 0x01 >/dev/null 2>&1\n"
              + anchor)
     return text.replace(anchor, block, 1)
+
+
+def bt_disable_lpm(text):
+    """Drop --enable_lpm from brcm_patchram_plus when bt_power owns the rail.
+
+    With cywdhd gone and bt_power_bluesleep driving BT_REG_ON, LPM leaves the
+    chip asleep and unwakeable: patchram completes, hci0 appears UP RUNNING,
+    and then every HCI command times out. Measured on BRCM_10: hci0_present at
+    7.17s (so patchram itself is fine), then `hciconfig hci0 reset` hung for
+    12s and `hciconfig hci0 up` by hand returned "Can't init device hci0:
+    Connection timed out (145)" after 10s. Dropping --enable_lpm on the same
+    hardware: patchram 4.31s, hci0 UP RUNNING and still up 5s later.
+
+    The cause is a GPIO direction mismatch. cywdhd's own parameters say
+    gpio_host_wake_bt=PB05 and gpio_bt_wake_host=-1 -- PB05 is the HOST waking
+    the chip, an output. bt_power_bluesleep takes its ingenic,wake-gpio as
+    "bt_wake", sets it with gpio_direction_input() and requests an IRQ on it,
+    i.e. the opposite direction. So nothing can wake the chip once it sleeps.
+
+    We cannot simply omit wake-gpio: the probe calls
+    gpio_direction_input(bt_wake) unconditionally and fails with -22 if it is
+    invalid. Disabling LPM is the smaller, testable change -- it costs some
+    idle power, which matters less than Bluetooth working. Fixing the
+    direction properly means patching bt_power_bluesleep.c.
+
+    Returns the new text, or None if there was nothing to change.
+    """
+    if "--enable_lpm" not in text:
+        return None
+    return text.replace(
+        "--enable_lpm ",
+        "",
+    ).replace(
+        "--enable_lpm",
+        "",
+    )
 
 def hasten_bt_init(root):
     """Move bt_init from S80 to S22, so its fixed cost overlaps the rest of boot.
@@ -2341,6 +2377,11 @@ def main():
                          "stamped alongside the embedded binary and compared "
                          "against /usr/data's own marker at boot to decide "
                          "whether to copy it in.")
+    ap.add_argument("--no-strip", action="store_true",
+                    help="keep the unused stock files (hiby_player, dmrd, "
+                         "stock fonts, litegui assets) that a standalone build "
+                         "normally strips. For experiments where the stripping "
+                         "would be a second uncontrolled variable.")
     ap.add_argument("--brcmfmac-switch", metavar="MODULES_DIR",
                     help="replace cywdhd with mainline brcmfmac (docs/10 step 3). "
                          "MODULES_DIR must hold brcmutil.ko and brcmfmac.ko; "
@@ -2529,7 +2570,7 @@ def main():
             nfw = install_brcmfmac_firmware(root)
             if nfw:
                 print(f"installed {nfw} brcmfmac firmware file(s) under lib/firmware/brcm/")
-            sn, sbytes = strip_unused_resources(root)
+            sn, sbytes = (0, 0) if args.no_strip else strip_unused_resources(root)
             if sn:
                 print(f"stripped {sn} unused stock file(s) "
                       f"({sbytes / 1024 / 1024:.1f}MB) -- hiby_player, dmrd, "
@@ -2703,6 +2744,44 @@ def main():
                 btext = traced
                 bpatched = btext
                 print(f"patched {BT_INIT} (step timing -> /usr/data/btsteps.log)")
+
+            # bt_init must run AFTER the module script when cywdhd is gone.
+            #
+            # With cywdhd, S11b worked because bt_init waited for cywdhd's
+            # rfkill and cywdhd had already powered the chip. Without it, S11b
+            # runs before ANY module loads: no soc_utils (no 32kHz LPO), no
+            # soc_gpio, no WL_REG_ON -- patchram then talks to a chip that is
+            # not running. Measured BRCM_7/8: hci0_present 17.3s, hci0 stuck
+            # DOWN INIT, the same signature as every BTPWR build.
+            #
+            # S12 is straight after S11module_driver_default, where the rail
+            # and the LPO come up -- the same effective start as the old
+            # cywdhd behaviour, so no boot time is lost. Must run after
+            # start_patchram_earlier(), which is what creates S11b_bt_init.
+            if args.brcmfmac_switch:
+                initd = os.path.join(root, "etc/init.d")
+                moved = False
+                for name in ("S11b_bt_init", "S22_bt_init", "S80_bt_init"):
+                    src = os.path.join(initd, name)
+                    if os.path.exists(src):
+                        os.rename(src, os.path.join(initd, "S12_bt_init"))
+                        print(f"moved etc/init.d/{name} -> S12_bt_init "
+                              f"(after the module script: the rail and the LPO "
+                              f"come up there)")
+                        moved = True
+                        break
+                if not moved and not os.path.exists(os.path.join(initd, "S12_bt_init")):
+                    die("--brcmfmac-switch: no bt_init script found to move")
+
+            if args.brcmfmac_switch:
+                nolpm = bt_disable_lpm(btext)
+                if nolpm is None:
+                    print(f"note: {BT_INIT} --enable_lpm not found — already removed")
+                else:
+                    btext = nolpm
+                    bpatched = btext
+                    print(f"patched {BT_INIT} (dropped --enable_lpm: the chip "
+                          f"sleeps unwakeably without cywdhd's wake line)")
 
             reordered = reorder_bt_init_radio_first(btext)
             if reordered is None:
