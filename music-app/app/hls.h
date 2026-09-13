@@ -10,6 +10,7 @@ typedef struct {
     int  n_queue;
     long long last_seq;                   /* media sequence of the last taken */
     int  target_ms;                       /* segment length the server declares */
+    double last_refresh_mono;             /* CLOCK_MONOTONIC seconds, see hls_next()'s own comment */
 } hls_t;
 
 int hls_open(hls_t *h, const char *master_url);
