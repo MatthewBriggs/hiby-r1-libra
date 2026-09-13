@@ -122,6 +122,12 @@ const char *audio_codec(void);        /* of the stream now playing */
 int  audio_is_exact(void);            /* output opened with no conversion layer */
 int  audio_output_lost(void);         /* playback stopped because the device went away */
 const char *audio_output(void);   /* "3.5 mm", "USB" or "Bluetooth" */
+/* Radio only: sample rate of the current stream/recording in Hz, and the
+ * real measured bitrate of the live fetch in kbps (not a nominal figure --
+ * see audio_radio_kbps()'s own comment in audio.c). Both 0 when not
+ * applicable (nothing playing, or the figure isn't known yet). */
+int audio_radio_rate_hz(void);
+int audio_radio_kbps(void);
 
 /* R28: header-only duration probe for a track the library's own database
  * has no duration for (see the comment above its definition in audio.c for

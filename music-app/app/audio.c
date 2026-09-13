@@ -96,6 +96,7 @@ static int g_out_fmt;               /* ALSA format the device actually took */
 static int g_out_lost;              /* the output device disappeared mid-play */
 static int g_lost_kind = -1;        /* which route it was, so the same one can be waited for */
 static const char *g_codec = "";    /* what the current source turned out to be */
+static unsigned g_radio_rate;       /* sample rate of the current radio stream/recording, Hz -- 0 if none */
 
 /* ---- decoders ------------------------------------------------------------ */
 #include "vendor/dr_flac.h"
@@ -408,6 +409,7 @@ static int dec_open_hls(dec_t *d, const char *url) {
             d->rate = (unsigned)g_hls.rate;
             d->frames = 0;
             g_codec = "AAC";
+            g_radio_rate = (unsigned)g_hls.rate;
             alog("[audio] hls %d Hz %d ch\n", g_hls.rate, g_hls.channels);
             return 0;
         }
@@ -476,6 +478,7 @@ static int dec_open_adts_file(dec_t *d, const char *path) {
             d->rate = (unsigned)g_adts_file.rate;
             d->frames = 0;
             g_codec = "AAC";
+            g_radio_rate = (unsigned)g_adts_file.rate;
             return 0;
         }
     }
@@ -530,6 +533,7 @@ static int dec_open_stream(dec_t *d, const char *url) {
     d->frames = 0;                            /* live: no length */
     d->is_stream = 1;
     g_codec = "MP3";
+    g_radio_rate = (unsigned)g_stream.rate;
     alog("[audio] stream %d Hz %d ch\n", g_stream.rate, g_stream.channels);
     return 0;
 }
@@ -1364,6 +1368,19 @@ static const char *out_label(void) {
 
 const char *audio_output(void) { return out_label(); }
 const char *audio_codec(void)  { return g_codec; }
+int audio_radio_rate_hz(void)  { return (int)g_radio_rate; }
+/* Real measured throughput of the live fetch, not a nominal figure the
+ * station may not even advertise -- radio_buffer.c's rb_bytes_per_sec() is
+ * already tracking this (a running EMA over the actual bytes arriving) for
+ * its own byte-position-as-time-proxy math, so this just reads it back and
+ * converts to kbps. 0 while nothing has arrived yet or once the buffer has
+ * stopped (rb_active() false), rather than reporting a stale figure from
+ * whichever station played last. */
+int audio_radio_kbps(void) {
+    if (!rb_active()) return 0;
+    double bps = rb_bytes_per_sec();
+    return bps > 0 ? (int)(bps * 8.0 / 1000.0) : 0;
+}
 int audio_is_exact(void) { return g_exact; }
 int audio_output_lost(void) { return g_out_lost; }
 int audio_using_bt(void)  { return g_out_kind == 2; }

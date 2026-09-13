@@ -8430,10 +8430,25 @@ static void qs_format_info(char *out, size_t outsz) {
      * ("AAC stream  ·  3.5 mm"); moved here to match Music/Podcast/
      * Audiobook, which have never shown format/route on the Now Playing
      * screen itself since R83 moved it into this same dropdown. A live
-     * stream has no file extension or bitrate to report, just whichever
-     * codec actually got negotiated and where it's playing out of. */
+     * stream has no file extension, but it does have a real sample rate
+     * (audio_radio_rate_hz(), from whichever decoder actually opened it)
+     * and a real measured bitrate (audio_radio_kbps(), from radio_buffer's
+     * own bytes/sec estimator) -- shown as "~" because it's a running
+     * average of actual bytes over the last few seconds, not a value the
+     * station declared, and can drift briefly right after a station change
+     * or a rewind/seek. */
     if (radio_mode) {
-        if (audio_codec()[0]) snprintf(out, outsz, "%s  \xc2\xb7  %s", audio_codec(), audio_output());
+        if (audio_codec()[0]) {
+            int hz = audio_radio_rate_hz(), kbps = audio_radio_kbps();
+            if (hz > 0 && kbps > 0)
+                snprintf(out, outsz, "%s  %g kHz  ~%d kbps  \xc2\xb7  %s",
+                        audio_codec(), hz / 1000.0, kbps, audio_output());
+            else if (hz > 0)
+                snprintf(out, outsz, "%s  %g kHz  \xc2\xb7  %s",
+                        audio_codec(), hz / 1000.0, audio_output());
+            else
+                snprintf(out, outsz, "%s  \xc2\xb7  %s", audio_codec(), audio_output());
+        }
         return;
     }
     if (recording_playback_mode) {
