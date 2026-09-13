@@ -187,18 +187,43 @@ int radio_fetch_nrk_art(const char *station_name, const char *dest_jpg,
 
     int rc = -1;
     const char *entries = strstr(buf, "\"entries\"");
-    const char *e0 = entries ? strchr(entries, '{') : NULL;
-    if (e0) {
-        /* Bounded to this one entry: its own closing '}' at nesting depth 0
-         * relative to e0, found the same brace-counting way art.c's own
-         * embedded-tag scanners bound a single frame/atom. */
-        int depth = 0;
-        const char *e_end = e0;
-        for (; *e_end; e_end++) {
-            if (*e_end == '{') depth++;
-            else if (*e_end == '}' && --depth == 0) { e_end++; break; }
+    const char *arr = entries ? strchr(entries, '[') : NULL;
+    const char *e0 = NULL, *e_end = NULL;
+    if (arr) {
+        /* "livebuffer" means exactly what it says: this array lists program
+         * blocks oldest-first, ending with whichever one is airing *right
+         * now* -- it is a record of what already played, not a schedule of
+         * what's coming. Confirmed against a live response: at 09:03 UTC
+         * the array ran Morgenstemning (06:03) ... Nyheter 11:00 (09:00) ...
+         * ending with the block that was actually current. Taking entries[0]
+         * (the old code) instead showed a program from hours earlier -- this
+         * walks every top-level {...} object in the array and keeps only
+         * the last one, bounded by the array's own closing ']' via a
+         * bracket-depth counter so a nested "images":[...] array inside an
+         * entry can't be mistaken for the end of the whole list. */
+        int brace_depth = 0, bracket_depth = 0;
+        const char *p = arr + 1;
+        const char *cur_start = NULL;
+        for (; *p; p++) {
+            if (*p == '[') {
+                bracket_depth++;
+            } else if (*p == ']') {
+                if (bracket_depth == 0) break;
+                bracket_depth--;
+            } else if (*p == '{') {
+                if (brace_depth == 0 && bracket_depth == 0 && !cur_start) cur_start = p;
+                brace_depth++;
+            } else if (*p == '}') {
+                brace_depth--;
+                if (brace_depth == 0 && bracket_depth == 0 && cur_start) {
+                    e0 = cur_start;
+                    e_end = p + 1;
+                    cur_start = NULL;
+                }
+            }
         }
-
+    }
+    if (e0) {
         const char *t = strstr(e0, "\"title\"");
         if (t && t < e_end) {
             const char *c = strchr(t, ':');

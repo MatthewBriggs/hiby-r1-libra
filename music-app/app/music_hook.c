@@ -6186,7 +6186,8 @@ static void draw_screen(uint16_t *fb) {
                 snprintf(buf, sizeof(buf), "-%ld:%02ld", behind_ms / 60000, (behind_ms / 1000) % 60);
                 draw_right_col(fb, ty + 82, buf, np_col_dim());
             } else {
-                draw_right_col(fb, ty + 82, audio_is_active() ? "LIVE" : "stopped", np_col_dim());
+                draw_right_col(fb, ty + 82, audio_is_active() ? "LIVE" : "stopped",
+                               audio_is_active() ? np_col_accent() : np_col_dim());
             }
 
             int by = bar_y();
@@ -6261,9 +6262,6 @@ static void draw_screen(uint16_t *fb) {
                              cyy - TEXT_PX_SMALL / 2 + 2, "REC", ring_col, TEXT_PX_SMALL, FB_W);
             }
 
-            snprintf(buf, sizeof(buf), "%s stream  \xc2\xb7  %s",
-                     audio_codec()[0] ? audio_codec() : "Live", audio_output());
-            draw_text(fb, 24, FB_H - 34, buf, COL_ACCENT, TEXT_PX_SMALL, FB_W - 48);
             return;
         }
 
@@ -8428,7 +8426,21 @@ static void draw_gear_icon(uint16_t *fb, int x, int y, uint16_t c) {
  * file-based format to read) or nothing loaded at all. */
 static void qs_format_info(char *out, size_t outsz) {
     out[0] = '\0';
-    if (radio_mode || cur_track < 0 || cur_track >= queue_n) return;
+    /* R111 follow-up: was its own line at the bottom of the radio player
+     * ("AAC stream  ·  3.5 mm"); moved here to match Music/Podcast/
+     * Audiobook, which have never shown format/route on the Now Playing
+     * screen itself since R83 moved it into this same dropdown. A live
+     * stream has no file extension or bitrate to report, just whichever
+     * codec actually got negotiated and where it's playing out of. */
+    if (radio_mode) {
+        if (audio_codec()[0]) snprintf(out, outsz, "%s  \xc2\xb7  %s", audio_codec(), audio_output());
+        return;
+    }
+    if (recording_playback_mode) {
+        if (audio_codec()[0]) snprintf(out, outsz, "%s  \xc2\xb7  %s", audio_codec(), audio_output());
+        return;
+    }
+    if (cur_track < 0 || cur_track >= queue_n) return;
     lib_track_t *t = &queue[cur_track];
     char ext[16];
     const char *dot = strrchr(t->path, '.');
