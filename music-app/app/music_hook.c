@@ -545,6 +545,76 @@ static volatile int radio_art_done = 1;
 static char radio_art_title[160];
 static char radio_art_for_station[LIB_NAME_LEN]; /* which station radio_art_bits/title belong to */
 static int  radio_art_tick;                       /* periodic refresh, main loop */
+
+/* Radio waveform scrubber (R111 follow-up): a live stream has no fixed
+ * duration, so this can't bucket by "fraction of the track" the way
+ * WAVE_BUCKETS above does -- it's keyed by absolute seconds since the
+ * current station was tuned in instead, wrapped into a ring the same
+ * size as radio_buffer.c's own 30-minute retention window (RB_WINDOW_
+ * SECONDS), so a second still physically in the byte buffer is always
+ * still physically in this ring too. radio_peak_owner[] records *which*
+ * absolute second currently occupies each slot; a mismatch (stale data
+ * from 30+ minutes ago, or a slot the stream simply hasn't reached yet)
+ * reads as silence rather than a wrong stale bar, and doubles as the
+ * "ran off the start of the buffer" signal the draw side needs -- no
+ * separate oldest/live-edge bookkeeping required. One byte would lose
+ * too much dynamic range for the draw side's own per-frame renormalise
+ * (see draw_radio_waveform()); audio_current_peak() is a raw abs-sample
+ * value up to 32767, so this stores that directly. */
+#define RADIO_PEAK_SECONDS (30 * 60)
+/* 2 minutes of waveform visible across the full screen width, per spec --
+ * FB_W is fixed at 480 on this device (no responsive layout elsewhere in
+ * this app either), so this is an exact integer, not an approximation:
+ * 480px / 120s = 4px/s. Shared by the draw side and the drag handler so
+ * "how far the finger moved" and "how far the waveform visibly moved"
+ * never disagree. */
+#define RADIO_WAVE_PX_PER_SEC (FB_W / 120)
+static uint16_t radio_peak_ring[RADIO_PEAK_SECONDS];
+static long     radio_peak_owner[RADIO_PEAK_SECONDS];   /* absolute second, or -1 = never written */
+static long     radio_peak_epoch_ms;   /* CLOCK_MONOTONIC ms when the current station's second 0 was */
+
+/* Set once, when a drag over the waveform begins -- the absolute second
+ * under the fixed playhead at that moment, so the drag reads as pure
+ * displacement (title_dragging above does the same thing for a scrolling
+ * title) rather than fighting with the real position that scrub_dragging's
+ * own continuous seeking is simultaneously moving underneath it. */
+static int  radio_scrub_dragging;
+static long radio_scrub_anchor_sec;
+
+static long radio_mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+/* Seconds since the current station was tuned in, at the live edge --
+ * grows with real elapsed time regardless of pause/rewind, exactly like
+ * radio_buffer.c's own byte-position-as-time-proxy grows with real bytes
+ * arriving. */
+static long radio_live_abs_sec(void) {
+    return (radio_mono_ms() - radio_peak_epoch_ms) / 1000;
+}
+
+/* The absolute second of whatever is actually being decoded right now --
+ * live minus however far behind live the byte cursor currently sits.
+ * Single source of truth for both the peak capture below and the draw
+ * side: the drag handler nudges audio_radio_offset_ms() itself in real
+ * time (see radio_scrub_dragging's own comment), so this is correct
+ * during a drag too, not just during ordinary playback. */
+static long radio_current_abs_sec(void) {
+    return radio_live_abs_sec() - audio_radio_offset_ms() / 1000;
+}
+
+/* Floor division -- plain C '/' truncates toward zero, which would bucket
+ * pixels just left of the playhead (a negative numerator) inconsistently
+ * with pixels just right of it. Only ever called with a positive divisor
+ * here. */
+static long radio_floor_div(long a, long b) {
+    long q = a / b;
+    if (a % b != 0 && a < 0) q--;
+    return q;
+}
+
 static char      art_want[512];       /* track the loader should be showing */
 /* R23: artist/album to search Last.fm with if no local art turns up for
  * art_want -- empty from any caller that shouldn't trigger that fallback
@@ -4558,6 +4628,12 @@ static void play_station(int i) {
     art_request("", "", "", "");         /* clears whatever art was showing */
     radio_art_clear();
     radio_art_request(radio_name);       /* R111: program art, no-op for a station no provider recognises */
+    /* Waveform ring: a fresh station means a fresh "second 0", and every
+     * existing owner[] entry belongs to whatever was playing before --
+     * without clearing it, an absolute second that happens to reuse the
+     * same ring slot could read back as this station's own history. */
+    radio_peak_epoch_ms = radio_mono_ms();
+    for (int pi = 0; pi < RADIO_PEAK_SECONDS; pi++) radio_peak_owner[pi] = -1;
     audio_play(stations[i].url);
     was_active = 1;
     mlog("[music] station %s\n", stations[i].name);
@@ -5633,6 +5709,66 @@ static void draw_keyboard(uint16_t *fb) {
     }
 }
 
+/* Radio's drag-scrubber waveform -- same column shape and colouring as
+ * Music's own R29 waveform above (3px bar, 1px gap, 2px floor so a true-
+ * silence second still reads as a hairline rather than vanishing), just
+ * fed from radio_peak_ring[] instead of wave_buckets[] and laid out around
+ * a fixed playhead instead of a played/unplayed split of one whole track.
+ * One column per second, not per pixel -- RADIO_WAVE_PX_PER_SEC is exactly
+ * 4 (see its own comment), so a 3+1 column is pixel-perfect against the
+ * ring's own resolution, the same way Music's own WAVE_BUCKETS comment
+ * picked 144 to divide its bar's width exactly.
+ *
+ * Fixed playhead at 2/3 across the screen (per explicit spec), 2 minutes
+ * of buffered audio visible across the full width either side of it --
+ * everything left of the playhead is already played (accent, matching
+ * Music's "played" colour), everything right of it is buffered-but-not-
+ * yet-reached (np_col_line(), matching Music's "unplayed" -- only ever
+ * non-empty when rewound behind live; blank all the way to the right edge
+ * at the live edge itself, since there is nothing beyond "now"). Each
+ * column's absolute second is validated against radio_peak_owner[] -- a
+ * mismatch there (predates this station's tune-in, aged out of the
+ * 30-minute ring, or simply hasn't arrived yet) draws nothing for that
+ * column, which is what both "ran off the start of the buffer" and "ran
+ * off the live edge" need to look like. Renormalised to whatever's
+ * actually visible on screen right now rather than any fixed scale, the
+ * same reasoning R29's wave_capture[] normalises against its one track's
+ * own peak -- a whisper-quiet classical piece and a loud news bulletin
+ * should each use the full height available, not whatever an arbitrary
+ * fixed ceiling happened to allow. */
+#define RADIO_WAVE_H 48
+static void draw_radio_waveform(uint16_t *fb, int center_y) {
+    int playhead_col = (FB_W * 2 / 3) / RADIO_WAVE_PX_PER_SEC;
+    int cols = FB_W / RADIO_WAVE_PX_PER_SEC;
+    long cur_abs = radio_current_abs_sec();
+
+    uint16_t maxp = 1;
+    long col_abs[FB_W / RADIO_WAVE_PX_PER_SEC];
+    int col_ok[FB_W / RADIO_WAVE_PX_PER_SEC];
+    for (int c = 0; c < cols; c++) {
+        long abs_sec = cur_abs + (c - playhead_col);
+        col_abs[c] = abs_sec;
+        col_ok[c] = 0;
+        if (abs_sec < 0) continue;
+        int idx = (int)(abs_sec % RADIO_PEAK_SECONDS);
+        if (radio_peak_owner[idx] == abs_sec) {
+            col_ok[c] = 1;
+            if (radio_peak_ring[idx] > maxp) maxp = radio_peak_ring[idx];
+        }
+    }
+
+    uint16_t wave_accent = np_col_accent(), wave_line = np_col_line();
+    for (int c = 0; c < cols; c++) {
+        if (!col_ok[c]) continue;
+        int idx = (int)(col_abs[c] % RADIO_PEAK_SECONDS);
+        int h = (int)((uint32_t)radio_peak_ring[idx] * RADIO_WAVE_H / maxp);
+        if (h < 2) h = 2;
+        int cx0 = c * RADIO_WAVE_PX_PER_SEC;
+        fill_rect(fb, cx0, center_y - h / 2, RADIO_WAVE_PX_PER_SEC - 1, h,
+                 c <= playhead_col ? wave_accent : wave_line);
+    }
+}
+
 static void draw_screen(uint16_t *fb) {
     if (screen == SC_KEYBOARD) { draw_keyboard(fb); return; }
     /* R14 flagged skipping this full clear (header/mini-player strips are
@@ -6234,6 +6370,7 @@ static void draw_screen(uint16_t *fb) {
             }
 
             int by = bar_y();
+            draw_radio_waveform(fb, by + 14);
             int cyy = by + 70 + CTRL_NUDGE_PX, mid = FB_W / 2;
             fill_circle(fb, mid, cyy, 42, np_col_accent());
             if (audio_is_paused()) fill_triangle(fb, mid + 4, cyy, 36, +1, np_col_bg());
@@ -11975,6 +12112,41 @@ int music_entry(void *a0, void *a1) {
             }
         }
 
+        /* Radio waveform scrubber's own peak capture -- same poll, same
+         * audio_current_peak() call, but keyed by absolute buffer-time
+         * second (see radio_peak_ring's own comment) instead of a track-
+         * duration bucket. Running max within a second, like the R29
+         * capture above does within a bucket: several ticks land in the
+         * same second at this ~33ms poll rate, and the loudest one is the
+         * one worth showing. Gated on radio_mode, not screen == SC_PLAYING
+         * -- capture keeps running (matching radio_buffer.c's own fetch)
+         * even while the user is back on the station list or elsewhere in
+         * the app, so the trace has no gap if they return to Now Playing. */
+        if (radio_mode && audio_is_active() && !audio_is_paused()) {
+            long abs_sec = radio_current_abs_sec();
+            if (abs_sec >= 0) {
+                int idx = (int)(abs_sec % RADIO_PEAK_SECONDS);
+                int32_t peak = audio_current_peak();
+                uint16_t p16 = peak > 32767 ? 32767 : (uint16_t)peak;
+                if (radio_peak_owner[idx] != abs_sec) {
+                    radio_peak_ring[idx] = p16;
+                    radio_peak_owner[idx] = abs_sec;
+                } else if (p16 > radio_peak_ring[idx]) {
+                    radio_peak_ring[idx] = p16;
+                }
+            }
+        }
+        /* The waveform (and the existing LIVE/-M:SS readout) both need to
+         * visibly advance in real time even with no touch on the screen at
+         * all -- same "redraw every tick so the bar animates" reasoning
+         * power_hold_ui_shown's own dirty=1 above already uses. Scoped to
+         * the radio Now Playing screen specifically, not radio_mode alone:
+         * the underlying state keeps changing everywhere radio_mode is
+         * true (that's the whole point of the capture block just above),
+         * but nothing needs painting for it while some other screen is
+         * actually on display. */
+        if (radio_mode && screen == SC_PLAYING) dirty = 1;
+
         /* Podcast downloads and whole-feed syncs both run as detached child
          * processes (see podcast.c) -- polled and reaped every tick, cheap
          * when idle since both are no-ops with nothing running. A completed
@@ -12657,6 +12829,56 @@ int music_entry(void *a0, void *a1) {
                            !qs_open && queue_n > 0 &&
                            touch_y > bar_y() - 26 && touch_y < bar_y() + 26;
             if (scrub_active || was) { dirty = 1; idle = 0; }
+        }
+
+        /* Radio's own waveform scrubber -- unlike the tap-to-position bar
+         * above, explicitly requested as drag-relative: moving the bar
+         * moves playback, dragging to an absolute x is not how it works.
+         * Applied live, tick by tick, rather than deferred to release --
+         * dragging right (finger moves right, dx > 0) slides earlier
+         * content in under the fixed playhead, i.e. rewind, matching what
+         * the same motion does to draw_radio_waveform()'s own content
+         * (see its comment); dragging left runs back toward live. Running
+         * out of buffered history while dragging right is exactly "the bar
+         * disappears off the left of the screen" -- radio_current_abs_sec()
+         * still moves (clamped below), but radio_peak_owner[] has nothing
+         * for seconds that predate the station's own tune-in or have aged
+         * out of the 30-minute ring, so the draw side just shows nothing
+         * there until dragged back. */
+        {
+            int was = radio_scrub_dragging;
+            radio_scrub_dragging = touch_down && screen == SC_PLAYING && radio_mode &&
+                                   !qs_open &&
+                                   touch_y > bar_y() - 32 && touch_y < bar_y() + 32;
+            if (radio_scrub_dragging && !was) {
+                radio_scrub_anchor_sec = radio_current_abs_sec();
+            } else if (radio_scrub_dragging) {
+                long dx = live_x - touch_x;
+                long raw_target = radio_scrub_anchor_sec - radio_floor_div(dx, RADIO_WAVE_PX_PER_SEC);
+                long live_abs = radio_live_abs_sec();
+                long max_rewind_sec = audio_radio_max_rewind_ms() / 1000;
+                long lo = live_abs - max_rewind_sec;
+                if (lo < 0) lo = 0;
+                long target = raw_target;
+                if (target < lo) target = lo;
+                if (target > live_abs) target = live_abs;
+                long delta_sec = target - radio_current_abs_sec();
+                if (delta_sec != 0) audio_radio_seek_relative_ms(delta_sec * 1000);
+                /* Re-anchor whenever the raw (unclamped) target overshot a
+                 * boundary -- otherwise the drag "banks" however far past
+                 * live or the buffer's start the finger travelled, and
+                 * reversing direction has to retrace that whole overshoot
+                 * before playback moves again. Clamping the anchor itself
+                 * means the finger's *current* position always maps to
+                 * exactly the clamped edge, so you genuinely cannot drag
+                 * past live (or past the buffer's start) at all -- pushing
+                 * further just holds there, and reversing responds
+                 * immediately. */
+                if (raw_target != target)
+                    radio_scrub_anchor_sec = target + radio_floor_div(dx, RADIO_WAVE_PX_PER_SEC);
+                dirty = 1;
+            }
+            if (radio_scrub_dragging || was) idle = 0;
         }
 
         /* Same shape as scrubbing, for the EQ sliders: which one (if any) the

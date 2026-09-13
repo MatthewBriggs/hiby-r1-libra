@@ -299,6 +299,51 @@ static void radio_apply_pending_seek(void) {
     g_hls.adts_len = g_hls.adts_used = 0;
 }
 
+/* R111 follow-up: reported live as visible instability right at connect
+ * time -- the offset readout and the waveform scrubber's own display both
+ * jumping around for the first several seconds of a station, before
+ * settling down. Root cause: dec_open_stream()/dec_open_hls() start
+ * reading from g_radio_cursor = 0, the very first byte radio_buffer.c's
+ * background thread ever wrote for this session, with essentially no
+ * cushion between the writer and this cursor -- unlike steady-state
+ * playback, which settles near (not exactly at) the live edge once
+ * rb_read_at_wait()'s own bounded blocking has had time to average out
+ * the normal jitter between when bytes are decoded and when they arrive.
+ *
+ * Waits for rb_bytes_per_sec() to become real (rather than a fixed real-
+ * time delay -- tried that first, and it under-shot: the wait started
+ * timing from rb_start()'s own return, but rb_note_bytes()'s 4-second EMA
+ * window only starts from the *first byte actually written*, which lands
+ * some real connect/TLS time later, so a 4000ms wait routinely finished
+ * before the estimate did and audio_radio_offset_ms() kept reporting 0/
+ * LIVE regardless of how far behind the cursor genuinely was -- confirmed
+ * live, twice). Waiting for the estimate itself needs no separate number
+ * for "how long is enough": rb_bytes_per_sec() only ever turns nonzero
+ * once, at exactly the point ~4 real seconds of data have been folded
+ * into it, which is already the cushion wanted, no matter how long
+ * connect overhead ran first. RADIO_STARTUP_BUDGET_MS bounds the total
+ * wait so a station that's connected (rb_active() true) but pathologically
+ * slow to produce any bytes at all doesn't hang here indefinitely -- in
+ * that case this just returns with the cursor at 0, no worse than before
+ * this fix existed. Called before the "prove it decodes" step, not after
+ * -- that step's own read must come from the cushioned position, not from
+ * position 0 followed by a jump. */
+#define RADIO_STARTUP_BUDGET_MS 8000
+static void radio_wait_startup_cushion(void) {
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (;;) {
+        if (rb_bytes_per_sec() > 0) return;
+        if (!rb_active()) return;
+        struct timespec t1;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        long elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000L +
+                          (t1.tv_nsec - t0.tv_nsec) / 1000000L;
+        if (elapsed_ms >= RADIO_STARTUP_BUDGET_MS) return;
+        usleep(50000);
+    }
+}
+
 /* rb_read_at() returning 0 at the live edge does not mean the stream ended
  * -- it means the background writer (radio_buffer.c) hasn't landed the next
  * bytes yet, which happens constantly during completely normal playback
@@ -373,6 +418,7 @@ static int dec_open_hls(dec_t *d, const char *url) {
     memset(&g_hls, 0, sizeof(g_hls));
     g_radio_cursor = 0;
     if (rb_start(url, RB_KIND_ADTS) != 0) { alog("[audio] hls open failed\n"); return -1; }
+    radio_wait_startup_cushion();
     g_hls.aac = aac_open(NULL, 0);           /* ADTS: self-describing */
     if (!g_hls.aac) { rb_stop(); alog("[audio] no AAC decoder\n"); return -1; }
 
@@ -499,6 +545,7 @@ static int dec_open_stream(dec_t *d, const char *url) {
      * it later. .pipe is repurposed as a plain "session active" flag -- the
      * real FILE* lives inside radio_buffer.c, not here. */
     if (rb_start(url, RB_KIND_MP3) != 0) { alog("[audio] cannot start fetch\n"); return -1; }
+    radio_wait_startup_cushion();
     g_stream.pipe = (FILE *)1;
 
     /* First bytes take a moment to arrive -- the background thread has only
