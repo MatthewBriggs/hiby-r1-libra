@@ -290,10 +290,12 @@ static void radio_apply_pending_seek(void) {
     int64_t delta_bytes = (int64_t)((double)delta_ms / 1000.0 * bps);
 
     uint64_t lo = rb_oldest_pos(), hi = rb_live_pos();
+    pthread_mutex_lock(&g_lock);
     int64_t pos = (int64_t)g_radio_cursor + delta_bytes;
     if (pos < (int64_t)lo) pos = (int64_t)lo;
     if (pos > (int64_t)hi) pos = (int64_t)hi;
     g_radio_cursor = (uint64_t)pos;
+    pthread_mutex_unlock(&g_lock);
 
     g_stream.len = 0;
     g_hls.adts_len = g_hls.adts_used = 0;
@@ -368,7 +370,18 @@ static int stream_fill(stream_t *s) {
     if (!s->pipe || s->len >= STREAM_BUF) return 0;
     size_t got = rb_read_at_wait(g_radio_cursor, s->buf + s->len, (size_t)(STREAM_BUF - s->len));
     s->len += (int)got;
+    /* Locked: audio_radio_offset_ms() reads g_radio_cursor from the UI
+     * thread under g_lock, and this is a 64-bit value on a 32-bit target --
+     * an unlocked read during an unlocked write here is a genuine torn-
+     * read hazard (two non-atomic word stores), not just a style nit, and
+     * this runs on every decode chunk during perfectly ordinary playback,
+     * not only during a seek. A torn value can land anywhere, including
+     * past the real live edge, which reads on screen as exactly the
+     * reported "jumps around" -- confirmed as a real, frequent race once
+     * looked for, not a one-off. */
+    pthread_mutex_lock(&g_lock);
     g_radio_cursor += got;
+    pthread_mutex_unlock(&g_lock);
     return (int)got;
 }
 
@@ -407,7 +420,10 @@ static int stream_decode_frame(stream_t *s) {
 static int hls_refill(hls_src_t *s) {
     size_t got = rb_read_at_wait(g_radio_cursor, s->adts, sizeof(s->adts));
     if (got == 0) return 0;
+    /* Locked -- see stream_fill()'s own comment on this same pattern. */
+    pthread_mutex_lock(&g_lock);
     g_radio_cursor += got;
+    pthread_mutex_unlock(&g_lock);
     s->adts_len = (int)got;
     s->adts_used = 0;
     return (int)got;

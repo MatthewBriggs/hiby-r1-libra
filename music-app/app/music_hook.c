@@ -580,6 +580,10 @@ static long     radio_peak_epoch_ms;   /* CLOCK_MONOTONIC ms when the current st
  * own continuous seeking is simultaneously moving underneath it. */
 static int  radio_scrub_dragging;
 static long radio_scrub_anchor_sec;
+/* What this drag has already told audio_radio_seek_relative_ms() to reach
+ * -- see the drag handler's own comment for why deltas must be computed
+ * against this, never against a fresh radio_current_abs_sec() read. */
+static long radio_scrub_committed_sec;
 
 static long radio_mono_ms(void) {
     struct timespec ts;
@@ -12844,7 +12848,27 @@ int music_entry(void *a0, void *a1) {
          * still moves (clamped below), but radio_peak_owner[] has nothing
          * for seconds that predate the station's own tune-in or have aged
          * out of the 30-minute ring, so the draw side just shows nothing
-         * there until dragged back. */
+         * there until dragged back.
+         *
+         * Deltas here are computed against radio_scrub_committed_sec, never
+         * against a fresh radio_current_abs_sec() read -- audio_radio_seek_
+         * relative_ms() only *queues* a delta (g_radio_seek_delta_ms +=),
+         * consumed whenever the decode worker next gets to it, which is not
+         * necessarily before this runs again at 30Hz. Reading the real
+         * position back and computing a fresh "distance to target" against
+         * it assumes the previous tick's request already landed; when the
+         * worker lags (a slow tick, a stalled connection, anything), it
+         * hasn't, and the same correction gets queued again on top of
+         * itself every tick until the worker catches up -- confirmed live
+         * as exactly the reported "drags into the future": a burst of
+         * compounded deltas landing all at once as a single large jump
+         * clamped hard against live by radio_apply_pending_seek()'s own
+         * bound, which looks indistinguishable from "overshot past live"
+         * even though the byte cursor itself never actually exceeded it.
+         * Tracking what this drag has *already told* the audio layer to
+         * reach, and only ever queuing the incremental difference from
+         * that, makes each tick's request correct regardless of how many
+         * ticks the worker needs to work through its backlog. */
         {
             int was = radio_scrub_dragging;
             radio_scrub_dragging = touch_down && screen == SC_PLAYING && radio_mode &&
@@ -12852,6 +12876,7 @@ int music_entry(void *a0, void *a1) {
                                    touch_y > bar_y() - 32 && touch_y < bar_y() + 32;
             if (radio_scrub_dragging && !was) {
                 radio_scrub_anchor_sec = radio_current_abs_sec();
+                radio_scrub_committed_sec = radio_scrub_anchor_sec;
             } else if (radio_scrub_dragging) {
                 long dx = live_x - touch_x;
                 long raw_target = radio_scrub_anchor_sec - radio_floor_div(dx, RADIO_WAVE_PX_PER_SEC);
@@ -12862,8 +12887,11 @@ int music_entry(void *a0, void *a1) {
                 long target = raw_target;
                 if (target < lo) target = lo;
                 if (target > live_abs) target = live_abs;
-                long delta_sec = target - radio_current_abs_sec();
-                if (delta_sec != 0) audio_radio_seek_relative_ms(delta_sec * 1000);
+                long delta_sec = target - radio_scrub_committed_sec;
+                if (delta_sec != 0) {
+                    audio_radio_seek_relative_ms(delta_sec * 1000);
+                    radio_scrub_committed_sec = target;
+                }
                 /* Re-anchor whenever the raw (unclamped) target overshot a
                  * boundary -- otherwise the drag "banks" however far past
                  * live or the buffer's start the finger travelled, and
