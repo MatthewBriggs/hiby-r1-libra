@@ -24,8 +24,8 @@
 #include "radio.h"
 
 #define STATIONS_PATH "/usr/data/radio_stations.conf"
-#define NRK_CURL_BIN  "/data/mnt/sd_0/.podsync/curl"
-#define NRK_CURL_CA   "/data/mnt/sd_0/.podsync/cacert.pem"
+#define RADIO_CURL_BIN "/data/mnt/sd_0/.podsync/curl"
+#define RADIO_CURL_CA  "/data/mnt/sd_0/.podsync/cacert.pem"
 
 /* Written on first run so the file exists to be edited, rather than the user
  * having to guess the format. These are stations that publish a direct stream
@@ -36,6 +36,14 @@ static const char *seed =
     "# Lines starting with # are ignored.\n"
     "NRK Klassisk | https://nrk-live-radio-world.akamaized.net/klassisk/muxed.m3u8?adap=audio&aco=aac\n"
     "rbbKultur | https://dispatcher.rndfnk.com/rbb/rbbkultur/live/mp3/high\n"
+    /* MP3, not the AAC variant these stations also publish -- AAC here
+     * means a raw ADTS elementary stream over plain HTTP, not HLS, and this
+     * app's direct-stream decode path only speaks MP3 (see open_any()'s
+     * .m3u8 check in audio.c: anything without that extension goes to the
+     * MP3 decoder, which would just fail on ADTS). MP3 needs no new code. */
+    "Deutschlandfunk | https://st01.sslstream.dlf.de/dlf/01/128/mp3/stream.mp3\n"
+    "Deutschlandfunk Kultur | https://st02.sslstream.dlf.de/dlf/02/128/mp3/stream.mp3\n"
+    "Deutschlandfunk Nova | https://st03.sslstream.dlf.de/dlf/03/128/mp3/stream.mp3\n"
     "BBC Radio 3 | \n"
     "BBC Radio 4 | \n";
 
@@ -79,20 +87,13 @@ int radio_load(radio_station_t *out, int max) {
     return n;
 }
 
-/* NRK's own live-channel API gives the current program block's title and
- * real artwork -- checked directly against psapi.nrk.no rather than
- * assumed: it does NOT give per-track/composer "now playing" info for a
- * live channel (that field, indexPoints, is only ever populated for their
- * on-demand catalog) -- see radio_fetch_nrk_art()'s own comment for the
- * exact endpoint. Channel id is derived from the station name ("NRK
- * Klassisk" -> "klassisk") since every NRK channel name in the wild follows
- * that same "NRK <Name>" convention; a non-NRK station is simply not
- * offered this (radio_fetch_nrk_art() returns -1 immediately). */
-static int nrk_run_curl(const char *url, const char *out_path) {
+/* Shared by every "now playing" provider below (NRK, Deutschlandfunk) --
+ * nothing in it is provider-specific, just fetch a URL to a file. */
+static int radio_run_curl(const char *url, const char *out_path) {
     unlink(out_path);
     pid_t pid = fork();
     if (pid == 0) {
-        execl(NRK_CURL_BIN, NRK_CURL_BIN, "-fsSL", "--cacert", NRK_CURL_CA,
+        execl(RADIO_CURL_BIN, RADIO_CURL_BIN, "-fsSL", "--cacert", RADIO_CURL_CA,
               "--connect-timeout", "10", "--max-time", "20",
               "-o", out_path, url, (char *)NULL);
         execlp("curl", "curl", "-fsSL",
@@ -174,7 +175,7 @@ int radio_fetch_nrk_art(const char *station_name, const char *dest_jpg,
 
     char meta_path[64];
     snprintf(meta_path, sizeof(meta_path), "/tmp/.nrk_live_%d.json", (int)getpid());
-    if (nrk_run_curl(url, meta_path) != 0) { unlink(meta_path); return -1; }
+    if (radio_run_curl(url, meta_path) != 0) { unlink(meta_path); return -1; }
 
     FILE *f = fopen(meta_path, "rb");
     if (!f) { unlink(meta_path); return -1; }
@@ -243,7 +244,7 @@ int radio_fetch_nrk_art(const char *station_name, const char *dest_jpg,
             if (nrk_best_url_in(sq, e_end, img_url, sizeof(img_url)) == 0) {
                 char tmp_jpg[300];
                 snprintf(tmp_jpg, sizeof(tmp_jpg), "%s.part", dest_jpg);
-                if (nrk_run_curl(img_url, tmp_jpg) == 0 && rename(tmp_jpg, dest_jpg) == 0)
+                if (radio_run_curl(img_url, tmp_jpg) == 0 && rename(tmp_jpg, dest_jpg) == 0)
                     rc = 0;
                 else
                     unlink(tmp_jpg);
@@ -252,6 +253,110 @@ int radio_fetch_nrk_art(const char *station_name, const char *dest_jpg,
     }
 
     free(buf);
+    return rc;
+}
+
+/* Deutschlandfunk / Deutschlandfunk Kultur / Deutschlandfunk Nova each run a
+ * different frontend (checked directly, not assumed): DLF and Kultur share
+ * one CMS that exposes "/api/partials/CurrentBroadcast?drsearch:_ajax=1" on
+ * the station's own site -- a tiny HTML fragment whose one real element is
+ * <div data-broadcast="{&quot;title&quot;:...,&quot;startTime&quot;:...,
+ * &quot;producer&quot;:...}">, no JSON API and no auth needed. Nova's site is
+ * a completely separate build with no equivalent found (its schedule pages
+ * only carry on-demand podcast episodes, not a live "now" marker), so it
+ * gets no title here -- radio_fetch_dlf_broadcast() returns -1 for it before
+ * any network access, same as radio_fetch_nrk_art() does for a non-NRK name.
+ *
+ * None of the three publish live per-program artwork the way NRK does, so
+ * the image here is a fixed per-station logo, not something that changes
+ * with the programme -- ARD Audiothek's own GraphQL API lists one for every
+ * ARD live stream (permanentLivestreams { image { url } }, confirmed via
+ * its schema introspection), but querying it live for a fixed value is
+ * pointless network cost; the three URLs below are exactly what that query
+ * returns for these stations' publicationServiceIds today. Landscape (16:9),
+ * not square -- cover_load()'s own center-crop (see its "side"/"x_off"
+ * logic) handles that the same way it would a landscape local album cover,
+ * but it also refuses to *upscale* a thumbnail, and center-cropping a 16:9
+ * image to a square uses its short side -- so w=960 here, not the w=480
+ * that would be plenty for a square image, since ARD's image service only
+ * takes a width and returns proportional height (960x540 clears RADIO_ART_
+ * PX's 480px square comfortably; 480x270 did not, and got silently
+ * rejected exactly the way an oversized NRK image once was for the
+ * opposite reason -- see nrk_best_url_in()'s own comment on that bug). */
+static int dlf_site_for(const char *station_name, const char **host) {
+    if (!strcmp(station_name, "Deutschlandfunk")) { *host = "www.deutschlandfunk.de"; return 0; }
+    if (!strcmp(station_name, "Deutschlandfunk Kultur")) { *host = "www.deutschlandfunkkultur.de"; return 0; }
+    return -1;   /* Nova, or anything else -- no CurrentBroadcast endpoint known */
+}
+
+static const char *dlf_logo_url_for(const char *station_name) {
+    if (!strcmp(station_name, "Deutschlandfunk"))
+        return "https://api.ardmediathek.de/image-service/images/urn:ard:image:13599da8686b116c?w=960&ch=aed6513ff66e353d";
+    if (!strcmp(station_name, "Deutschlandfunk Kultur"))
+        return "https://api.ardmediathek.de/image-service/images/urn:ard:image:653f5af88ec9c219?w=960&ch=46be14b5e31b871c";
+    if (!strcmp(station_name, "Deutschlandfunk Nova"))
+        return "https://api.ardmediathek.de/image-service/images/urn:ard:image:3ae73f64276f37ad?w=960&ch=dc349460284f607a";
+    return NULL;
+}
+
+/* Pulls "title" out of data-broadcast="{&quot;title&quot;:&quot;...&quot;,
+ * ...}" without ever unescaping the whole blob -- the value never contains
+ * a raw '"', so the &quot; markers either side of it are exactly the
+ * delimiters needed, no HTML-entity decoding required for this one field. */
+static int dlf_title_in(const char *buf, char *out, size_t out_n) {
+    const char *attr = strstr(buf, "data-broadcast=\"");
+    if (!attr) return -1;
+    const char *k = strstr(attr, "title&quot;:&quot;");
+    if (!k) return -1;
+    const char *v0 = k + strlen("title&quot;:&quot;");
+    const char *v1 = strstr(v0, "&quot;");
+    if (!v1) return -1;
+    size_t len = (size_t)(v1 - v0);
+    if (len >= out_n) len = out_n - 1;
+    memcpy(out, v0, len);
+    out[len] = '\0';
+    return out[0] ? 0 : -1;
+}
+
+int radio_fetch_dlf_broadcast(const char *station_name, const char *dest_jpg,
+                              char *title_out, size_t title_n) {
+    title_out[0] = '\0';
+    if (strncmp(station_name, "Deutschlandfunk", 15) != 0) return -1;
+
+    int rc = -1;
+    const char *host;
+    if (dlf_site_for(station_name, &host) == 0) {
+        char url[160];
+        snprintf(url, sizeof(url), "https://%s/api/partials/CurrentBroadcast?drsearch:_ajax=1", host);
+        char frag_path[64];
+        snprintf(frag_path, sizeof(frag_path), "/tmp/.dlf_bc_%d.html", (int)getpid());
+        if (radio_run_curl(url, frag_path) == 0) {
+            FILE *f = fopen(frag_path, "rb");
+            if (f) {
+                char buf[4096];
+                size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+                fclose(f);
+                buf[n] = '\0';
+                if (dlf_title_in(buf, title_out, title_n) == 0) rc = 0;
+            }
+        }
+        unlink(frag_path);
+    }
+
+    const char *logo = dlf_logo_url_for(station_name);
+    if (logo) {
+        char tmp_jpg[300];
+        snprintf(tmp_jpg, sizeof(tmp_jpg), "%s.part", dest_jpg);
+        /* Whatever format the host actually published -- checked live,
+         * Deutschlandfunk and Nova's own logos are JPEG but Kultur's are
+         * PNG. Format handling lives with the rest of the cover pipeline
+         * (music_hook.c's radio_art_worker(), via cover_png_to_jpeg()),
+         * not here: this function's job is just getting the bytes. */
+        if (radio_run_curl(logo, tmp_jpg) == 0 && rename(tmp_jpg, dest_jpg) == 0)
+            rc = 0;   /* a logo with no title is still worth showing */
+        else
+            unlink(tmp_jpg);
+    }
     return rc;
 }
 

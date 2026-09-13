@@ -34,6 +34,7 @@
 #include <unistd.h>
 
 #include "vendor/jpeg9/jpeglib.h"
+#include "vendor/miniz/miniz.h"
 #include "cover.h"
 
 typedef void (*pfn_create)(j_decompress_ptr, int, size_t);
@@ -765,6 +766,200 @@ int cover_downscale_max(const char *jpeg_path, int max_dim) {
     xc_destroy(&cout);
     fclose(out_f);
     free(outbuf);
+
+    if (rename(tmp_path, jpeg_path) != 0) { unlink(tmp_path); return -1; }
+    return 0;
+}
+
+/* ---- PNG -> JPEG: just enough PNG to handle a station/album logo -------- */
+
+#define PNG_MAX_FILE (8 * 1024 * 1024)
+#define PNG_MAX_DIM  4000
+
+/* Decodes exactly what's needed here and nothing more: 8-bit depth, color
+ * type 2 (RGB) or 6 (RGBA), non-interlaced. Any real photo/logo a host
+ * publishes for this purpose is one of those; a 16-bit, palette/greyscale,
+ * or Adam7-interlaced PNG is declined rather than half-supported. IDAT
+ * chunks are concatenated (a PNG encoder is free to split the compressed
+ * stream across more than one) before the single zlib inflate -- mz_
+ * uncompress() needs the whole stream at once, unlike tinfl's streaming
+ * API, but these files are small enough (PNG_MAX_FILE) that holding all of
+ * it is not a concern the way it would be for cover.c's own JPEG covers.
+ * CRC32 checks are skipped: this app already trusts curl's own transport
+ * security for these URLs, and a truncated/corrupt download fails anyway,
+ * either at mz_uncompress() (wrong length) or by decoding to visible
+ * garbage no worse than a bad photo would. */
+static int png_decode_rgb(const unsigned char *buf, size_t len,
+                          unsigned char **out_rgb, int *out_w, int *out_h) {
+    static const unsigned char sig[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+    if (len < 8 || memcmp(buf, sig, 8) != 0) return -1;
+
+    size_t p = 8;
+    int width = 0, height = 0, bit_depth = 0, color_type = 0, interlace = 0, have_ihdr = 0;
+    unsigned char *idat = NULL;
+    size_t idat_len = 0, idat_cap = 0;
+    int rc = -1;
+
+    while (p + 12 <= len) {
+        uint32_t clen = ((uint32_t)buf[p] << 24) | ((uint32_t)buf[p + 1] << 16) |
+                        ((uint32_t)buf[p + 2] << 8) | buf[p + 3];
+        const unsigned char *ctype = buf + p + 4;
+        size_t cstart = p + 8;
+        if (clen > len || cstart + clen + 4 > len) break;
+
+        if (!memcmp(ctype, "IHDR", 4) && clen >= 13) {
+            width  = (int)(((uint32_t)buf[cstart] << 24) | ((uint32_t)buf[cstart + 1] << 16) |
+                           ((uint32_t)buf[cstart + 2] << 8) | buf[cstart + 3]);
+            height = (int)(((uint32_t)buf[cstart + 4] << 24) | ((uint32_t)buf[cstart + 5] << 16) |
+                           ((uint32_t)buf[cstart + 6] << 8) | buf[cstart + 7]);
+            bit_depth  = buf[cstart + 8];
+            color_type = buf[cstart + 9];
+            interlace  = buf[cstart + 12];
+            have_ihdr = 1;
+        } else if (!memcmp(ctype, "IDAT", 4)) {
+            if (idat_len + clen > idat_cap) {
+                size_t ncap = idat_cap ? idat_cap * 2 : 65536;
+                while (ncap < idat_len + clen) ncap *= 2;
+                unsigned char *n = realloc(idat, ncap);
+                if (!n) goto out;
+                idat = n; idat_cap = ncap;
+            }
+            memcpy(idat + idat_len, buf + cstart, clen);
+            idat_len += clen;
+        } else if (!memcmp(ctype, "IEND", 4)) {
+            break;
+        }
+        p = cstart + clen + 4;
+    }
+
+    if (!have_ihdr || !idat || width <= 0 || height <= 0 ||
+        width > PNG_MAX_DIM || height > PNG_MAX_DIM ||
+        bit_depth != 8 || interlace != 0 ||
+        (color_type != 2 && color_type != 6))
+        goto out;
+
+    {
+        int channels = (color_type == 6) ? 4 : 3;
+        size_t stride = (size_t)width * (size_t)channels + 1;
+        size_t raw_len = stride * (size_t)height;
+        unsigned char *raw = malloc(raw_len);
+        if (!raw) goto out;
+
+        mz_ulong dest_len = (mz_ulong)raw_len;
+        int urc = mz_uncompress(raw, &dest_len, idat, (mz_ulong)idat_len);
+        if (urc != MZ_OK || dest_len != raw_len) { free(raw); goto out; }
+
+        /* PNG defilter, per-scanline, in place -- the standard five filter
+         * types (None/Sub/Up/Average/Paeth), each referencing the already-
+         * unfiltered byte to its left (a) and the row above (b, c). */
+        unsigned char *prev = NULL;
+        for (int y = 0; y < height; y++) {
+            unsigned char *line = raw + (size_t)y * stride;
+            int filt = line[0];
+            unsigned char *cur = line + 1;
+            size_t rowbytes = (size_t)width * (size_t)channels;
+            for (size_t x = 0; x < rowbytes; x++) {
+                int a = (x >= (size_t)channels) ? cur[x - (size_t)channels] : 0;
+                int b = prev ? prev[x] : 0;
+                int c = (prev && x >= (size_t)channels) ? prev[x - (size_t)channels] : 0;
+                int v = cur[x];
+                switch (filt) {
+                    case 0: break;
+                    case 1: v += a; break;
+                    case 2: v += b; break;
+                    case 3: v += (a + b) / 2; break;
+                    case 4: {
+                        int pp = a + b - c;
+                        int pa = abs(pp - a), pb = abs(pp - b), pc = abs(pp - c);
+                        v += (pa <= pb && pa <= pc) ? a : (pb <= pc ? b : c);
+                        break;
+                    }
+                    default: free(raw); goto out;
+                }
+                cur[x] = (unsigned char)(v & 0xFF);
+            }
+            prev = cur;
+        }
+
+        unsigned char *rgb = malloc((size_t)width * (size_t)height * 3);
+        if (!rgb) { free(raw); goto out; }
+        for (int y = 0; y < height; y++) {
+            const unsigned char *line = raw + (size_t)y * stride + 1;
+            unsigned char *orow = rgb + (size_t)y * (size_t)width * 3;
+            for (int x = 0; x < width; x++) {
+                orow[x * 3 + 0] = line[x * channels + 0];
+                orow[x * 3 + 1] = line[x * channels + 1];
+                orow[x * 3 + 2] = line[x * channels + 2];
+            }
+        }
+        free(raw);
+        *out_rgb = rgb; *out_w = width; *out_h = height;
+        rc = 0;
+    }
+
+out:
+    free(idat);
+    return rc;
+}
+
+int cover_png_to_jpeg(const char *png_path, const char *jpeg_path) {
+    FILE *f = fopen(png_path, "rb");
+    if (!f) return -1;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz > PNG_MAX_FILE) { fclose(f); return -1; }
+    unsigned char *buf = malloc((size_t)sz);
+    if (!buf) { fclose(f); return -1; }
+    size_t got = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    if (got != (size_t)sz) { free(buf); return -1; }
+
+    unsigned char *rgb = NULL;
+    int w = 0, h = 0;
+    int rc = png_decode_rgb(buf, (size_t)sz, &rgb, &w, &h);
+    free(buf);
+    if (rc != 0) return -1;
+
+    if (!load_lib_compress()) { free(rgb); return -1; }
+
+    char tmp_path[600];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp-png2jpg", jpeg_path);
+    FILE *out_f = fopen(tmp_path, "wb");
+    if (!out_f) { free(rgb); return -1; }
+
+    struct jpeg_compress_struct cout;
+    struct jump_err jerr2;
+    memset(&cout, 0, sizeof(cout));
+    cout.err = x_std_error(&jerr2.pub);
+    jerr2.pub.error_exit = on_error;
+    jerr2.pub.output_message = on_message;
+
+    if (setjmp(jerr2.jump)) {
+        if (xc_destroy) xc_destroy(&cout);
+        fclose(out_f);
+        unlink(tmp_path);
+        free(rgb);
+        return -1;
+    }
+
+    xc_create(&cout, JPEG_LIB_VERSION, sizeof(struct jpeg_compress_struct));
+    xc_stdio_dest(&cout, out_f);
+    cout.image_width = (JDIMENSION)w;
+    cout.image_height = (JDIMENSION)h;
+    cout.input_components = 3;
+    cout.in_color_space = JCS_RGB;
+    xc_set_defaults(&cout);
+    xc_set_quality(&cout, 90, TRUE);
+    xc_start(&cout, TRUE);
+    while (cout.next_scanline < cout.image_height) {
+        JSAMPROW rp = rgb + (size_t)cout.next_scanline * (size_t)w * 3;
+        xc_write_scanlines(&cout, &rp, 1);
+    }
+    xc_finish(&cout);
+    xc_destroy(&cout);
+    fclose(out_f);
+    free(rgb);
 
     if (rename(tmp_path, jpeg_path) != 0) { unlink(tmp_path); return -1; }
     return 0;

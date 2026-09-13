@@ -31,4 +31,20 @@ uint16_t *cover_cached(const char *cache_key, const char *dir, int px);
  * visible. Returns 0 on success (shrunk or already fine), -1 on any
  * failure -- the original file is left untouched either way. */
 int cover_downscale_max(const char *jpeg_path, int max_dim);
+
+/* Converts a PNG (8-bit RGB or RGBA, non-interlaced only) to a baseline
+ * JPEG at jpeg_path, write-then-rename -- png_path and jpeg_path may be the
+ * same string, converting in place. For a network-fetched image whose
+ * format the app doesn't control: this device's cover pipeline is
+ * otherwise libjpeg-only (see this file's own top comment), and some
+ * sources (confirmed live: Deutschlandfunk Kultur's own logo assets) only
+ * publish PNG. Alpha is dropped, not composited -- flattening onto black
+ * would look wrong for a light logo and there is no way to know the
+ * right background color to composite onto instead, so this is only
+ * correct for a source with no meaningfully transparent pixels, which is
+ * what a station/album logo generally is. Returns 0 on success, -1 for
+ * anything unsupported (16-bit depth, palette/greyscale, interlaced, or
+ * not actually a PNG) or on any decode/encode failure -- the original
+ * file is left untouched either way. */
+int cover_png_to_jpeg(const char *png_path, const char *jpeg_path);
 #endif

@@ -4430,16 +4430,47 @@ static void queue_apply_pending(void) {
 static void *radio_art_worker(void *arg) {
     char *station = arg;
     char jpg[128];
-    snprintf(jpg, sizeof(jpg), "/tmp/.nrk_art_%d.jpg", (int)getpid());
+    snprintf(jpg, sizeof(jpg), "/tmp/.radio_art_%d.jpg", (int)getpid());
     char title[160];
+    /* One provider per station, tried in turn -- each returns -1 immediately
+     * (no network access) for a station name it doesn't recognise, so this
+     * costs nothing extra for a station neither one knows about. */
     int rc = radio_fetch_nrk_art(station, jpg, title, sizeof(title));
+    /* Different max-dim per provider below, so this can't just be "rc != 0
+     * -> try the other one" -- NRK's square images want FETCHED_COVER_MAX_
+     * DIM (800, already proven live) and DLF's 16:9 logos need more (see
+     * below), so track which provider actually produced jpg. */
+    int is_dlf = 0;
+    if (rc != 0) { rc = radio_fetch_dlf_broadcast(station, jpg, title, sizeof(title)); is_dlf = 1; }
     if (rc == 0) {
-        cover_downscale_max(jpg, FETCHED_COVER_MAX_DIM);
-        uint16_t *bits = cover_load_fresh(jpg, "radio:nrk", RADIO_ART_PX);
-        if (bits && !strcmp(station, radio_name)) {   /* still the station actually playing */
+        /* A title with no usable image is still worth showing -- decode is
+         * attempted only when jpg actually exists and is (or becomes) a
+         * real JPEG; either way, the title is applied on its own below so
+         * a decode failure can no longer silently discard a title fetch
+         * that worked fine. Checked live: Deutschlandfunk Kultur's own
+         * logo assets are PNG, not JPEG like Deutschlandfunk/Nova's --
+         * converted in place before the JPEG-only pipeline below ever
+         * sees it; cover_png_to_jpeg() itself declines anything that
+         * isn't actually a supported PNG (including "isn't a PNG at
+         * all", which every other station's real JPEG hits harmlessly). */
+        struct stat jst;
+        cover_png_to_jpeg(jpg, jpg);
+        uint16_t *bits = NULL;
+        if (stat(jpg, &jst) == 0) {
+            /* DLF's logo is 16:9, not square: cover_load()'s center-crop
+             * uses the short edge, and capping the long edge at FETCHED_
+             * COVER_MAX_DIM (800) the way local covers and NRK's own square
+             * images do would leave only 450px on the short edge -- under
+             * the 480 cover_load() needs, and silently rejected exactly the
+             * way an oversized NRK image once was, just from the opposite
+             * direction (see dlf_logo_url_for()'s own comment). 960 is a
+             * no-op for the DLF logos (already fetched at that size). */
+            cover_downscale_max(jpg, is_dlf ? 960 : FETCHED_COVER_MAX_DIM);
+            bits = cover_load_fresh(jpg, "radio:art", RADIO_ART_PX);
+        }
+        if (!strcmp(station, radio_name)) {   /* still the station actually playing */
             pthread_mutex_lock(&radio_art_lock);
-            free(radio_art_bits);
-            radio_art_bits = bits;
+            if (bits) { free(radio_art_bits); radio_art_bits = bits; }
             snprintf(radio_art_title, sizeof(radio_art_title), "%s", title);
             snprintf(radio_art_for_station, sizeof(radio_art_for_station), "%s", station);
             /* R111: the "cover colours" setting applies to NRK art exactly
@@ -4451,8 +4482,10 @@ static void *radio_art_worker(void *arg) {
              * bits() is already made safe to call off it (cover_prewarm_
              * worker() does the same for local art) and RADIO_ART_PX ==
              * ART_PX makes the histogram pass exactly as expensive as the
-             * one that function already does per track. */
-            if (cover_palette_enabled) {
+             * one that function already does per track. Skipped with no
+             * bits -- the default theme stays in effect, same as any other
+             * station with no usable art. */
+            if (bits && cover_palette_enabled) {
                 derive_palette_from_bits(bits, &np_bg, &np_accent, &np_fg);
                 np_palette_valid = 1;
             }
@@ -4467,11 +4500,13 @@ static void *radio_art_worker(void *arg) {
     return NULL;
 }
 
-/* Dispatches a fetch if station_name looks like an NRK channel and one
- * isn't already in flight. Safe to call every tick -- radio_art_done gates
- * it exactly the way art_request() gates art_worker() for local tracks. */
+/* Dispatches a fetch if station_name looks like a station some provider in
+ * radio_art_worker() recognises, and one isn't already in flight. Safe to
+ * call every tick -- radio_art_done gates it exactly the way art_request()
+ * gates art_worker() for local tracks. */
 static void radio_art_request(const char *station_name) {
-    if (strncmp(station_name, "NRK ", 4) != 0) return;
+    if (strncmp(station_name, "NRK ", 4) != 0 &&
+        strncmp(station_name, "Deutschlandfunk", 15) != 0) return;
     if (!radio_art_done) return;
     char *copy = strdup(station_name);
     if (!copy) return;
@@ -4492,6 +4527,14 @@ static void radio_art_clear(void) {
     radio_art_bits = NULL;
     radio_art_title[0] = '\0';
     radio_art_for_station[0] = '\0';
+    /* Otherwise the outgoing station's theme keeps painting the whole
+     * SC_PLAYING background (np_col_bg() et al) until the new station's own
+     * fetch lands, or forever if it never gets art at all -- confirmed live
+     * switching Deutschlandfunk -> Deutschlandfunk Kultur, whose blue logo
+     * palette carried straight over onto Kultur's still-blank Now Playing
+     * screen. Dropping back to the plain default theme for the gap is
+     * exactly what a station with no art at all already looks like. */
+    if (cover_palette_enabled) np_palette_valid = 0;
     pthread_mutex_unlock(&radio_art_lock);
 }
 
@@ -4514,7 +4557,7 @@ static void play_station(int i) {
     snprintf(radio_name, sizeof(radio_name), "%s", stations[i].name);
     art_request("", "", "", "");         /* clears whatever art was showing */
     radio_art_clear();
-    radio_art_request(radio_name);       /* R111: NRK program art, no-op for any other station */
+    radio_art_request(radio_name);       /* R111: program art, no-op for a station no provider recognises */
     audio_play(stations[i].url);
     was_active = 1;
     mlog("[music] station %s\n", stations[i].name);
@@ -11898,7 +11941,7 @@ int music_entry(void *a0, void *a1) {
          * change while a station keeps playing (it's a schedule, not a
          * per-track thing), so a one-shot fetch at station-start alone would
          * go stale over a long listen. Every ~2 minutes, radio_mode only;
-         * radio_art_request() itself no-ops for anything not named "NRK ". */
+         * radio_art_request() itself no-ops for anything neither provider recognises. */
         if (radio_mode) {
             if (++radio_art_tick >= 3600) { radio_art_tick = 0; radio_art_request(radio_name); }
         } else {

@@ -38,6 +38,16 @@ int radio_recordings_load(radio_recording_t *out, int max);
 int radio_fetch_nrk_art(const char *station_name, const char *dest_jpg,
                         char *title_out, size_t title_n);
 
+/* Same shape, for Deutschlandfunk/Deutschlandfunk Kultur/Deutschlandfunk
+ * Nova (see radio_fetch_dlf_broadcast()'s own comment in radio.c). Unlike
+ * NRK, the artwork here is a fixed per-station logo rather than something
+ * that changes with the programme, and Nova gets no title at all -- no live
+ * "now playing" endpoint was found for its site. station_name must be
+ * "Deutschlandfunk", "Deutschlandfunk Kultur" or "Deutschlandfunk Nova"
+ * exactly (the seed list's own naming) or this returns -1 immediately. */
+int radio_fetch_dlf_broadcast(const char *station_name, const char *dest_jpg,
+                              char *title_out, size_t title_n);
+
 /* Builds a fresh path for a new recording of this station, named by station
  * and the current local time so a folder of them sorts and reads sensibly
  * without opening each one. ext is "mp3" or "aac" (radio_buffer.h's
