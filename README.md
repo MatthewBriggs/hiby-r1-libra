@@ -14,7 +14,7 @@ Please note: Libra is entirely written by LLM with extensive human testing. I do
 
 📖**Audiobook player** - Mostly feature complete. Chapter selection, playback speed, doubled-up chapter and book seekbars.
 
-📻**Radio** - Internet Radio - everything works apart from HLS streams.
+📻**Radio** - Internet Radio - MP3, AAC, HLS and DASH streams 
 
 
 
