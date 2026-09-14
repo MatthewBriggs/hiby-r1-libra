@@ -324,6 +324,77 @@ static int usb_bypass_enabled;
  * bt_eq_pending_path already uses: audio_toggle() belongs to the UI thread. */
 static int bt_autoplay_enabled;
 static int bt_autoplay_pending;      /* set under bt_lock, cleared by the main loop */
+
+static void mlog(const char *fmt, ...);   /* defined below; used by R84's idle check */
+
+/* R84: turn WiFi off after 15 minutes with no traffic. Off by default, same
+ * reasoning as bt_autoplay_enabled just above -- this changes radio state on
+ * its own, which must be opted into.
+ *
+ * Motivation is Bluetooth, not battery: reported live, A2DP cut-outs and
+ * corruption in built-up areas that persisted even with WiFi "off" from this
+ * screen's own toggle -- because that toggle only runs wifi_off.sh, which
+ * stops wpa_supplicant and takes the interface down but never touches the
+ * driver. brcmfmac has no runtime power-down path (unlike the vendor DHD
+ * driver it replaced, which idled the SDIO bus and WLAN core on interface
+ * down), so the chip stayed fully awake and still arbitrating the shared
+ * antenna against Bluetooth regardless of the toggle. Confirmed live:
+ * `rmmod brcmfmac; rmmod brcmutil` transformed it. wifi_off.sh/wifi_on.sh
+ * now do exactly that rmmod/insmod themselves (see patch_firmware.py's
+ * patch_wifi_idle_scripts()) for every off/on, by hand or automatic --
+ * this setting is only about *when* "off" fires on its own.
+ *
+ * "In use" is measured, not assumed: rx+tx byte counters on wlan0, not
+ * merely "the interface is associated". An association with genuinely no
+ * traffic for the whole window is exactly the case this targets -- a
+ * podcast sync or the web-transfer feature actually moving data keeps
+ * resetting the clock the same way audio playback keeps the screen unlocked.
+ *
+ * Deliberately does not touch wifi_pref (the user's own on/off preference,
+ * persisted and restored at boot by R64's own logic) -- this is a runtime
+ * action, not a change of what the user asked for. st_wifi_on() is queried
+ * live everywhere it matters (this screen's own toggle, quick settings), so
+ * turning the radio off here is enough for the UI to show it correctly on
+ * its own; tapping the toggle afterwards calls st_wifi_set(1), which
+ * reinserts the driver exactly as a cold boot would. */
+static int wifi_auto_off_enabled;
+static time_t wifi_idle_since;
+static unsigned long long wifi_idle_last_bytes = (unsigned long long)-1;   /* -1: no baseline yet */
+
+#define WIFI_AUTO_OFF_SECS (15 * 60)
+
+static unsigned long long read_ull_file(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    unsigned long long v = 0;
+    if (fscanf(f, "%llu", &v) != 1) v = 0;
+    fclose(f);
+    return v;
+}
+
+/* Called on the ~2s status tick -- fifteen minutes is a long window, and this
+ * is two file reads, not a fork, so there is no reason to ration it further. */
+static void wifi_idle_check(void) {
+    if (!wifi_auto_off_enabled || !st_wifi_on()) {
+        wifi_idle_since = 0;
+        wifi_idle_last_bytes = (unsigned long long)-1;   /* fresh baseline next time it's on */
+        return;
+    }
+    unsigned long long bytes =
+        read_ull_file("/sys/class/net/wlan0/statistics/rx_bytes") +
+        read_ull_file("/sys/class/net/wlan0/statistics/tx_bytes");
+    time_t now = time(NULL);
+    if (wifi_idle_last_bytes == (unsigned long long)-1 || bytes != wifi_idle_last_bytes) {
+        wifi_idle_last_bytes = bytes;
+        wifi_idle_since = now;
+        return;
+    }
+    if (wifi_idle_since && now - wifi_idle_since >= WIFI_AUTO_OFF_SECS) {
+        st_wifi_set(0);
+        mlog("[music] R84: WiFi idle %ds with no traffic, turning off\n", (int)(now - wifi_idle_since));
+        wifi_idle_since = 0;
+    }
+}
 static int usb_bypass_active;
 static int usb_bypass_bt_was_on;
 static int usb_bypass_saved_vol;
@@ -545,79 +616,6 @@ static volatile int radio_art_done = 1;
 static char radio_art_title[160];
 static char radio_art_for_station[LIB_NAME_LEN]; /* which station radio_art_bits/title belong to */
 static int  radio_art_tick;                       /* periodic refresh, main loop */
-
-/* Radio waveform scrubber (R111 follow-up): a live stream has no fixed
- * duration, so this can't bucket by "fraction of the track" the way
- * WAVE_BUCKETS above does -- it's keyed by absolute seconds since the
- * current station was tuned in instead, wrapped into a ring the same
- * size as radio_buffer.c's own 30-minute retention window (RB_WINDOW_
- * SECONDS), so a second still physically in the byte buffer is always
- * still physically in this ring too. radio_peak_owner[] records *which*
- * absolute second currently occupies each slot; a mismatch (stale data
- * from 30+ minutes ago, or a slot the stream simply hasn't reached yet)
- * reads as silence rather than a wrong stale bar, and doubles as the
- * "ran off the start of the buffer" signal the draw side needs -- no
- * separate oldest/live-edge bookkeeping required. One byte would lose
- * too much dynamic range for the draw side's own per-frame renormalise
- * (see draw_radio_waveform()); audio_current_peak() is a raw abs-sample
- * value up to 32767, so this stores that directly. */
-#define RADIO_PEAK_SECONDS (30 * 60)
-/* 2 minutes of waveform visible across the full screen width, per spec --
- * FB_W is fixed at 480 on this device (no responsive layout elsewhere in
- * this app either), so this is an exact integer, not an approximation:
- * 480px / 120s = 4px/s. Shared by the draw side and the drag handler so
- * "how far the finger moved" and "how far the waveform visibly moved"
- * never disagree. */
-#define RADIO_WAVE_PX_PER_SEC (FB_W / 120)
-static uint16_t radio_peak_ring[RADIO_PEAK_SECONDS];
-static long     radio_peak_owner[RADIO_PEAK_SECONDS];   /* absolute second, or -1 = never written */
-static long     radio_peak_epoch_ms;   /* CLOCK_MONOTONIC ms when the current station's second 0 was */
-
-/* Set once, when a drag over the waveform begins -- the absolute second
- * under the fixed playhead at that moment, so the drag reads as pure
- * displacement (title_dragging above does the same thing for a scrolling
- * title) rather than fighting with the real position that scrub_dragging's
- * own continuous seeking is simultaneously moving underneath it. */
-static int  radio_scrub_dragging;
-static long radio_scrub_anchor_sec;
-/* What this drag has already told audio_radio_seek_relative_ms() to reach
- * -- see the drag handler's own comment for why deltas must be computed
- * against this, never against a fresh radio_current_abs_sec() read. */
-static long radio_scrub_committed_sec;
-
-static long radio_mono_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
-}
-
-/* Seconds since the current station was tuned in, at the live edge --
- * grows with real elapsed time regardless of pause/rewind, exactly like
- * radio_buffer.c's own byte-position-as-time-proxy grows with real bytes
- * arriving. */
-static long radio_live_abs_sec(void) {
-    return (radio_mono_ms() - radio_peak_epoch_ms) / 1000;
-}
-
-/* The absolute second of whatever is actually being decoded right now --
- * live minus however far behind live the byte cursor currently sits.
- * Single source of truth for both the peak capture below and the draw
- * side: the drag handler nudges audio_radio_offset_ms() itself in real
- * time (see radio_scrub_dragging's own comment), so this is correct
- * during a drag too, not just during ordinary playback. */
-static long radio_current_abs_sec(void) {
-    return radio_live_abs_sec() - audio_radio_offset_ms() / 1000;
-}
-
-/* Floor division -- plain C '/' truncates toward zero, which would bucket
- * pixels just left of the playhead (a negative numerator) inconsistently
- * with pixels just right of it. Only ever called with a positive divisor
- * here. */
-static long radio_floor_div(long a, long b) {
-    long q = a / b;
-    if (a % b != 0 && a < 0) q--;
-    return q;
-}
 
 static char      art_want[512];       /* track the loader should be showing */
 /* R23: artist/album to search Last.fm with if no local art turns up for
@@ -2627,7 +2625,7 @@ static int settings_content_rows(void) {
  * pushed by hand, not by CI against a tagged commit), so this stays a
  * literal that a human edits; the discipline is remembering to, not the
  * mechanism. */
-#define LIBRARY_VERSION "0.51.2"
+#define LIBRARY_VERSION "0.52"
 
 /* A custom-built kernel keeps uname()'s own release string exactly
  * "4.4.94+" on purpose -- that string is also the vermagic every one of the
@@ -3790,15 +3788,89 @@ static time_t           wifi_nets_refresh_at;
  * first place, same as R75's own wifi tap handler already reasons).
  * devs/dev_n/last_refresh hoisted to file scope for the same reason
  * wifi_nets/wifi_net_n were. */
-static bt_found_dev_t bt_devs[8];
+/* R84 follow-up: was 8, fixed-size and positional -- reported live as the
+ * Paired devices section vanishing outright. bluetoothctl devices returns
+ * paired and freshly-scanned devices interleaved in whatever order bluez
+ * happens to iterate them, and in a built-up area a live inquiry easily
+ * turns up 20-30 ambient LE devices; with only 8 slots, a paired classic
+ * headset simply never made it into the array to be recognised as paired.
+ * 32 is comfortably above what a scan realistically returns and still
+ * cheap (bt_found_dev_t is mac[18]+name[48] -- 32 of them is ~2KB), and the
+ * list already scrolls, so there is no rendering reason to keep it small. */
+#define BT_DEV_MAX 32
+static bt_found_dev_t bt_devs[BT_DEV_MAX];
 static int             bt_dev_n;
 static time_t          bt_devs_refresh_at;
-static int bt_row_n(void) { return 3 + bt_dev_n; }   /* toggle, status, "Scan for devices" */
+
+/* R84: paired devices (already known to bluez, whether or not this scan's
+ * inquiry actually heard them -- see bt_is_paired()'s own comment on why a
+ * paired-but-merely-switched-on headset often won't) get their own section
+ * above whatever this scan additionally turned up, rather than being mixed
+ * into one flat list in whatever order bluetoothctl printed them. bt_order[]
+ * is bt_devs[] indices, paired ones first, computed once per refresh
+ * alongside bt_dev_n so the draw loop, the tap handler and the scroll-clamp
+ * total all agree on the same layout without recomputing bt_is_paired() --
+ * itself just a handful of stat() calls, but no reason to pay it three
+ * times a frame for numbers that only change every 2s anyway. */
+static int bt_order[BT_DEV_MAX];
+static int bt_paired_n;
+
+/* Row kinds within the device area (everything from row 3 down): a section
+ * header is not tappable and carries no device index. Shared by the draw
+ * loop and the tap handler so their row math cannot drift apart -- `r` is
+ * row-relative-to-row-3, i.e. row 3 itself is r==0. */
+enum { BT_ROW_NONE, BT_ROW_HEADER_PAIRED, BT_ROW_HEADER_SCAN, BT_ROW_DEVICE };
+
+/* Parameterised so the tap handler can run it against a freshly re-queried
+ * list (same reasoning the old flat-list handler gave for re-querying: a tap
+ * is rare and deliberate, not a redraw-rate concern, so it should not act on
+ * a list that might be a couple of seconds stale) while the draw loop runs it
+ * against the 2s-cached one, without the two ever computing the layout two
+ * different ways. */
+static int bt_row_kind_of(int r, int dev_n, int paired_n, const int *order, int *out_idx) {
+    int other_n = dev_n - paired_n;
+    if (dev_n == 0) return BT_ROW_NONE;   /* the "No devices found yet" row */
+    if (paired_n > 0) {
+        if (r == 0) return BT_ROW_HEADER_PAIRED;
+        if (r >= 1 && r <= paired_n) { *out_idx = order[r - 1]; return BT_ROW_DEVICE; }
+        r -= 1 + paired_n;
+    }
+    if (other_n > 0) {
+        if (r == 0) return BT_ROW_HEADER_SCAN;
+        if (r >= 1 && r <= other_n) { *out_idx = order[paired_n + r - 1]; return BT_ROW_DEVICE; }
+    }
+    return BT_ROW_NONE;
+}
+static int bt_row_kind(int r, int *out_idx) {
+    return bt_row_kind_of(r, bt_dev_n, bt_paired_n, bt_order, out_idx);
+}
+
+static int bt_row_n_of(int dev_n, int paired_n) {
+    if (dev_n == 0) return 3;   /* toggle, status, "Scan for devices" */
+    int other_n = dev_n - paired_n;
+    int rows = 3;
+    if (paired_n > 0) rows += 1 + paired_n;
+    if (other_n > 0)  rows += 1 + other_n;
+    return rows;
+}
+static int bt_row_n(void) { return bt_row_n_of(bt_dev_n, bt_paired_n); }
+
+/* order[] gets dev_n entries: bt_is_paired() ones first (in their original
+ * relative order), then the rest. Returns how many of dev_n are paired. */
+static int bt_partition(bt_found_dev_t *devs, int dev_n, int *order) {
+    int paired_n = 0;
+    for (int i = 0; i < dev_n; i++)
+        if (bt_is_paired(devs[i].mac)) order[paired_n++] = i;
+    int oi = paired_n;
+    for (int i = 0; i < dev_n; i++)
+        if (!bt_is_paired(devs[i].mac)) order[oi++] = i;
+    return paired_n;
+}
 
 /* 4 fixed rows (toggle, status, "Scan for networks", "Add network
  * manually") plus however many results are currently cached -- the
  * scroll-limit ternary's own `total` for this screen. */
-static int wifi_row_n(void) { return 4 + wifi_net_n; }
+static int wifi_row_n(void) { return 5 + wifi_net_n; }   /* R84: +1 for the idle-off toggle */
 
 /* Only the two lists long enough to need it -- and not Recent, capped at
  * PAGE_MAX items and sorted by recency rather than alphabetically, where a
@@ -4513,9 +4585,12 @@ static void *radio_art_worker(void *arg) {
     /* Different max-dim per provider below, so this can't just be "rc != 0
      * -> try the other one" -- NRK's square images want FETCHED_COVER_MAX_
      * DIM (800, already proven live) and DLF's 16:9 logos need more (see
-     * below), so track which provider actually produced jpg. */
+     * below), so track which provider actually produced jpg. BBC's images
+     * (checked live) are square like NRK's, so they share NRK's cap rather
+     * than needing a third case. */
     int is_dlf = 0;
     if (rc != 0) { rc = radio_fetch_dlf_broadcast(station, jpg, title, sizeof(title)); is_dlf = 1; }
+    if (rc != 0) { rc = radio_fetch_bbc_track(station, jpg, title, sizeof(title)); is_dlf = 0; }
     if (rc == 0) {
         /* A title with no usable image is still worth showing -- decode is
          * attempted only when jpg actually exists and is (or becomes) a
@@ -4580,7 +4655,8 @@ static void *radio_art_worker(void *arg) {
  * gates art_worker() for local tracks. */
 static void radio_art_request(const char *station_name) {
     if (strncmp(station_name, "NRK ", 4) != 0 &&
-        strncmp(station_name, "Deutschlandfunk", 15) != 0) return;
+        strncmp(station_name, "Deutschlandfunk", 15) != 0 &&
+        strncmp(station_name, "BBC Radio ", 10) != 0) return;
     if (!radio_art_done) return;
     char *copy = strdup(station_name);
     if (!copy) return;
@@ -4632,12 +4708,6 @@ static void play_station(int i) {
     art_request("", "", "", "");         /* clears whatever art was showing */
     radio_art_clear();
     radio_art_request(radio_name);       /* R111: program art, no-op for a station no provider recognises */
-    /* Waveform ring: a fresh station means a fresh "second 0", and every
-     * existing owner[] entry belongs to whatever was playing before --
-     * without clearing it, an absolute second that happens to reuse the
-     * same ring slot could read back as this station's own history. */
-    radio_peak_epoch_ms = radio_mono_ms();
-    for (int pi = 0; pi < RADIO_PEAK_SECONDS; pi++) radio_peak_owner[pi] = -1;
     audio_play(stations[i].url);
     was_active = 1;
     mlog("[music] station %s\n", stations[i].name);
@@ -5713,66 +5783,6 @@ static void draw_keyboard(uint16_t *fb) {
     }
 }
 
-/* Radio's drag-scrubber waveform -- same column shape and colouring as
- * Music's own R29 waveform above (3px bar, 1px gap, 2px floor so a true-
- * silence second still reads as a hairline rather than vanishing), just
- * fed from radio_peak_ring[] instead of wave_buckets[] and laid out around
- * a fixed playhead instead of a played/unplayed split of one whole track.
- * One column per second, not per pixel -- RADIO_WAVE_PX_PER_SEC is exactly
- * 4 (see its own comment), so a 3+1 column is pixel-perfect against the
- * ring's own resolution, the same way Music's own WAVE_BUCKETS comment
- * picked 144 to divide its bar's width exactly.
- *
- * Fixed playhead at 2/3 across the screen (per explicit spec), 2 minutes
- * of buffered audio visible across the full width either side of it --
- * everything left of the playhead is already played (accent, matching
- * Music's "played" colour), everything right of it is buffered-but-not-
- * yet-reached (np_col_line(), matching Music's "unplayed" -- only ever
- * non-empty when rewound behind live; blank all the way to the right edge
- * at the live edge itself, since there is nothing beyond "now"). Each
- * column's absolute second is validated against radio_peak_owner[] -- a
- * mismatch there (predates this station's tune-in, aged out of the
- * 30-minute ring, or simply hasn't arrived yet) draws nothing for that
- * column, which is what both "ran off the start of the buffer" and "ran
- * off the live edge" need to look like. Renormalised to whatever's
- * actually visible on screen right now rather than any fixed scale, the
- * same reasoning R29's wave_capture[] normalises against its one track's
- * own peak -- a whisper-quiet classical piece and a loud news bulletin
- * should each use the full height available, not whatever an arbitrary
- * fixed ceiling happened to allow. */
-#define RADIO_WAVE_H 48
-static void draw_radio_waveform(uint16_t *fb, int center_y) {
-    int playhead_col = (FB_W * 2 / 3) / RADIO_WAVE_PX_PER_SEC;
-    int cols = FB_W / RADIO_WAVE_PX_PER_SEC;
-    long cur_abs = radio_current_abs_sec();
-
-    uint16_t maxp = 1;
-    long col_abs[FB_W / RADIO_WAVE_PX_PER_SEC];
-    int col_ok[FB_W / RADIO_WAVE_PX_PER_SEC];
-    for (int c = 0; c < cols; c++) {
-        long abs_sec = cur_abs + (c - playhead_col);
-        col_abs[c] = abs_sec;
-        col_ok[c] = 0;
-        if (abs_sec < 0) continue;
-        int idx = (int)(abs_sec % RADIO_PEAK_SECONDS);
-        if (radio_peak_owner[idx] == abs_sec) {
-            col_ok[c] = 1;
-            if (radio_peak_ring[idx] > maxp) maxp = radio_peak_ring[idx];
-        }
-    }
-
-    uint16_t wave_accent = np_col_accent(), wave_line = np_col_line();
-    for (int c = 0; c < cols; c++) {
-        if (!col_ok[c]) continue;
-        int idx = (int)(col_abs[c] % RADIO_PEAK_SECONDS);
-        int h = (int)((uint32_t)radio_peak_ring[idx] * RADIO_WAVE_H / maxp);
-        if (h < 2) h = 2;
-        int cx0 = c * RADIO_WAVE_PX_PER_SEC;
-        fill_rect(fb, cx0, center_y - h / 2, RADIO_WAVE_PX_PER_SEC - 1, h,
-                 c <= playhead_col ? wave_accent : wave_line);
-    }
-}
-
 static void draw_screen(uint16_t *fb) {
     if (screen == SC_KEYBOARD) { draw_keyboard(fb); return; }
     /* R14 flagged skipping this full clear (header/mini-player strips are
@@ -6374,7 +6384,6 @@ static void draw_screen(uint16_t *fb) {
             }
 
             int by = bar_y();
-            draw_radio_waveform(fb, by + 14);
             int cyy = by + 70 + CTRL_NUDGE_PX, mid = FB_W / 2;
             fill_circle(fb, mid, cyy, 42, np_col_accent());
             if (audio_is_paused()) fill_triangle(fb, mid + 4, cyy, 36, +1, np_col_bg());
@@ -7577,6 +7586,12 @@ static void draw_screen(uint16_t *fb) {
         ry += ROW_H;
         fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
 
+        /* R84 */
+        draw_text_clip(fb, 24, ry + 20, "Turn off after 15 min idle", COL_TEXT, TEXT_PX_BODY, FB_W - 140, CONTENT_Y, clip_bot);
+        draw_toggle_switch_h_clip(fb, ry, wifi_auto_off_enabled, ROW_H, CONTENT_Y, clip_bot);
+        ry += ROW_H;
+        fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
+
         /* RP2: scan-and-select, the same shape Bluetooth's own settings
          * screen already has. Manual entry stays alongside it, not
          * replaced -- a hidden network never shows up in any scan, so it
@@ -7647,20 +7662,37 @@ static void draw_screen(uint16_t *fb) {
          * scan-in-progress is actively trying to grow. */
         time_t now = time(NULL);
         if (now - bt_devs_refresh_at >= 2) {
-            bt_dev_n = bt_scan_devices(bt_devs, 8);
+            bt_dev_n = bt_scan_devices(bt_devs, BT_DEV_MAX);
+            bt_paired_n = bt_partition(bt_devs, bt_dev_n, bt_order);
             bt_devs_refresh_at = now;
         }
         if (bt_dev_n == 0) {
             ry = CONTENT_Y + 3 * ROW_H - off;
             draw_text_clip(fb, 24, ry + 20, "No devices found yet", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
         } else {
-            for (int i = 0; i < bt_dev_n; i++) {
-                ry = CONTENT_Y + (3 + i) * ROW_H - off;
+            int total = bt_row_n() - 3;
+            for (int r = 0; r < total; r++) {
+                ry = CONTENT_Y + (3 + r) * ROW_H - off;
                 if (ry + ROW_H < CONTENT_Y) continue;
                 if (ry > clip_bot) break;
-                draw_text_clip(fb, 24, ry + 20, bt_devs[i].name[0] ? bt_devs[i].name : bt_devs[i].mac,
-                              COL_TEXT, TEXT_PX_BODY, FB_W - 48, CONTENT_Y, clip_bot);
-                draw_right_clip(fb, ry + 20, bt_devs[i].mac, CONTENT_Y, clip_bot);
+                int idx = -1;
+                int kind = bt_row_kind(r, &idx);
+                if (kind == BT_ROW_HEADER_PAIRED) {
+                    draw_text_clip(fb, 24, ry + 20, "Paired devices", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
+                } else if (kind == BT_ROW_HEADER_SCAN) {
+                    /* A plain 1px COL_LINE here would be identical to the rule
+                     * under every other row, so the end of the paired list
+                     * read as just another row boundary rather than a section
+                     * break. A 2px rule specifically above this header (on
+                     * top of, not instead of, the 1px one the loop's tail
+                     * already draws under the row before it) marks it as one. */
+                    fill_rect_clip(fb, 0, ry - 2, FB_W, 2, COL_LINE, CONTENT_Y, clip_bot);
+                    draw_text_clip(fb, 24, ry + 20, "Other devices:", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
+                } else if (kind == BT_ROW_DEVICE) {
+                    draw_text_clip(fb, 24, ry + 20, bt_devs[idx].name[0] ? bt_devs[idx].name : bt_devs[idx].mac,
+                                  COL_TEXT, TEXT_PX_BODY, FB_W - 48, CONTENT_Y, clip_bot);
+                    draw_right_clip(fb, ry + 20, bt_devs[idx].mac, CONTENT_Y, clip_bot);
+                }
                 fill_rect_clip(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
             }
         }
@@ -9243,6 +9275,9 @@ static void load_conf(void) {
         } else if (sscanf(line, "bt_autoplay_enabled = %d", &v) == 1 ||
                    sscanf(line, "bt_autoplay_enabled=%d", &v) == 1) {
             bt_autoplay_enabled = v != 0;
+        } else if (sscanf(line, "wifi_auto_off_enabled = %d", &v) == 1 ||
+                   sscanf(line, "wifi_auto_off_enabled=%d", &v) == 1) {
+            wifi_auto_off_enabled = v != 0;
         } else if (sscanf(line, "theme_mode = %d", &v) == 1 ||
                    sscanf(line, "theme_mode=%d", &v) == 1) {
             if (v >= 0 && v < THEME_MODE_N) theme_mode = v;
@@ -9384,6 +9419,7 @@ static void save_conf(void) {
                 !conf_line_is(lines[n], "usb_bypass_enabled") &&
                 !conf_line_is(lines[n], "cover_palette_enabled") &&
                 !conf_line_is(lines[n], "bt_autoplay_enabled") &&
+                !conf_line_is(lines[n], "wifi_auto_off_enabled") &&
                 !conf_line_is(lines[n], "light_theme") &&
                 !conf_line_is(lines[n], "theme_mode") &&
                 !conf_line_is(lines[n], "tz_index") &&
@@ -9412,6 +9448,7 @@ static void save_conf(void) {
     fprintf(f, "usb_bypass_enabled = %d\n", usb_bypass_enabled);
     fprintf(f, "cover_palette_enabled = %d\n", cover_palette_enabled);
     fprintf(f, "bt_autoplay_enabled = %d\n", bt_autoplay_enabled);
+    fprintf(f, "wifi_auto_off_enabled = %d\n", wifi_auto_off_enabled);
     fprintf(f, "theme_mode = %d\n", theme_mode);
     fprintf(f, "tz_index = %d\n", tz_idx);
     fprintf(f, "shuffle_enabled = %d\n", shuffle_enabled);
@@ -11486,10 +11523,13 @@ int music_entry(void *a0, void *a1) {
                     wifi_pref = on;
                     save_conf();          /* R64 */
                 } else if (row == 2) {
-                    wifi_scan_start();
+                    wifi_auto_off_enabled = !wifi_auto_off_enabled;   /* R84 */
+                    save_conf();
                 } else if (row == 3) {
+                    wifi_scan_start();
+                } else if (row == 4) {
                     kb_open("Network name (SSID)", KB_PURPOSE_WIFI_SSID_MANUAL, "");
-                } else if (row >= 4) {
+                } else if (row >= 5) {
                     /* Re-queried fresh, same reasoning bt_pair()'s own tap
                      * handler gives for doing the same -- a tap is rare and
                      * deliberate, not a redraw-rate concern. No separate
@@ -11498,7 +11538,7 @@ int music_entry(void *a0, void *a1) {
                      * touch to land on in the first place. */
                     wifi_found_net_t nets[10];
                     int n = wifi_scan_results(nets, 10);
-                    int idx = row - 4;
+                    int idx = row - 5;
                     if (idx >= 0 && idx < n) {
                         if (nets[idx].open) {
                             wifi_connect(nets[idx].ssid, "");
@@ -11528,11 +11568,18 @@ int music_entry(void *a0, void *a1) {
                      * deliberate, not a redraw-rate concern. No separate
                      * visibility cap needed any more -- a row that's
                      * scrolled off-screen simply has no on-screen y for a
-                     * touch to land on in the first place. */
-                    bt_found_dev_t devs[8];
-                    int n = bt_scan_devices(devs, 8);
-                    int idx = row - 3;
-                    if (idx >= 0 && idx < n)
+                     * touch to land on in the first place.
+                     *
+                     * R84: re-partitioned fresh too, via the same
+                     * bt_row_kind_of() the draw loop uses, rather than
+                     * assuming row-3-plus-i is a device -- a header row now
+                     * sits in that range and must not be treated as one. */
+                    bt_found_dev_t devs[BT_DEV_MAX];
+                    int order[BT_DEV_MAX];
+                    int n = bt_scan_devices(devs, BT_DEV_MAX);
+                    int paired_n = bt_partition(devs, n, order);
+                    int idx = -1;
+                    if (bt_row_kind_of(row - 3, n, paired_n, order, &idx) == BT_ROW_DEVICE)
                         bt_pair(devs[idx].mac);
                 }
             } else if (screen == SC_SETTINGS_THEME) {
@@ -12116,39 +12163,12 @@ int music_entry(void *a0, void *a1) {
             }
         }
 
-        /* Radio waveform scrubber's own peak capture -- same poll, same
-         * audio_current_peak() call, but keyed by absolute buffer-time
-         * second (see radio_peak_ring's own comment) instead of a track-
-         * duration bucket. Running max within a second, like the R29
-         * capture above does within a bucket: several ticks land in the
-         * same second at this ~33ms poll rate, and the loudest one is the
-         * one worth showing. Gated on radio_mode, not screen == SC_PLAYING
-         * -- capture keeps running (matching radio_buffer.c's own fetch)
-         * even while the user is back on the station list or elsewhere in
-         * the app, so the trace has no gap if they return to Now Playing. */
-        if (radio_mode && audio_is_active() && !audio_is_paused()) {
-            long abs_sec = radio_current_abs_sec();
-            if (abs_sec >= 0) {
-                int idx = (int)(abs_sec % RADIO_PEAK_SECONDS);
-                int32_t peak = audio_current_peak();
-                uint16_t p16 = peak > 32767 ? 32767 : (uint16_t)peak;
-                if (radio_peak_owner[idx] != abs_sec) {
-                    radio_peak_ring[idx] = p16;
-                    radio_peak_owner[idx] = abs_sec;
-                } else if (p16 > radio_peak_ring[idx]) {
-                    radio_peak_ring[idx] = p16;
-                }
-            }
-        }
-        /* The waveform (and the existing LIVE/-M:SS readout) both need to
-         * visibly advance in real time even with no touch on the screen at
-         * all -- same "redraw every tick so the bar animates" reasoning
-         * power_hold_ui_shown's own dirty=1 above already uses. Scoped to
-         * the radio Now Playing screen specifically, not radio_mode alone:
-         * the underlying state keeps changing everywhere radio_mode is
-         * true (that's the whole point of the capture block just above),
-         * but nothing needs painting for it while some other screen is
-         * actually on display. */
+        /* The LIVE/-M:SS readout needs to visibly advance in real time even
+         * with no touch on the screen at all -- same "redraw every tick so
+         * the bar animates" reasoning power_hold_ui_shown's own dirty=1
+         * above already uses. Scoped to the radio Now Playing screen
+         * specifically, not radio_mode alone: nothing needs painting for
+         * it while some other screen is actually on display. */
         if (radio_mode && screen == SC_PLAYING) dirty = 1;
 
         /* Podcast downloads and whole-feed syncs both run as detached child
@@ -12835,80 +12855,6 @@ int music_entry(void *a0, void *a1) {
             if (scrub_active || was) { dirty = 1; idle = 0; }
         }
 
-        /* Radio's own waveform scrubber -- unlike the tap-to-position bar
-         * above, explicitly requested as drag-relative: moving the bar
-         * moves playback, dragging to an absolute x is not how it works.
-         * Applied live, tick by tick, rather than deferred to release --
-         * dragging right (finger moves right, dx > 0) slides earlier
-         * content in under the fixed playhead, i.e. rewind, matching what
-         * the same motion does to draw_radio_waveform()'s own content
-         * (see its comment); dragging left runs back toward live. Running
-         * out of buffered history while dragging right is exactly "the bar
-         * disappears off the left of the screen" -- radio_current_abs_sec()
-         * still moves (clamped below), but radio_peak_owner[] has nothing
-         * for seconds that predate the station's own tune-in or have aged
-         * out of the 30-minute ring, so the draw side just shows nothing
-         * there until dragged back.
-         *
-         * Deltas here are computed against radio_scrub_committed_sec, never
-         * against a fresh radio_current_abs_sec() read -- audio_radio_seek_
-         * relative_ms() only *queues* a delta (g_radio_seek_delta_ms +=),
-         * consumed whenever the decode worker next gets to it, which is not
-         * necessarily before this runs again at 30Hz. Reading the real
-         * position back and computing a fresh "distance to target" against
-         * it assumes the previous tick's request already landed; when the
-         * worker lags (a slow tick, a stalled connection, anything), it
-         * hasn't, and the same correction gets queued again on top of
-         * itself every tick until the worker catches up -- confirmed live
-         * as exactly the reported "drags into the future": a burst of
-         * compounded deltas landing all at once as a single large jump
-         * clamped hard against live by radio_apply_pending_seek()'s own
-         * bound, which looks indistinguishable from "overshot past live"
-         * even though the byte cursor itself never actually exceeded it.
-         * Tracking what this drag has *already told* the audio layer to
-         * reach, and only ever queuing the incremental difference from
-         * that, makes each tick's request correct regardless of how many
-         * ticks the worker needs to work through its backlog. */
-        {
-            int was = radio_scrub_dragging;
-            radio_scrub_dragging = touch_down && screen == SC_PLAYING && radio_mode &&
-                                   !qs_open &&
-                                   touch_y > bar_y() - 32 && touch_y < bar_y() + 32;
-            if (radio_scrub_dragging && !was) {
-                radio_scrub_anchor_sec = radio_current_abs_sec();
-                radio_scrub_committed_sec = radio_scrub_anchor_sec;
-            } else if (radio_scrub_dragging) {
-                long dx = live_x - touch_x;
-                long raw_target = radio_scrub_anchor_sec - radio_floor_div(dx, RADIO_WAVE_PX_PER_SEC);
-                long live_abs = radio_live_abs_sec();
-                long max_rewind_sec = audio_radio_max_rewind_ms() / 1000;
-                long lo = live_abs - max_rewind_sec;
-                if (lo < 0) lo = 0;
-                long target = raw_target;
-                if (target < lo) target = lo;
-                if (target > live_abs) target = live_abs;
-                long delta_sec = target - radio_scrub_committed_sec;
-                if (delta_sec != 0) {
-                    audio_radio_seek_relative_ms(delta_sec * 1000);
-                    radio_scrub_committed_sec = target;
-                }
-                /* Re-anchor whenever the raw (unclamped) target overshot a
-                 * boundary -- otherwise the drag "banks" however far past
-                 * live or the buffer's start the finger travelled, and
-                 * reversing direction has to retrace that whole overshoot
-                 * before playback moves again. Clamping the anchor itself
-                 * means the finger's *current* position always maps to
-                 * exactly the clamped edge, so you genuinely cannot drag
-                 * past live (or past the buffer's start) at all -- pushing
-                 * further just holds there, and reversing responds
-                 * immediately. */
-                if (raw_target != target)
-                    radio_scrub_anchor_sec = target + radio_floor_div(dx, RADIO_WAVE_PX_PER_SEC);
-                dirty = 1;
-            }
-            if (radio_scrub_dragging || was) idle = 0;
-        }
-
         /* Same shape as scrubbing, for the EQ sliders: which one (if any) the
          * finger is over this tick, so the draw code can show it tracking
          * live_x instead of the stored value. The actual write happens on
@@ -13150,6 +13096,7 @@ int music_entry(void *a0, void *a1) {
             if (++status_tick >= 60) {
                 status_tick = 0;
                 if (qs_open) qs_refresh();      /* the radios take a moment */
+                wifi_idle_check();               /* R84 */
                 /* Same reasoning as BG6's standby-undo below: whatever turns
                  * this LED on isn't this app, so a one-shot fix doesn't rule
                  * out it happening again later. Only while unlocked --

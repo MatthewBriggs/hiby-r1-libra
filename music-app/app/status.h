@@ -20,6 +20,7 @@ void st_bt_name(char *out, unsigned n);
 typedef struct { char mac[18]; char name[48]; } bt_found_dev_t;
 void bt_scan_start(void);
 int  bt_scan_devices(bt_found_dev_t *out, int max);   /* returns count found, <= max */
+int  bt_is_paired(const char *mac);                   /* has a bluez pairing record on disk */
 void bt_pair(const char *mac);
 
 /* RP2: Wi-Fi scan-and-select, the same shape as Bluetooth's just above.

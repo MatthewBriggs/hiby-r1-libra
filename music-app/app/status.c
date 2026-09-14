@@ -12,6 +12,8 @@
 #include <string.h>
 #include <time.h>
 #include <stdlib.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 #include "status.h"
 
@@ -96,7 +98,13 @@ static int bt_pcm_path(char *out, unsigned n) {
     run_cmd("bluealsa-cli list-pcms 2>/dev/null", buf, sizeof(buf));
     char *line = strtok(buf, "\n");
     while (line) {
-        if (strstr(line, "/sink")) {
+        /* Must match a2dp AND /sink, exactly as audio.c's bt_sink_connected()
+         * does. A connected headset publishes three PCMs -- a2dpsrc/sink plus
+         * hfpag/sink and hfpag/source -- and bluealsa-cli lists hfpag first,
+         * so matching "/sink" alone returned the hands-free PCM. Its codec is
+         * CVSD (8kHz mono voice), so the footer showed CVSD while the music
+         * was actually playing over aptX on the A2DP transport. */
+        if (strstr(line, "a2dp") && strstr(line, "/sink")) {
             while (*line == ' ') line++;
             snprintf(out, n, "%s", line);
             return 1;
@@ -269,8 +277,46 @@ void bt_scan_start(void) {
  * array rather than returned as text: the caller needs the MAC (to pair)
  * and the name (to display) as separate fields, not one blob to re-parse
  * itself. Returns how many were found, capped at max. */
+/* Is this MAC a device bluez already has a pairing record for, as opposed to
+ * one bt_scan_devices() only just discovered? Answered from bluez's own
+ * on-disk state (/usr/data/bluetooth/<adapter>/<device>/info) rather than by
+ * spawning bluetoothctl per device -- this runs once per device on every
+ * refresh of the Bluetooth settings screen, and a stat() is a fraction of a
+ * fork+exec. bluez creates that directory the moment a device is paired and
+ * it survives disconnection/power-off, which is exactly "paired", not
+ * "currently connected" -- a device that is on but not yet reconnected still
+ * counts. Reported live: an already-paired headset that was switched on
+ * didn't answer an inquiry scan (expected -- see bt_scan_start()'s own
+ * comment on Just Works pairing; a paired device isn't in discoverable mode,
+ * it only answers a direct page) and so never surfaced as connectable from
+ * this screen even though `bluetoothctl connect <mac>` worked immediately by
+ * hand. Splitting the list is the fix: paired devices belong above scan
+ * results regardless of whether they showed up in this scan's inquiry. */
+int bt_is_paired(const char *mac) {
+    DIR *d = opendir("/usr/data/bluetooth");
+    if (!d) return 0;
+    struct dirent *ent;
+    int paired = 0;
+    while ((ent = readdir(d))) {
+        if (ent->d_name[0] == '.') continue;
+        char path[300];
+        snprintf(path, sizeof(path), "/usr/data/bluetooth/%s/%s/info", ent->d_name, mac);
+        struct stat st;
+        if (stat(path, &st) == 0) { paired = 1; break; }
+    }
+    closedir(d);
+    return paired;
+}
+
 int bt_scan_devices(bt_found_dev_t *out, int max) {
-    char buf[4096];
+    /* R84 follow-up: 4096 was sized for a handful of devices and silently
+     * truncated in a crowded environment -- reported live as the Paired
+     * devices section vanishing entirely because bluetoothd's inquiry, with
+     * ambient LE traffic nearby, returned 27 devices and the caller's own
+     * fixed-size array (separately bumped) only asked for the first 8 of
+     * whatever this buffer held. 8192 comfortably holds well over a hundred
+     * "Device XX:XX:XX:XX:XX:XX Name" lines. */
+    char buf[8192];
     run_cmd("bluetoothctl devices 2>/dev/null", buf, sizeof(buf));
     int n = 0;
     char *line = buf;
@@ -472,8 +518,9 @@ void st_wifi_set(int on) {
  *
  * bt_init itself touches /tmp/bt_init_ok as its last line, after that Off,
  * so waiting for that file first and then re-asserting "on" always comes
- * after, not before. Capped at 20s (bt_init's own sleeps alone add up to
- * about 10s) so a firmware or init failure that never creates the file
+ * after, not before. Capped at 20s (bt_init_ok lands ~8.4s into a cold
+ * boot, measured; it was ~16.3s before its fixed sleeps became condition
+ * waits) so a firmware or init failure that never creates the file
  * can't hang this forever -- it just falls through to enabling immediately,
  * the same behavior as before this existed. A no-op wait on every call
  * after boot, once the file already exists, so this is safe to leave in
@@ -485,8 +532,16 @@ void st_bt_set(int on) {
         if (system("/usr/bin/bt_disable >/dev/null 2>&1 &") == -1) return;
         return;
     }
-    if (system("(i=0; while [ ! -f /tmp/bt_init_ok ] && [ $i -lt 40 ]; do "
-               "sleep 0.5; i=$((i+1)); done; /usr/bin/bt_enable) "
+    /* 50ms, not 500ms. bt_init_ok lands ~8.4s into boot and this loop is
+     * what gates bt_enable, so the poll granularity is paid on every cold
+     * boot -- 0.25s wasted on average, measured. usleep is safe to tighten
+     * here because the condition is a file test, a shell builtin with no
+     * process spawn; the same trick applied to bt_init's command-based
+     * waits was actively harmful (spawn costs 4.3ms on this device, so a
+     * 10ms tick on "hciconfig | grep" is ~86% of the core, and it cost a
+     * boot in ten). Same 20s cap, now 400 iterations rather than 40. */
+    if (system("(i=0; while [ ! -f /tmp/bt_init_ok ] && [ $i -lt 400 ]; do "
+               "usleep 50000; i=$((i+1)); done; /usr/bin/bt_enable) "
                ">/dev/null 2>&1 &") == -1) return;
 }
 
