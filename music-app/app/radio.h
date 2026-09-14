@@ -48,6 +48,17 @@ int radio_fetch_nrk_art(const char *station_name, const char *dest_jpg,
 int radio_fetch_dlf_broadcast(const char *station_name, const char *dest_jpg,
                               char *title_out, size_t title_n);
 
+/* Real per-track composer/piece info for BBC Radio 3 (see radio_fetch_bbc_
+ * track()'s own comment in radio.c) -- unlike NRK/DLF, this can give an
+ * actual "artist - track" line, not just a programme block, when the
+ * current programme is playing music. Falls back to the programme title
+ * for Radio 4 (all speech, no track list ever) and for Radio 3 itself
+ * outside a music segment. station_name must be "BBC Radio 3" or
+ * "BBC Radio 4" exactly (the seed list's own naming) or this returns -1
+ * immediately. */
+int radio_fetch_bbc_track(const char *station_name, const char *dest_jpg,
+                          char *title_out, size_t title_n);
+
 /* Builds a fresh path for a new recording of this station, named by station
  * and the current local time so a folder of them sorts and reads sensibly
  * without opening each one. ext is "mp3" or "aac" (radio_buffer.h's

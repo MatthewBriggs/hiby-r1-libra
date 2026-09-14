@@ -5,10 +5,22 @@
  * kinds play: a direct MP3 stream, fed straight to the decoder, and an HLS
  * playlist, whose segments are demuxed from MPEG-TS and decoded as AAC.
  *
- * On the BBC: their live radio is served through an endpoint that describes
- * itself as part of a content protection system, so this app does not go
- * looking for URLs there. Paste one in and it plays like any other — the
- * player has no opinion about where a URL came from.
+ * On the BBC: their *iPlayer* media selector does describe itself as part of
+ * a content protection system, and an earlier pass here stopped at that and
+ * concluded BBC radio was off limits. That was wrong, and worth spelling out
+ * so it isn't re-concluded later. Watching what bbc.co.uk/sounds actually
+ * does, signed out, shows it fetch a plain, unauthenticated master playlist
+ * from a.files.bbci.co.uk whose own path segment reads "nonuk" and whose
+ * variants live under .../live/ww/... -- the worldwide simulcast the BBC
+ * publishes deliberately. No sign-in, no token, no CORS preflight: bare curl
+ * from the device gets a 200. The dead ends that caused the earlier wrong
+ * conclusion were all legacy: open.live.bbc.co.uk's version/2.0 vpid form
+ * answers "selectionunavailable" to every request now (a real vpid, a
+ * nonsense vpid and a nonsense mediaset all give the byte-identical reply),
+ * and stream.live.bbc.co.uk / bbcmedia.ic.llnwd.net / the a.files.bbci.co.uk
+ * "manifesto" paths are all gone. The GUID in the URL below is required and
+ * comes from the current media-selector response; if the BBC rotates it the
+ * station simply stops resolving, the same as any other URL going stale.
  */
 
 #include <dirent.h>
@@ -44,8 +56,14 @@ static const char *seed =
     "Deutschlandfunk | https://st01.sslstream.dlf.de/dlf/01/128/mp3/stream.mp3\n"
     "Deutschlandfunk Kultur | https://st02.sslstream.dlf.de/dlf/02/128/mp3/stream.mp3\n"
     "Deutschlandfunk Nova | https://st03.sslstream.dlf.de/dlf/03/128/mp3/stream.mp3\n"
-    "BBC Radio 3 | \n"
-    "BBC Radio 4 | \n";
+    /* The BBC's worldwide ("nonuk") HLS simulcast -- see this file's own top
+     * comment for why these are real URLs now rather than the empty slots
+     * they used to be. Radio 4's service id is bbc_radio_fourfm, not
+     * bbc_radio_four (that one 404s), and each service sits behind its own
+     * pool, which is exactly why these point at the master playlist rather
+     * than a pool URL: the master is what maps to whichever pool is current. */
+    "BBC Radio 3 | https://a.files.bbci.co.uk/ms6/live/3441A116-B12E-4D2F-ACA8-C1984642FA4B/audio/simulcast/hls/nonuk/pc_hd_abr_v2/cfs/bbc_radio_three.m3u8\n"
+    "BBC Radio 4 | https://a.files.bbci.co.uk/ms6/live/3441A116-B12E-4D2F-ACA8-C1984642FA4B/audio/simulcast/hls/nonuk/pc_hd_abr_v2/cfs/bbc_radio_fourfm.m3u8\n";
 
 static void trim(char *s) {
     char *p = s;
@@ -354,6 +372,172 @@ int radio_fetch_dlf_broadcast(const char *station_name, const char *dest_jpg,
          * not here: this function's job is just getting the bytes. */
         if (radio_run_curl(logo, tmp_jpg) == 0 && rename(tmp_jpg, dest_jpg) == 0)
             rc = 0;   /* a logo with no title is still worth showing */
+        else
+            unlink(tmp_jpg);
+    }
+    return rc;
+}
+
+/* Pulls one string field's value out of a bounded buffer range -- key must
+ * include its own quotes, e.g. bbc_json_str(from, end, "\"primary\"", ...).
+ * No unescaping: BBC's JSON here carries real UTF-8 straight through
+ * (accented composer names and the like), never backslash-escaped, so
+ * copying the raw bytes between the quotes is already correct. */
+static int bbc_json_str(const char *from, const char *end, const char *key,
+                        char *out, size_t out_n) {
+    out[0] = '\0';
+    const char *k = strstr(from, key);
+    if (!k || k >= end) return -1;
+    const char *c = strchr(k, ':');
+    if (!c || c >= end) return -1;
+    const char *q1 = strchr(c, '"');
+    if (!q1 || q1 >= end) return -1;
+    const char *q2 = strchr(q1 + 1, '"');
+    if (!q2) return -1;
+    size_t len = (size_t)(q2 - q1 - 1);
+    if (len >= out_n) len = out_n - 1;
+    memcpy(out, q1 + 1, len);
+    out[len] = '\0';
+    return out[0] ? 0 : -1;
+}
+
+/* BBC's own image URLs are a template, not a direct link -- "{recipe}"
+ * stands in for a size token the caller picks (their own player substitutes
+ * whichever size the current layout needs). 480 is comfortably above
+ * RADIO_ART_PX's 480px square, the same "don't ask for less than the
+ * target" reasoning nrk_best_url_in()'s own comment explains. */
+static void bbc_recipe_url(const char *tmpl, char *out, size_t out_n) {
+    const char *tag = strstr(tmpl, "{recipe}");
+    if (!tag) { snprintf(out, out_n, "%s", tmpl); return; }
+    snprintf(out, out_n, "%.*s480x480%s", (int)(tag - tmpl), tmpl, tag + 8);
+}
+
+/* Finds the one entry in a /segments/latest response whose own
+ * "offset":{...,"now_playing":true} marks it as current, and pulls its
+ * composer/piece title and image template out of *that* entry specifically
+ * -- entries are bounded by consecutive "type":"segment_item" markers
+ * (they are flat objects, no nested arrays of their own, so this needs
+ * nothing fancier than "next occurrence" to bound one). Combines composer
+ * (titles.primary) and piece (titles.secondary) the same way a "artist -
+ * track" now-playing line conventionally reads. */
+static int bbc_now_playing_in(const char *buf, char *title_out, size_t title_n,
+                              char *img_tmpl, size_t img_tmpl_n) {
+    title_out[0] = '\0';
+    img_tmpl[0] = '\0';
+    const char *marker = "\"type\":\"segment_item\"";
+    const char *e0 = strstr(buf, marker);
+    while (e0) {
+        const char *next = strstr(e0 + 1, marker);
+        const char *e_end = next ? next : buf + strlen(buf);
+        const char *np = strstr(e0, "\"now_playing\":true");
+        if (np && np < e_end) {
+            char primary[160] = "", secondary[200] = "";
+            bbc_json_str(e0, e_end, "\"primary\"", primary, sizeof(primary));
+            bbc_json_str(e0, e_end, "\"secondary\"", secondary, sizeof(secondary));
+            bbc_json_str(e0, e_end, "\"image_url\"", img_tmpl, img_tmpl_n);
+            if (primary[0] && secondary[0])
+                snprintf(title_out, title_n, "%s \xe2\x80\x93 %s", primary, secondary);
+            else if (primary[0])
+                snprintf(title_out, title_n, "%s", primary);
+            return title_out[0] ? 0 : -1;
+        }
+        e0 = next;
+    }
+    return -1;
+}
+
+/* Which BBC ids this station needs -- not derived generically from the
+ * display name (unlike NRK's "NRK <Name>" -> channel-id trick), since the
+ * BBC's own ids don't map cleanly from it, and Radio 4's *programme*-
+ * metadata id genuinely differs from its *stream* id (bbc_radio_four vs
+ * bbc_radio_fourfm -- confirmed live, the fourfm id 404s against
+ * /playable). segments_id NULL means "don't bother" for an all-speech
+ * network that will never have a now_playing music segment (checked live:
+ * Radio 4 returns "total":0 from that endpoint every time), going
+ * straight to the programme-title fallback instead. */
+static int bbc_ids_for(const char *station_name, const char **segments_id,
+                       const char **playable_id) {
+    if (!strcmp(station_name, "BBC Radio 3")) {
+        *segments_id = "bbc_radio_three"; *playable_id = "bbc_radio_three"; return 0;
+    }
+    if (!strcmp(station_name, "BBC Radio 4")) {
+        *segments_id = NULL; *playable_id = "bbc_radio_four"; return 0;
+    }
+    return -1;
+}
+
+/* Real per-track info for BBC Radio 3 -- unlike NRK, whose livebuffer only
+ * ever gives the surrounding programme block, the BBC publishes actual
+ * composer/piece segments for a live channel with a now_playing flag on
+ * the current one (see bbc_now_playing_in()'s own comment). Falls back to
+ * the programme title (rms.api.bbc.co.uk's own /playable, the same title
+ * bbc.co.uk/sounds itself shows as the headline) when there's no track
+ * list -- always the case for Radio 4, and the case for Radio 3 itself
+ * between music segments (news, continuity, a speech programme). Same
+ * rms.api.bbc.co.uk host this file's own top comment already confirmed is
+ * unauthenticated and un-geo-blocked for the stream itself. */
+int radio_fetch_bbc_track(const char *station_name, const char *dest_jpg,
+                          char *title_out, size_t title_n) {
+    title_out[0] = '\0';
+    const char *segments_id, *playable_id;
+    if (bbc_ids_for(station_name, &segments_id, &playable_id) != 0) return -1;
+
+    int rc = -1;
+    char img_tmpl[300] = "";
+
+    if (segments_id) {
+        char url[200];
+        snprintf(url, sizeof(url),
+                "https://rms.api.bbc.co.uk/v2/services/%s/segments/latest?limit=5", segments_id);
+        char path[64];
+        snprintf(path, sizeof(path), "/tmp/.bbc_seg_%d.json", (int)getpid());
+        if (radio_run_curl(url, path) == 0) {
+            FILE *f = fopen(path, "rb");
+            if (f) {
+                char *buf = malloc(16384);
+                size_t n = buf ? fread(buf, 1, 16383, f) : 0;
+                fclose(f);
+                if (buf) {
+                    buf[n] = '\0';
+                    if (bbc_now_playing_in(buf, title_out, title_n, img_tmpl, sizeof(img_tmpl)) == 0)
+                        rc = 0;
+                    free(buf);
+                }
+            }
+        }
+        unlink(path);
+    }
+
+    if (rc != 0 && playable_id) {
+        char url[160];
+        snprintf(url, sizeof(url), "https://rms.api.bbc.co.uk/v2/networks/%s/playable", playable_id);
+        char path[64];
+        snprintf(path, sizeof(path), "/tmp/.bbc_pl_%d.json", (int)getpid());
+        if (radio_run_curl(url, path) == 0) {
+            FILE *f = fopen(path, "rb");
+            if (f) {
+                char buf[4096];
+                size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+                fclose(f);
+                buf[n] = '\0';
+                char primary[160] = "";
+                if (bbc_json_str(buf, buf + n, "\"primary\"", primary, sizeof(primary)) == 0) {
+                    snprintf(title_out, title_n, "%s", primary);
+                    bbc_json_str(buf, buf + n, "\"image_url\"", img_tmpl, sizeof(img_tmpl));
+                    rc = 0;
+                }
+            }
+        }
+        unlink(path);
+    }
+
+    if (img_tmpl[0]) {
+        char img_url[400];
+        bbc_recipe_url(img_tmpl, img_url, sizeof(img_url));
+        char tmp_jpg[300];
+        snprintf(tmp_jpg, sizeof(tmp_jpg), "%s.part", dest_jpg);
+        if (radio_run_curl(img_url, tmp_jpg) == 0 && rename(tmp_jpg, dest_jpg) == 0)
+            rc = 0;   /* art with no fresh title still worth showing */
         else
             unlink(tmp_jpg);
     }
