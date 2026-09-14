@@ -1608,14 +1608,55 @@ BT_CONNECT_BLOCK = BT_POWERED_ON_LINE + """
       _try=0; _how=timeout
       # Window widened to ~60s: 6 tries over ~21s was giving up while the
       # headset was still coming up.
+      # Success means an A2DP PCM exists, not merely "a link exists".
+      #
+      # Reported live 2026-09-11: the boot reconnect logged how=ours tries=1
+      # and the headset still had to be selected by hand. The link it made was
+      # "< LE 40:ED:98:1D:2D:29" -- a Low Energy link to a dual-mode device
+      # (the FiiO BTR17 advertises BR/EDR and LE both), which carries no audio
+      # and produces no bluealsa PCM. hcitool con saw a connection, so the loop
+      # declared victory and stopped.
+      #
+      # So: ask for the A2DP Sink profile explicitly rather than letting bluez
+      # choose, and test for the PCM. UUID 0000110b-... is A2DP Sink, and it is
+      # already listed in the device's own bluez info file.
+      _path=/org/bluez/hci0/dev_$(echo "$_mac" | tr ":" "_")
+      _a2dp_up() {
+          bluealsa-cli list-pcms 2>/dev/null | grep -qi "$(echo "$_mac" | tr ":" "_").*a2dp"
+      }
+      # Per-attempt detail, because "how=timeout tries=10" says only that it
+      # failed, not which failure it was. Observed BRCM_13: a full timeout over
+      # 63s with no A2DP, indistinguishable from the LE-link case where a link
+      # exists but carries no audio. Logged to its own file so btconn.log stays
+      # one line per boot.
+      _det=/usr/data/btconn_detail.log
+      _note() { echo "$(cut -d" " -f1 /proc/uptime) try=$_try $1" >> $_det; }
+      echo "--- boot $(date -u "+%Y-%m-%d %H:%M:%S") mac=$_mac" >> $_det
+
       for _gap in 1 2 3 5 5 5 10 10 10 10; do
-        if hcitool con 2>/dev/null | grep -qi "$_mac"; then _how=incoming; break; fi
+        if _a2dp_up; then _how=incoming; _note "a2dp present before our attempt"; break; fi
         _try=$((_try + 1))
+
+        _err=$(dbus-send --system --reply-timeout=12000 --dest=org.bluez "$_path" \
+          org.bluez.Device1.ConnectProfile \
+          string:0000110b-0000-1000-8000-00805f9b34fb 2>&1 >/dev/null)
+        _note "ConnectProfile: ${_err:-ok}"
+        if _a2dp_up; then _how=ours; _note "a2dp up after ConnectProfile"; break; fi
+
         printf "agent NoInputNoOutput\ndefault-agent\nconnect $_mac\nquit\n" \
           | bluetoothctl >/dev/null 2>&1
-        if hcitool con 2>/dev/null | grep -qi "$_mac"; then _how=ours; break; fi
+        if _a2dp_up; then _how=ours-fallback; _note "a2dp up after plain connect"; break; fi
+
+        # What DID we get? A link with no audio profile is a completely
+        # different problem from no link at all.
+        _link=$(hcitool con 2>/dev/null | grep -i "$_mac" | head -1 | awk "{print \$1}")
+        _pcms=$(bluealsa-cli list-pcms 2>/dev/null | grep -ci "$(echo "$_mac" | tr ":" "_")")
+        _note "no a2dp: link='${_link:-none}' pcms=$_pcms"
         sleep $_gap
       done
+      if [ "$(wc -l < $_det 2>/dev/null || echo 0)" -gt 400 ]; then
+        tail -200 $_det > $_det.tmp && mv $_det.tmp $_det
+      fi
       _t1=$(cut -d" " -f1 /proc/uptime)
       echo "$(date -u "+%Y-%m-%d %H:%M:%S") mac=$_mac how=$_how tries=$_try from=${_t0}s to=${_t1}s" \
         >> /usr/data/btconn.log
@@ -1901,16 +1942,71 @@ def switch_to_brcmfmac(root, modules_dir, firmware_dir):
     with open(init, "w") as fh:
         fh.write(t)
 
+    # Bluetooth early, WiFi last.
+    #
+    # S12_bt_init cannot start until ALL of S11module_driver_default finishes,
+    # and loading brcmfmac there costs ~0.6s of firmware load that Bluetooth
+    # has no reason to wait for (measured BRCM_11: r1_wlan_up 2.07s -> mmc0
+    # 2.25 -> firmware 2.44 -> reg_notifier 2.80). So the module script keeps
+    # only the rail work, and the WiFi driver moves to its own late script.
+    #
+    # The rail work must NOT move with it. r1_wlan_up pulses WL_REG_ON
+    # low->high, and that rail is shared with the Bluetooth side of the combo
+    # chip -- doing that after bt_init would reset the chip out from under a
+    # live BT link. Enumerating the SDIO card early is harmless; it is binding
+    # brcmfmac and loading its firmware that is expensive, and that is what
+    # gets deferred.
+    # Remove cywdhd outright, rather than leaving 1.4MB of unloadable blob in
+    # the image. Verified on hardware that nothing reaches for it:
+    #   * wifi_on.sh (what the UI's WiFi toggle runs) only starts
+    #     wpa_supplicant and udhcpc.
+    #   * S43wifi_bcm_init_config writes the MAC to
+    #     /sys/module/cywdhd/parameters/bcm_mac_address but guards it with
+    #     [ -e ... ], so it is a no-op once the module is gone. (That guard is
+    #     also why wlan0's MAC now randomises per load -- nothing sets it, so
+    #     brcmfmac falls back to the NVRAM placeholder. Separate fix.)
+    #   * The only other mentions are comments.
+    # There was never any fallback logic: not loading it is the whole of it.
+    for dead in ("module_driver/cywdhd.ko", "module_driver/cywdhd.sh"):
+        dp = os.path.join(root, dead)
+        if os.path.exists(dp):
+            os.remove(dp)
+
     loader = os.path.join(root, "module_driver/brcmfmac.sh")
     with open(loader, "w") as fh:
-        fh.write("# r1_wlan_up powers WL_REG_ON and calls\n"
-                 "# ingenic_mmc_manual_detect() so the non-removable mmc0 host\n"
-                 "# actually enumerates the chip. Must precede brcmfmac, which\n"
-                 "# has nothing to bind to otherwise.\n"
-                 "insmod r1_wlan_up.ko\n"
+        fh.write("# Rail + SDIO enumeration only. Stays early: the WL_REG_ON\n"
+                 "# pulse is on a rail shared with Bluetooth, so it must happen\n"
+                 "# before bt_init, never after.\n"
+                 "insmod r1_wlan_up.ko\n")
+    os.chmod(loader, 0o755)
+
+    wifi = os.path.join(root, "module_driver/wifi_late.sh")
+    with open(wifi, "w") as fh:
+        fh.write("# The actual WiFi driver, deferred to the end of boot.\n"
                  "insmod brcmutil.ko\n"
                  "insmod brcmfmac.ko\n")
-    os.chmod(loader, 0o755)
+    os.chmod(wifi, 0o755)
+
+    initd = os.path.join(root, "etc/init.d")
+    # S91. Tried S93 (after the app) on the theory that brcmfmac's firmware
+    # load was competing with bluez bring-up for the single core: measured
+    # BRCM_13 vs BRCM_12, the firmware still loaded at 6.496s vs 6.52s and
+    # bluealsa_ready was 8.20s in both. Init order cannot move it, because
+    # S12_bt_init backgrounds itself -- the whole rc sequence finishes while
+    # patchram is still running. The 0.73s gap against LEAN_5b's 7.47s is real
+    # but is NOT init ordering, and remains unexplained.
+    late = os.path.join(initd, "S91wifi")
+    with open(late, "w") as fh:
+        fh.write("#!/bin/sh\n"
+                 "# WiFi genuinely last -- after the app is up, so brcmfmac's\n"
+                 "# firmware load does not compete with bluez bring-up for the\n"
+                 "# single core. Nothing earlier in boot needs the network.\n"
+                 "case \"$1\" in\n"
+                 "  start) cd /module_driver && sh wifi_late.sh & ;;\n"
+                 "  stop)  rmmod brcmfmac 2>/dev/null; rmmod brcmutil 2>/dev/null ;;\n"
+                 "esac\n"
+                 "exit 0\n")
+    os.chmod(late, 0o755)
 
     # modules alongside the vendor ones
     for m in BRCM_MODULES:
@@ -1927,6 +2023,76 @@ def switch_to_brcmfmac(root, modules_dir, firmware_dir):
         if not os.path.exists(src):
             return f"missing {src}"
         shutil.copy2(src, os.path.join(fwdir, f))
+
+    return patch_wifi_idle_scripts(root)
+
+
+WIFI_OFF_RMMOD_BLOCK = """# R84: unload the driver, not just the interface. brcmfmac has no runtime
+# power-down path -- unlike the vendor DHD driver this replaced, which idled
+# the SDIO bus and WLAN core when the interface went down -- so `ifconfig
+# wlan0 down` alone left the chip fully awake and still arbitrating the
+# shared antenna against Bluetooth. Reported live: A2DP cut-outs in built-up
+# areas were just as bad with WiFi "off" from this exact toggle as with it
+# on. `rmmod brcmfmac; rmmod brcmutil` tested live and confirmed to fix it --
+# this is that fix made permanent, run on every off rather than by hand.
+#
+# r1_wlan_up (WL_REG_ON) is deliberately NOT unloaded here. It is a separate
+# pin from BT_REG_ON, but the two share the chip's internal supply (bc4ecfe),
+# so dropping the WLAN rail risks taking Bluetooth down with it too. Only the
+# 802.11 driver goes -- the same action already proven live to work.
+rmmod brcmfmac 2>/dev/null
+rmmod brcmutil 2>/dev/null
+"""
+
+WIFI_ON_INSMOD_BLOCK = """# R84: reinsert the driver if wifi_off.sh (by hand, or the idle auto-off
+# timer) unloaded it. The SDIO function itself survives an rmmod -- verified
+# live, `ls /sys/bus/sdio/devices` is unchanged across cywdhd's own rmmod --
+# so this only needs to re-bind the driver, not repeat r1_wlan_up's
+# power-on/detect sequence.
+if ! lsmod | grep -q '^brcmfmac'; then
+    ( cd /module_driver && insmod brcmutil.ko && insmod brcmfmac.ko ) >/dev/null 2>&1
+    i=0
+    while [ $i -lt 60 ]; do
+        [ -e /sys/class/net/$INTERFACE ] && break
+        usleep 100000
+        i=$((i + 1))
+    done
+fi
+"""
+
+
+def patch_wifi_idle_scripts(root):
+    """wifi_off.sh unloads brcmfmac/brcmutil; wifi_on.sh reinserts them.
+
+    Companion to R84 (music_hook.c): the app's own idle timer calls
+    st_wifi_set(0)/(1) exactly as the Settings toggle does, so the actual
+    unload/reload has to live here, in the scripts both paths already share.
+    See WIFI_OFF_RMMOD_BLOCK/WIFI_ON_INSMOD_BLOCK for why.
+    """
+    off = os.path.join(root, "usr/bin/wifi_off.sh")
+    on = os.path.join(root, "usr/bin/wifi_on.sh")
+    if not (os.path.exists(off) and os.path.exists(on)):
+        return "usr/bin/wifi_{on,off}.sh not found"
+
+    with open(off) as fh:
+        t = fh.read()
+    if "rmmod brcmfmac" not in t:
+        anchor = "ifconfig $INTERFACE down\n"
+        if t.count(anchor) != 1:
+            return "wifi_off.sh anchor not found"
+        t = t.replace(anchor, anchor + WIFI_OFF_RMMOD_BLOCK, 1)
+        with open(off, "w") as fh:
+            fh.write(t)
+
+    with open(on) as fh:
+        t = fh.read()
+    if "insmod brcmfmac.ko" not in t:
+        anchor = "INTERFACE=wlan0\n"
+        if t.count(anchor) != 1:
+            return "wifi_on.sh anchor not found"
+        t = t.replace(anchor, anchor + WIFI_ON_INSMOD_BLOCK, 1)
+        with open(on, "w") as fh:
+            fh.write(t)
     return None
 
 
@@ -2623,6 +2789,10 @@ def main():
                     die(f"--brcmfmac-switch: {err}")
                 print("patched module_driver (cywdhd -> mainline brcmfmac; "
                       "soc_msc wifi_reg_on=PB03)")
+                print("patched usr/bin/wifi_on.sh, usr/bin/wifi_off.sh "
+                      "(rmmod/insmod brcmfmac+brcmutil on off/on, so 'WiFi "
+                      "off' and R84's idle timer actually power the chip "
+                      "down instead of just downing the interface)")
 
             if enable_rtc32k_at_boot(root):
                 print("patched module_driver/soc_utils.sh (rtc32k_init_on=1: "
