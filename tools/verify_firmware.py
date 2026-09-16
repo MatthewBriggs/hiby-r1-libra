@@ -35,6 +35,16 @@ MODULE_INIT_SCRIPT = "module_driver/driver_default_init_script.sh"
 ADB_INIT_SCRIPT = "etc/init.d/adb/S440adb"
 BRCMFMAC_FILES = ("lib/firmware/brcm/brcmfmac43430-sdio.bin",
                   "lib/firmware/brcm/brcmfmac43430-sdio.txt")
+# Mirrors patch_firmware.py's own UNUSED_FONTS/UNUSED_BINARIES/LITEGUI_DIR --
+# strip_unused_resources() deletes these unconditionally on any standalone
+# build (not gated on --brcmfmac-switch), so a --against diff run against a
+# vanilla base legitimately shows them all as removed. Kept as a duplicate
+# set rather than importing patch_firmware.py, matching how the other
+# constants above (SET_FUNCTIONS_FILES, BRCMFMAC_FILES) are already done.
+STRIPPED_FONTS_AND_BINARIES = ("usr/resource/fonts/default.otf",
+                               "usr/resource/fonts/Thai.ttf",
+                               "usr/bin/hiby_player", "usr/bin/dmrd")
+LITEGUI_DIR = "usr/resource/litegui/"
 
 
 def detect_format(path):
@@ -403,7 +413,13 @@ def main():
                     print(f"    - {k}")
                 expected = {SCRIPT, MOUNT_SCRIPT, CONFIG_JSON, VERSION_FILE,
                             BT_INIT, HGL_SCRIPT, MODULE_INIT_SCRIPT,
-                            ADB_INIT_SCRIPT, "usr/bin/adboff", "usr/bin/adbon"}
+                            ADB_INIT_SCRIPT, "usr/bin/adboff", "usr/bin/adbon",
+                            # enable_rtc32k_at_boot() flips rtc32k_init_on=1
+                            # here (enables the 32kHz LPO at module load) --
+                            # part of the same boot-timing patch set as
+                            # BT_INIT/MODULE_INIT_SCRIPT above, just missed
+                            # when this allowlist was last updated.
+                            "module_driver/soc_utils.sh"}
                 expected |= set(SET_FUNCTIONS_FILES)
                 # kernel_build_id: --kernel-build-id re-stamps this file, which
                 # shows up as "changed" (not "added") whenever the base image
@@ -437,8 +453,13 @@ def main():
                 # and start_patchram_earlier() above does the same to
                 # S21mount_ubifs on its way to S11amount_ubifs.
                 expected_removed = {"etc/init.d/S80_bt_init", "etc/init.d/S21mount_ubifs"}
+                expected_removed |= set(STRIPPED_FONTS_AND_BINARIES)
+
+                def removed_ok(path):
+                    return path in expected_removed or path.startswith(LITEGUI_DIR)
+
                 if (set(changed) <= expected and set(added) <= expected_added
-                        and set(removed) <= expected_removed):
+                        and all(removed_ok(k) for k in removed)):
                     print(f"    only expected files changed ({len(changed)}), "
                           f"as intended")
                 else:
