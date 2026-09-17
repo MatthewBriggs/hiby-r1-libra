@@ -2060,6 +2060,29 @@ if ! lsmod | grep -q '^brcmfmac'; then
 fi
 """
 
+WIFI_ON_DHCP_BLOCK = """# Wait for the association to actually complete before asking for a lease.
+#
+# The stock script sleeps a flat 1.3s after starting wpa_supplicant and then
+# runs udhcpc once. Associating takes longer than that more often than not --
+# and since R84 above now reloads the driver on every single toggle, the
+# firmware load is in that window too, so it lost the race routinely. The
+# symptom is quiet and confusing rather than obvious: wpa_cli reports
+# wpa_state=COMPLETED and the Wi-Fi screen shows the network name, so Wi-Fi
+# looks connected, while the interface has no address at all and nothing can
+# reach the network. Confirmed on hardware -- associated with no IP and no
+# udhcpc left running, and a manual udhcpc got a lease instantly.
+#
+# Polls for COMPLETED for up to 15s instead, then hands over to the lease
+# request below. Falls straight through on the timeout rather than giving up,
+# so a network that genuinely is not there behaves exactly as it did before.
+i=0
+while [ $i -lt 150 ]; do
+    wpa_cli -i $INTERFACE status 2>/dev/null | grep -q '^wpa_state=COMPLETED' && break
+    usleep 100000
+    i=$((i + 1))
+done
+"""
+
 
 def patch_wifi_idle_scripts(root):
     """wifi_off.sh unloads brcmfmac/brcmutil; wifi_on.sh reinserts them.
@@ -2093,6 +2116,36 @@ def patch_wifi_idle_scripts(root):
         t = t.replace(anchor, anchor + WIFI_ON_INSMOD_BLOCK, 1)
         with open(on, "w") as fh:
             fh.write(t)
+    return None
+
+
+def patch_wifi_dhcp_wait(root):
+    """Wait for association before asking for a DHCP lease.
+
+    Deliberately NOT part of patch_wifi_idle_scripts() above, and not gated on
+    --brcmfmac-switch: the rmmod/insmod blocks there are specific to brcmfmac
+    (cywdhd idles the SDIO bus and WLAN core on interface-down by itself, which
+    is the whole reason R84 needed them for the mainline driver), but the race
+    this fixes is in the stock script and belongs to whichever driver is
+    packaged. The stock-kernel build ships cywdhd and has the same fixed 1.3s
+    sleep in front of the same one-shot udhcpc, so it can come up associated
+    with no address just the same -- the brcmfmac reload only made it the usual
+    outcome rather than an occasional one. See WIFI_ON_DHCP_BLOCK.
+    """
+    on = os.path.join(root, "usr/bin/wifi_on.sh")
+    if not os.path.exists(on):
+        return "usr/bin/wifi_on.sh not found"
+    with open(on) as fh:
+        t = fh.read()
+    if "wpa_state=COMPLETED" in t:
+        return None
+    anchor = "usleep 1300000\n"
+    if t.count(anchor) != 1:
+        return "wifi_on.sh dhcp-wait anchor not found"
+    # Replaces the fixed sleep rather than adding to it: that sleep is the bug.
+    t = t.replace(anchor, WIFI_ON_DHCP_BLOCK, 1)
+    with open(on, "w") as fh:
+        fh.write(t)
     return None
 
 
@@ -2736,6 +2789,12 @@ def main():
             nfw = install_brcmfmac_firmware(root)
             if nfw:
                 print(f"installed {nfw} brcmfmac firmware file(s) under lib/firmware/brcm/")
+            err = patch_wifi_dhcp_wait(root)
+            if err:
+                print(f"note: wifi_on.sh DHCP wait not applied -- {err}")
+            else:
+                print("patched usr/bin/wifi_on.sh (wait for association before "
+                      "requesting a DHCP lease)")
             sn, sbytes = (0, 0) if args.no_strip else strip_unused_resources(root)
             if sn:
                 print(f"stripped {sn} unused stock file(s) "

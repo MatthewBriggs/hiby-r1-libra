@@ -1774,6 +1774,24 @@ void audio_bt_volume_service(void) {
                     g_vol = bt_raw_to_pct(fresh);
                     pthread_mutex_unlock(&g_lock);
                 }
+                /* The comment above promises the queued press is "not
+                 * lost", but pending/raw_val were only captured into
+                 * locals above (bt_vol_pending itself already cleared to
+                 * 0) -- returning here without re-queuing them silently
+                 * dropped the user's own press. Reported live: the first
+                 * press after connecting still landed as a jump to
+                 * whatever the headset's own volume already was,
+                 * regardless of direction, because this is exactly that
+                 * dropped write. Re-queue against bt_vol_raw/g_vol as they
+                 * now stand (the sync just above), so next tick's
+                 * `if (pending)` below actually applies the press the user
+                 * asked for instead of silently eating it. */
+                if (pending) {
+                    pthread_mutex_lock(&bt_vol_lock);
+                    bt_vol_pending = 1;
+                    bt_vol_pending_raw = raw_val;
+                    pthread_mutex_unlock(&bt_vol_lock);
+                }
                 return;
             }
         }
@@ -1858,6 +1876,7 @@ static void *pcm_open(unsigned rate, int channels, int deep, int want_fmt) {
     const char *names[4];
     int fmts[4];
     unsigned count = 0;
+    unsigned long buf_frames = 0;   /* what the device actually granted */
     if (use_bt) {
         /* Pin the profile. Since HFP was enabled there are three PCMs on the
          * headset — a2dpsrc/sink plus hfpag/sink and /source — and the bare
@@ -1905,6 +1924,10 @@ static void *pcm_open(unsigned rate, int channels, int deep, int want_fmt) {
         if (ok) x_hwp_set_period_time_near(pcm, hw, &per_us, NULL);
         if (ok) ok = x_hwp_apply(pcm, hw) >= 0;
         if (!ok) { x_hwp_free(hw); x_close(pcm); pcm = NULL; continue; }
+        /* Read while `hw` is still alive -- it is freed below, and the
+         * start-threshold sizing after the loop needs the real granted buffer
+         * rather than the buffer_time that was asked for. */
+        if (x_hwp_get_buffer_size) x_hwp_get_buffer_size(hw, &buf_frames);
 
         /* Which *device* was opened, not which index: the exact device now has
          * two candidate formats, so "i == 0" no longer means bit-perfect. Both
@@ -1926,12 +1949,45 @@ static void *pcm_open(unsigned rate, int channels, int deep, int want_fmt) {
      * happily, took about eleven seconds of audio, and then parked forever in
      * wait_for_avail: the stream never started, so nothing ever drained. */
 
-    /* start_threshold 1: begin playing as soon as there is a frame, rather
-     * than waiting for the buffer to fill. */
+    /* How much has to be queued before the stream actually starts.
+     *
+     * 1 (start on the very first frame) for the jack and USB, as it always
+     * was: the hardware is local, the decode thread runs at nice -8 there
+     * (apply_decode_priority()), and starting instantly is what keeps a seek
+     * or a track change feeling immediate.
+     *
+     * Bluetooth cannot afford that. Starting on one frame means the stream
+     * begins with a near-empty buffer, and every underrun from there is
+     * recovered by write_pcm_frames() calling snd_pcm_recover(), which
+     * prepares the stream afresh and *discards whatever was buffered*. The
+     * opening moments are exactly when that is most likely: a brand new
+     * bluealsa PCM per track (see bt_repush_volume()'s comment) has to
+     * acquire the A2DP transport, the SBC encoder and the headset's own
+     * jitter buffer both start cold, and the decode thread is deliberately
+     * left at nice 0 over Bluetooth so it competes with the UI. music.log
+     * from a real headset session bears this out -- hundreds of underruns,
+     * in bursts, starting within seconds of each `bluealsa:PROFILE=a2dp`
+     * open. Each one eats a slice of the beginning, which is what "the first
+     * half second or so of the track gets skipped" actually is.
+     *
+     * So Bluetooth waits for a real cushion (~250ms, clamped to half the
+     * granted buffer so the threshold can never sit above what the buffer can
+     * hold -- at or above it, the stream would simply never start). The tail
+     * of a track is unaffected either way: playback ends through
+     * snd_pcm_drain(), which plays out a partial buffer below the threshold
+     * rather than waiting for one that will never arrive. */
+    snd_pcm_uframes_t start_at = 1;
+    if (g_out_kind == 2) {
+        start_at = g_out_rate / 4;
+        if (buf_frames && start_at > buf_frames / 2) start_at = buf_frames / 2;
+        if (start_at < 1) start_at = 1;
+        alog("[audio] bt start threshold %lu frames (buffer %lu)\n",
+             (unsigned long)start_at, buf_frames);
+    }
     void *sw = NULL;
     if (x_swp_malloc(&sw) >= 0 && sw) {
         x_swp_current(pcm, sw);
-        x_swp_set_start_threshold(pcm, sw, 1);
+        x_swp_set_start_threshold(pcm, sw, start_at);
         x_swp_apply(pcm, sw);
         x_swp_free(sw);
     }
@@ -2231,6 +2287,12 @@ static void *worker(void *arg) {
     g_seek_pending_points = NULL; g_seek_pending_count = 0; g_seek_pending_ready = 0;
     pthread_mutex_unlock(&g_lock);
     drmp3_seek_point *bound_points = NULL;   /* currently bound to d->mp3, if any; owned here */
+    /* R-seeklatency: same "took N ms" diagnostic as the seek timing below --
+     * splits decoder-open (file I/O + header/metadata parse) from device-open
+     * (pcm_open(), ALSA negotiation) so a slow fresh track-start and a slow
+     * mid-track seek don't get confused for the same cause. */
+    struct timespec op0, op1;
+    clock_gettime(CLOCK_MONOTONIC, &op0);
     if (open_any(d, g_path) != 0) {
         alog("[audio] cannot decode %s\n", g_path);
         pthread_mutex_lock(&g_lock);
@@ -2238,6 +2300,9 @@ static void *worker(void *arg) {
         pthread_mutex_unlock(&g_lock);
         return NULL;
     }
+    clock_gettime(CLOCK_MONOTONIC, &op1);
+    long open_ms = (op1.tv_sec - op0.tv_sec) * 1000 + (op1.tv_nsec - op0.tv_nsec) / 1000000;
+    if (open_ms >= 50) alog("[audio] decoder open took %ld ms\n", open_ms);
     mp3_seektable_kickoff(d, g_path);
     int ch = d->channels > 0 ? d->channels : 2;
     unsigned rate = d->rate ? d->rate : 44100;   /* the source's own rate -- seek/duration/polling always key off this, never eff_rate */
@@ -2247,7 +2312,11 @@ static void *worker(void *arg) {
 
     /* 24-bit sources are opened as S24_LE; everything else is 16 either way. */
     int want_fmt = (d->bits > 16) ? FMT_S24_LE : FMT_S16_LE;
+    clock_gettime(CLOCK_MONOTONIC, &op0);
     void *pcm = pcm_open(rate, ch, d->is_stream, want_fmt);
+    clock_gettime(CLOCK_MONOTONIC, &op1);
+    open_ms = (op1.tv_sec - op0.tv_sec) * 1000 + (op1.tv_nsec - op0.tv_nsec) / 1000000;
+    if (open_ms >= 50) alog("[audio] device open took %ld ms\n", open_ms);
     apply_decode_priority();
     if (!pcm) {
         dec_close(d);
@@ -2365,7 +2434,24 @@ static void *worker(void *arg) {
 
         if (seek >= 0) {
             uint64_t f = (uint64_t)seek * rate / 1000;
+            /* R-seeklatency: diagnostic only, same "took N ms" shape
+             * bt_sink_connected() already logs -- reported live as audio
+             * resuming audibly late after a seek on a large 192kHz/24-bit
+             * FLAC, while the position readout (audio_seek_pending_ms(),
+             * which shows this seek's own target the instant it's
+             * requested, before the worker thread gets here at all -- see
+             * its own comment) already reads the new position. This times
+             * dec_seek() itself -- for FLAC that's drflac_seek_to_pcm_frame(),
+             * which without an embedded SEEKTABLE falls back to a binary
+             * search over the compressed stream (see dr_flac.h's own
+             * drflac__seek_to_pcm_frame__binary_search()) -- to find out
+             * whether the gap is really spent here, and how large. */
+            struct timespec sk0, sk1;
+            clock_gettime(CLOCK_MONOTONIC, &sk0);
             dec_seek(d, f, g_path, &bound_points);
+            clock_gettime(CLOCK_MONOTONIC, &sk1);
+            long seek_ms = (sk1.tv_sec - sk0.tv_sec) * 1000 + (sk1.tv_nsec - sk0.tv_nsec) / 1000000;
+            if (seek_ms >= 50) alog("[audio] seek to %dms took %ld ms\n", seek, seek_ms);
             done = f;
             pthread_mutex_lock(&g_lock);
             g_pos_ms = seek;                  /* move the clock even while paused */

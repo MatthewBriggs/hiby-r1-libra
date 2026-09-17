@@ -29,6 +29,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
+#include <fcntl.h>          /* AT_FDCWD, for the atime use-clock below */
+#include <sys/syscall.h>    /* SYS_gettid, for per-thread shrink temp names */
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -163,10 +165,66 @@ static void on_message(j_common_ptr cinfo) { (void)cinfo; }   /* stay quiet */
  * load_cache() only compares against the source JPEG/folder's own mtime,
  * which has no way to know the *code* that turned those bytes into pixels
  * changed underneath it; a bumped version here is what actually invalidates
- * every existing cache entry (they simply become unreachable orphans,
- * cleaned up over time by prune_cache()'s normal LRU pruning). Bump this
- * again any time cover_load()'s pixel output changes. */
+ * every existing cache entry (they simply become unreachable orphans).
+ * Reclaiming the space those orphans take is cache_version_sweep()'s job --
+ * it used to fall out of prune_cache() evicting everything within a few days,
+ * which stopped being true once the cap was raised to cover the library. Bump
+ * this again any time cover_load()'s pixel output changes. */
 #define CACHE_VERSION "2"
+
+/* Bumping CACHE_VERSION used to rely on prune_cache() to clear out the entries
+ * it orphaned, which worked only because the cap was small enough that
+ * everything got evicted within a few days. With the cap now set to cover the
+ * whole library (see COVER_CACHE_KEEP) eviction is meant never to fire, so
+ * those orphans would sit on the card forever -- hundreds of megabytes of
+ * bitmaps nothing can ever reach again. A stamp file makes the version
+ * explicit: when it disagrees with the running build, the directory is cleared
+ * once and the stamp rewritten.
+ *
+ * Racing art workers can both see a stale stamp and both wipe; the cost is one
+ * extra decode, not corruption, and only on the first access after an update. */
+static void cache_version_sweep(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+
+    char stamp[512];
+    snprintf(stamp, sizeof(stamp), "%s/.version", COVER_CACHE_DIR);
+
+    char have[32] = "";
+    FILE *f = fopen(stamp, "r");
+    int stamped = 0;
+    if (f) {
+        stamped = fgets(have, sizeof(have), f) != NULL;
+        fclose(f);
+    }
+    have[strcspn(have, "\r\n")] = '\0';
+    if (stamped && strcmp(have, CACHE_VERSION) == 0) return;
+
+    /* No stamp at all means a cache written before this check existed, not a
+     * stale one: its entries were hashed with whatever CACHE_VERSION was
+     * current when they were written, so any that disagree with this build are
+     * already unreachable by construction and the rest are still good. Adopt
+     * the version instead of wiping -- a wipe here would throw away a full
+     * cache of valid bitmaps and re-decode every one of them for nothing. */
+    if (stamped) {
+        DIR *d = opendir(COVER_CACHE_DIR);
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d))) {
+                if (!strstr(e->d_name, ".r565")) continue;
+                char p[512];
+                snprintf(p, sizeof(p), "%s/%s", COVER_CACHE_DIR, e->d_name);
+                unlink(p);
+            }
+            closedir(d);
+        }
+    }
+    if ((f = fopen(stamp, "w"))) {
+        fputs(CACHE_VERSION "\n", f);
+        fclose(f);
+    }
+}
 
 static void cache_path(const char *key, int px, char *out, size_t n) {
     unsigned long h = 5381;
@@ -175,7 +233,59 @@ static void cache_path(const char *key, int px, char *out, size_t n) {
     for (const unsigned char *p = (const unsigned char *)CACHE_VERSION; *p; p++)
         h = ((h << 5) + h) ^ *p;
     mkdir(COVER_CACHE_DIR, 0755);
+    cache_version_sweep();
     snprintf(out, n, "%s/%08lx.%d.r565", COVER_CACHE_DIR, h & 0xFFFFFFFFul, px);
+}
+
+/* Eviction order used to come from the cache entry's own mtime, which is its
+ * *write* time and never moves again -- so "keep the most recently used" was
+ * really FIFO, and a cover opened every day could be dropped in favour of one
+ * seen once. mtime cannot double as the use clock, because load_cache() and
+ * cover_cached() compare it against the *source's* mtime to notice a
+ * hand-replaced cover.jpg (the documented way to fix art the decoder refuses).
+ * So the use clock rides on atime, which nothing else here reads.
+ *
+ * Measured on this device's exFAT mount, with a test binary doing exactly the
+ * call below: atime moves and mtime holds, so the driver really does keep the
+ * two apart (busybox `touch -a` moving both is a busybox limitation, not a
+ * filesystem one). It is still checked at runtime rather than trusted, because
+ * the failure mode is nasty: if setting atime dragged mtime forward, every
+ * entry would look newer than its source and a stale cover would be pinned
+ * forever -- far worse than the FIFO eviction this replaces. On the first call
+ * the old mtime is read back, and if it moved it is put back and the use clock
+ * is abandoned for the rest of the session.
+ *
+ * What this mount does *not* do is persist atime across a remount: entries
+ * written before a reboot come back reading 1980 while their mtime survives
+ * intact. So this is a within-session use clock, not a durable one, which is
+ * why prune_cache() sorts on whichever of the two timestamps is later rather
+ * than on atime alone. */
+static int atime_lru = -1;   /* -1 = not yet probed, 1 = usable, 0 = abandoned */
+
+static void touch_used(const char *path) {
+    if (atime_lru == 0) return;
+
+    struct timespec ts[2];
+    ts[0].tv_sec = 0; ts[0].tv_nsec = UTIME_NOW;    /* atime := now */
+    ts[1].tv_sec = 0; ts[1].tv_nsec = UTIME_OMIT;   /* mtime untouched */
+
+    if (atime_lru == 1) {
+        utimensat(AT_FDCWD, path, ts, 0);
+        return;
+    }
+
+    struct stat before, after;
+    if (stat(path, &before) != 0) return;
+    if (utimensat(AT_FDCWD, path, ts, 0) != 0) { atime_lru = 0; return; }
+    if (stat(path, &after) == 0 && after.st_mtime != before.st_mtime) {
+        struct timespec fix[2];
+        fix[0].tv_sec = 0;               fix[0].tv_nsec = UTIME_OMIT;
+        fix[1].tv_sec = before.st_mtime; fix[1].tv_nsec = 0;
+        utimensat(AT_FDCWD, path, fix, 0);
+        atime_lru = 0;
+        return;
+    }
+    atime_lru = 1;
 }
 
 static uint16_t *load_cache(const char *jpg, const char *key, int px) {
@@ -204,46 +314,93 @@ static uint16_t *load_cache(const char *jpg, const char *key, int px) {
     size_t got = fread(buf, sizeof(uint16_t), want, f);
     fclose(f);
     if (got != want) { free(buf); return NULL; }
+    touch_used(p);
     return buf;
 }
 
 /* The cache is on the card, so it is not a threat to the device, but it still
  * grows by a third of a megabyte per album and nothing was ever removing any
- * of it. Keep a bounded number of the most recently used and drop the rest. */
-#define COVER_CACHE_KEEP 120
+ * of it. Keep a bounded number of the most recently used and drop the rest.
+ *
+ * 120 was far too tight, and measurably so: every entry is a 480px square
+ * (ART_PX is FB_W -- the only size anything here ever asks for) at 450 KB, the
+ * cache sat pinned at exactly 120 files / 60.3 MB, and the card holds ~600
+ * media directories. So roughly a fifth of the library fit and the rest
+ * evicted continuously -- and a miss is expensive: re-find the artwork, which
+ * for embedded art means parsing the audio file again and spilling ~1.5 MB to
+ * /tmp, then a full JPEG decode. That is exactly the "loads artwork a lot"
+ * this cache exists to prevent, caused by the cache rather than survived by
+ * it.
+ *
+ * The honest budget here is card space, not memory: the bitmaps never sit in
+ * RAM together, and the cache lives on the music card by design (see
+ * COVER_CACHE_DIR). 2000 entries is ~900 MB of a 477 GB card -- 0.2% -- and
+ * comfortably more than any library this device can hold the music for. Sized
+ * to cover the library rather than to be small, because an eviction that never
+ * fires is the cheapest eviction there is; the cap stays only as a backstop
+ * against genuinely unbounded growth. */
+#define COVER_CACHE_KEEP 2000
+
+/* Has to exceed COVER_CACHE_KEEP, or the readdir loop below fills the array
+ * with the first COVER_PRUNE_MAX names it happens to see, finds that no more
+ * than the cap were collected, and returns having deleted nothing -- the cache
+ * would then grow without limit and silently. Kept well clear of the cap so
+ * the overshoot COVER_PRUNE_EVERY allows still leaves room. */
+#define COVER_PRUNE_MAX  4096
+
+/* Sweeping the directory and stat()ing every entry was affordable on each save
+ * at 120 files; at 2000 it is 2000 stat()s on a single-core MIPS to usually
+ * discover there is nothing to do. The cap is a disk-space bound, not a
+ * correctness one, so overshooting it by a few dozen entries between sweeps
+ * costs nothing that matters. */
+#define COVER_PRUNE_EVERY 64
 
 static void prune_cache(void) {
     DIR *d = opendir(COVER_CACHE_DIR);
     if (!d) return;
-    struct { char name[64]; time_t at; } ent[512];
+
+    /* ~290 KB, so it is malloc'd rather than put on an art worker's stack. */
+    struct ent { char name[64]; time_t at; };
+    struct ent *ent = malloc((size_t)COVER_PRUNE_MAX * sizeof(*ent));
+    if (!ent) { closedir(d); return; }
+
     int n = 0;
     struct dirent *e;
-    while (n < (int)(sizeof(ent) / sizeof(ent[0])) && (e = readdir(d))) {
+    while (n < COVER_PRUNE_MAX && (e = readdir(d))) {
         if (!strstr(e->d_name, ".r565")) continue;
         char p[512];
         snprintf(p, sizeof(p), "%s/%s", COVER_CACHE_DIR, e->d_name);
         struct stat st;
         if (stat(p, &st) != 0) continue;
         snprintf(ent[n].name, sizeof(ent[n].name), "%s", e->d_name);
-        ent[n].at = st.st_mtime;
+        /* Whichever is later, for the reason in touch_used(): atime is the use
+         * clock but does not survive a remount, so an entry not read since
+         * boot reads as 1980 and mtime (its write time) is the better signal
+         * for it. Taking the max means a read this session always wins, and
+         * anything else falls back to the write-order this used to use --
+         * never worse than the old behaviour, whatever the mount has done to
+         * the atimes. */
+        ent[n].at = st.st_atime > st.st_mtime ? st.st_atime : st.st_mtime;
         n++;
     }
     closedir(d);
-    if (n <= COVER_CACHE_KEEP) return;
+    if (n <= COVER_CACHE_KEEP) { free(ent); return; }
 
-    /* Selection sort by age; n is small and this runs only when the cache is
-     * already over its limit. */
+    /* Selection sort by age. Only the entries actually being dropped are
+     * selected, so this is (n - KEEP) passes, not a full sort, and it runs
+     * only once the cache is already over its limit. */
     for (int i = 0; i < n - COVER_CACHE_KEEP; i++) {
         int oldest = i;
         for (int j = i + 1; j < n; j++)
             if (ent[j].at < ent[oldest].at) oldest = j;
         if (oldest != i) {
-            typeof(ent[0]) t = ent[i]; ent[i] = ent[oldest]; ent[oldest] = t;
+            struct ent t = ent[i]; ent[i] = ent[oldest]; ent[oldest] = t;
         }
         char p[512];
         snprintf(p, sizeof(p), "%s/%s", COVER_CACHE_DIR, ent[i].name);
         unlink(p);
     }
+    free(ent);
 }
 
 static void save_cache(const char *key, int px, const uint16_t *buf) {
@@ -253,7 +410,12 @@ static void save_cache(const char *key, int px, const uint16_t *buf) {
     if (!f) return;
     fwrite(buf, sizeof(uint16_t), (size_t)px * px, f);
     fclose(f);
-    prune_cache();
+
+    static int saves;
+    if (++saves >= COVER_PRUNE_EVERY) {
+        saves = 0;
+        prune_cache();
+    }
 }
 
 uint16_t *cover_cached(const char *cache_key, const char *dir, int px) {
@@ -282,6 +444,7 @@ uint16_t *cover_cached(const char *cache_key, const char *dir, int px) {
     size_t got = fread(buf, sizeof(uint16_t), want, f);
     fclose(f);
     if (got != want) { free(buf); return NULL; }
+    touch_used(p);
     return buf;
 }
 
@@ -577,7 +740,22 @@ uint16_t *cover_load_fresh(const char *jpeg_path, const char *cache_key, int px)
  * one across both halves would need extra bookkeeping to stop the shared
  * error handler from re-destroying/re-closing whichever half had already
  * finished cleanly by the time the other one failed. */
-int cover_downscale_max(const char *jpeg_path, int max_dim) {
+/* dst_path NULL shrinks jpeg_path in place (write-then-rename over the top of
+ * it); otherwise the shrunk copy is written to dst_path and the source is left
+ * exactly as it was.
+ *
+ * The second form exists because the caller's alternative was far worse:
+ * cover_load_capped() used to copy a *full-size* cover.jpg byte-for-byte into
+ * /tmp purely so it had something of its own to shrink in place -- and /tmp
+ * here is tmpfs, so that copy is RAM, on a 57 MB device with a documented OOM
+ * history (docs/06) and a 27.9 MB /tmp to fit it in. An oversized original
+ * could therefore cost several megabytes of RAM before a single pixel was
+ * decoded. Decoding straight to the destination skips that entirely: the only
+ * thing that ever lands in /tmp is the already-shrunk result.
+ *
+ * Returns 1 if an output was written, 0 if the source was already within
+ * max_dim (nothing written, dst_path untouched), -1 on error. */
+static int downscale_impl(const char *jpeg_path, const char *dst_path, int max_dim) {
     if (max_dim <= 0) return -1;
     if (!load_lib()) return -1;
 
@@ -729,8 +907,25 @@ int cover_downscale_max(const char *jpeg_path, int max_dim) {
     /* ---- encode outbuf as a fresh baseline JPEG, write-then-rename ---- */
     if (!load_lib_compress()) { free(outbuf); return -1; }
 
+    /* In place: via a sibling temp file so a failure or a kill part-way through
+     * cannot leave a truncated JPEG where a good one was. Writing to a
+     * caller-supplied destination needs none of that -- it is that caller's own
+     * scratch path, nothing else reads it, and a -1 return tells them not to
+     * use it.
+     *
+     * The thread id in the temp name is not decoration. Once this runs on art
+     * in the user's own album folder, two art workers can be shrinking two
+     * covers in the same directory at once -- or, on a track change, the same
+     * cover twice -- and a single shared temp name would have them writing one
+     * file while the other renamed it away. That is exactly the shared-scratch
+     * collision that produced "art correct down to some horizontal line and
+     * flat grey below it" (see cover_load_capped()'s own comment), except this
+     * time the casualty would be a file of the user's rather than a scratch
+     * copy. One temp path per thread cannot collide. */
     char tmp_path[600];
-    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp-shrink", jpeg_path);
+    if (dst_path) snprintf(tmp_path, sizeof(tmp_path), "%s", dst_path);
+    else snprintf(tmp_path, sizeof(tmp_path), "%s.shrink%ld.tmp",
+                  jpeg_path, (long)syscall(SYS_gettid));
     FILE *out_f = fopen(tmp_path, "wb");
     if (!out_f) { free(outbuf); return -1; }
 
@@ -767,8 +962,18 @@ int cover_downscale_max(const char *jpeg_path, int max_dim) {
     fclose(out_f);
     free(outbuf);
 
-    if (rename(tmp_path, jpeg_path) != 0) { unlink(tmp_path); return -1; }
-    return 0;
+    if (!dst_path && rename(tmp_path, jpeg_path) != 0) { unlink(tmp_path); return -1; }
+    return 1;
+}
+
+int cover_downscale_max(const char *jpeg_path, int max_dim) {
+    int rc = downscale_impl(jpeg_path, NULL, max_dim);
+    return rc < 0 ? -1 : 0;   /* no caller distinguishes "wrote" from "no-op" */
+}
+
+int cover_downscale_to(const char *src_path, const char *dst_path, int max_dim) {
+    if (!src_path || !dst_path) return -1;
+    return downscale_impl(src_path, dst_path, max_dim);
 }
 
 /* ---- PNG -> JPEG: just enough PNG to handle a station/album logo -------- */

@@ -10,6 +10,8 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
+#include <ctype.h>
 #include <time.h>
 #include <stdlib.h>
 #include <dirent.h>
@@ -329,11 +331,136 @@ int bt_scan_devices(bt_found_dev_t *out, int max) {
             if (*name == ' ') name++;
             memcpy(out[n].mac, mac, 17); out[n].mac[17] = '\0';
             snprintf(out[n].name, sizeof(out[n].name), "%s", name);
+            /* Cleared, not left alone: the caller's array is reused across
+             * refreshes, so a reading from a previous scan would otherwise
+             * stick to whatever device now lands in this slot. */
+            out[n].rssi = 0;
             n++;
         }
         line = nl ? nl + 1 : NULL;
     }
     return n;
+}
+
+/* bluez publishes RSSI as a property on each device object, not through
+ * `bluetoothctl devices` (which prints only "Device <mac> <name>"), so it has
+ * to come from D-Bus. GetManagedObjects returns every device in one reply --
+ * ~110KB of text with a crowded scan running, but measured on hardware at
+ * ~0.08s against ~0.25s for the `bluetoothctl devices` call that already runs
+ * on this same refresh, because dbus-send is a single round trip where
+ * bluetoothctl starts a whole interactive client. Streamed line by line rather
+ * than slurped into a buffer, since that reply is far too big for the
+ * fixed-size run_cmd() arrays used elsewhere here.
+ *
+ * The reply nests properties under each object path, e.g.
+ *
+ *     object path "/org/bluez/hci0/dev_40_ED_98_1D_2D_29"
+ *     ...
+ *                  string "RSSI"
+ *                  variant       int16 -83
+ *
+ * so the parse tracks the most recent object path and attaches the next RSSI
+ * value it sees to it -- order-independent within a device's property list,
+ * which matters because bluez does not promise any particular property
+ * order. */
+/* Last reading seen for each device, kept because bluez does not keep one:
+ * it publishes RSSI only while discovery is actually running and drops the
+ * property again when the scan stops. bt_scan_start() runs its scan for 8
+ * seconds, so without this the readings -- and the proximity ordering built on
+ * them -- would appear for one or two refreshes and then blank out to "--"
+ * moments later, which is worse than never showing them. A remembered reading
+ * is still the right answer to "how close is this device": it is the last time
+ * we actually heard from it. */
+#define BT_RSSI_CACHE_N 64
+static struct { char mac[18]; int rssi; } bt_rssi_cache[BT_RSSI_CACHE_N];
+static int bt_rssi_cache_n;
+
+static void bt_rssi_remember(const char *mac, int rssi) {
+    for (int i = 0; i < bt_rssi_cache_n; i++)
+        if (!strcasecmp(bt_rssi_cache[i].mac, mac)) { bt_rssi_cache[i].rssi = rssi; return; }
+    if (bt_rssi_cache_n >= BT_RSSI_CACHE_N) return;   /* full: this one just goes uncached */
+    snprintf(bt_rssi_cache[bt_rssi_cache_n].mac, sizeof(bt_rssi_cache[0].mac), "%s", mac);
+    bt_rssi_cache[bt_rssi_cache_n].rssi = rssi;
+    bt_rssi_cache_n++;
+}
+
+static int bt_rssi_recall(const char *mac) {
+    for (int i = 0; i < bt_rssi_cache_n; i++)
+        if (!strcasecmp(bt_rssi_cache[i].mac, mac)) return bt_rssi_cache[i].rssi;
+    return 0;
+}
+
+void bt_fill_details(bt_found_dev_t *devs, int n) {
+    if (n <= 0) return;
+    FILE *p = popen("dbus-send --system --print-reply --dest=org.bluez / "
+                    "org.freedesktop.DBus.ObjectManager.GetManagedObjects 2>/dev/null", "r");
+    if (!p) {
+        for (int i = 0; i < n; i++) {
+            devs[i].rssi = bt_rssi_recall(devs[i].mac);
+            devs[i].paired = bt_is_paired(devs[i].mac);
+        }
+        return;
+    }
+    char line[512];
+    char mac[18] = "";
+    int want_value = 0;            /* 0 none, 1 expecting RSSI, 2 expecting Paired */
+    int saw_paired_property = 0;
+    for (int i = 0; i < n; i++) devs[i].paired = 0;
+    while (fgets(line, sizeof(line), p)) {
+        const char *dev = strstr(line, "/org/bluez/");
+        if (dev) {
+            /* ".../dev_XX_XX_XX_XX_XX_XX" -> "XX:XX:XX:XX:XX:XX". Anything
+             * else under /org/bluez (the adapter itself, a service, a
+             * characteristic) simply has no dev_ segment ending the path and
+             * is skipped. */
+            const char *d = strstr(dev, "dev_");
+            mac[0] = '\0';
+            if (d && strlen(d) >= 4 + 17) {
+                d += 4;
+                int ok = 1;
+                for (int i = 0; i < 17; i++) {
+                    char c = d[i];
+                    if (i % 3 == 2) {
+                        if (c != '_') { ok = 0; break; }
+                        mac[i] = ':';
+                    } else {
+                        if (!isxdigit((unsigned char)c)) { ok = 0; break; }
+                        mac[i] = c;
+                    }
+                }
+                if (ok) mac[17] = '\0'; else mac[0] = '\0';
+            }
+            want_value = 0;
+            continue;
+        }
+        if (strstr(line, "\"RSSI\""))   { want_value = 1; continue; }
+        if (strstr(line, "\"Paired\"")) { want_value = 2; continue; }
+        if (want_value == 1) {
+            const char *v = strstr(line, "int16");
+            if (v) {
+                int rssi = atoi(v + 5);
+                if (mac[0] && rssi < 0) bt_rssi_remember(mac, rssi);
+            }
+            want_value = 0;
+        } else if (want_value == 2) {
+            if (mac[0] && strstr(line, "boolean true")) {
+                for (int i = 0; i < n; i++)
+                    if (!strcasecmp(devs[i].mac, mac)) { devs[i].paired = 1; break; }
+            }
+            saw_paired_property = 1;
+            want_value = 0;
+        }
+    }
+    pclose(p);
+    /* Applied from the cache rather than straight from the parse, so a device
+     * bluez reported a moment ago but has since dropped the property for keeps
+     * its last reading instead of reverting to unknown. */
+    for (int i = 0; i < n; i++) devs[i].rssi = bt_rssi_recall(devs[i].mac);
+    /* Only if bluez said nothing at all -- a missing dbus-send, say. Its answer
+     * is authoritative when there is one, and the on-disk guess it falls back
+     * to is exactly what this replaced. */
+    if (!saw_paired_property)
+        for (int i = 0; i < n; i++) devs[i].paired = bt_is_paired(devs[i].mac);
 }
 
 /* pair, then trust (so it reconnects on its own next time without asking
@@ -362,13 +489,65 @@ int bt_scan_devices(bt_found_dev_t *out, int max) {
  * "quit" pipe already relies on exactly this and works), which is what
  * actually ends the session; explicit "quit" added for clarity, but the
  * EOF is what was really doing the job all along. */
+/* R-reconnect: this used to be pair+trust+connect, one shot, no retry --
+ * fine when bluez links on the first try, but bt_init's own boot-time
+ * reconnect (see /usr/bin/bt_init's BT_LASTUSED section) exists precisely
+ * because a plain `connect` often doesn't: it can hand back an LE-only
+ * link with no audio profile at all (observed live: "< LE ..." with no
+ * bluealsa PCM), or just time out, and nothing here noticed or retried.
+ * Reported live: switching to any paired device OTHER than whichever one
+ * bt_init's boot script last reconnected got no such retry budget, so it
+ * was hostage to a single attempt succeeding outright -- the boot path's
+ * own reliability came entirely from the retry loop, not from anything
+ * about being at boot. Ported that same loop here: ConnectProfile for the
+ * A2DP Sink UUID specifically (0000110b-..., asks bluez for audio rather
+ * than letting it pick and possibly hand back LE), a plain `connect`
+ * fallback, and an actual bluealsa-cli A2DP-PCM check for success rather
+ * than trusting hcitool con's mere presence of a link. Same backoff
+ * schedule bt_init uses, since that is what live testing showed this
+ * chip/stack combination actually needs.
+ *
+ * Backgrounded, same as before -- a real link can take tens of seconds.
+ * Result written to /usr/data/bt_pair_status ("<mac> ok" or "<mac>
+ * failed") once the loop is done either way, so the Settings screen's tap
+ * handler can poll bt_pair_result() and clear its "Connecting..." row
+ * without the UI thread blocking on any of this. */
 void bt_pair(const char *mac) {
-    char cmd[256];
+    char cmd[1024];
     snprintf(cmd, sizeof(cmd),
-        "printf 'agent NoInputNoOutput\\ndefault-agent\\npair %s\\ntrust %s\\nconnect %s\\nquit\\n' | "
-        "bluetoothctl >/dev/null 2>&1 &",
-        mac, mac, mac);
+        "("
+        "_mac=%s; "
+        "printf 'agent NoInputNoOutput\\ndefault-agent\\npair '$_mac'\\ntrust '$_mac'\\nquit\\n' | bluetoothctl >/dev/null 2>&1; "
+        "_path=/org/bluez/hci0/dev_$(echo $_mac | tr ':' '_'); "
+        "_pcm_up() { bluealsa-cli list-pcms 2>/dev/null | grep -qi \"$(echo $_mac | tr ':' '_').*a2dp\"; }; "
+        "_ok=0; "
+        "for _gap in 1 2 3 5 5 5 10 10 10 10; do "
+        "_pcm_up && { _ok=1; break; }; "
+        "dbus-send --system --reply-timeout=8000 --dest=org.bluez \"$_path\" org.bluez.Device1.ConnectProfile string:0000110b-0000-1000-8000-00805f9b34fb >/dev/null 2>&1; "
+        "_pcm_up && { _ok=1; break; }; "
+        "printf 'agent NoInputNoOutput\\ndefault-agent\\nconnect '$_mac'\\nquit\\n' | bluetoothctl >/dev/null 2>&1; "
+        "_pcm_up && { _ok=1; break; }; "
+        "sleep $_gap; "
+        "done; "
+        "echo \"$_mac $([ $_ok = 1 ] && echo ok || echo failed)\" > /usr/data/bt_pair_status"
+        ") >/dev/null 2>&1 &",
+        mac);
     if (system(cmd) == -1) return;
+}
+
+int bt_pair_result(const char *mac) {
+    FILE *f = fopen("/usr/data/bt_pair_status", "r");
+    if (!f) return 0;
+    char line[64] = "";
+    char *got = fgets(line, sizeof(line), f);
+    fclose(f);
+    if (!got) return 0;
+    char rmac[24] = "", rstate[16] = "";
+    if (sscanf(line, "%23s %15s", rmac, rstate) != 2) return 0;
+    if (strcmp(rmac, mac) != 0) return 0;
+    if (!strcmp(rstate, "ok")) return 1;
+    if (!strcmp(rstate, "failed")) return 2;
+    return 0;
 }
 
 /* ---- Wi-Fi scanning -------------------------------------------------------

@@ -143,7 +143,13 @@ static void id3_all(FILE *f, int *track, int *disc) {
         if (fread(fh, 1, 10, f) != 10) return;
         if (fh[0] == 0) return;                    /* padding */
         uint32_t fsize = (ver >= 4) ? syncsafe(fh + 4) : rd32be(fh + 4);
-        if (fsize == 0 || fsize > (1 << 16)) return;
+        /* A frame body that runs past the end of the tag is a corrupt size and
+         * there is no safe way to keep walking, so that still gives up. A
+         * merely *large* frame does not: this used to bail on anything over
+         * 64 KB, which is almost every APIC, so an MP3 whose embedded art
+         * happens to sit before its text frames lost its track and disc
+         * numbers entirely. The skip below handles any size. */
+        if (fsize == 0 || fsize > tag_size - pos - 10) return;
         int *out = track && *track < 0 && !memcmp(fh, "TRCK", 4) ? track
                  : disc  && *disc  < 0 && !memcmp(fh, "TPOS", 4) ? disc : NULL;
         if (out) {
@@ -152,6 +158,13 @@ static void id3_all(FILE *f, int *track, int *disc) {
             if (fread(v, 1, want, f) != want) return;
             v[want] = '\0';
             *out = parse_num(v + 1, (int)want - 1);   /* first byte is text encoding */
+            /* pos advances by the whole frame, so the file position has to as
+             * well -- reading only the first `want` bytes and then trusting
+             * pos would desynchronise the walk for the rest of the tag.
+             * Unreachable while the 64 KB bail above existed and TRCK/TPOS are
+             * short in practice, which is exactly why it needs to be explicit
+             * now that any frame size can get here. */
+            if (want < fsize && fseek(f, (long)(fsize - want), SEEK_CUR)) return;
         } else if (fseek(f, (long)fsize, SEEK_CUR)) {
             return;
         }
@@ -345,7 +358,11 @@ static void id3_meta(FILE *f, char *artist, unsigned an, char *album, unsigned b
         if (fread(fh, 1, 10, f) != 10) return;
         if (fh[0] == 0) return;
         uint32_t fsize = (ver >= 4) ? syncsafe(fh + 4) : rd32be(fh + 4);
-        if (fsize == 0 || fsize > (1 << 16)) return;
+        /* See id3_all()'s own comment: only a size that runs past the end of
+         * the tag is unrecoverable. Bailing on anything over 64 KB meant an
+         * APIC before the text frames cost this file its artist, album, album
+         * artist and genre -- the fseek() below skips a body of any size. */
+        if (fsize == 0 || fsize > tag_size - pos - 10) return;
         char *out = NULL; unsigned outn = 0;
         if (artist && !artist[0] && !memcmp(fh, "TPE1", 4)) { out = artist; outn = an; }
         else if (album && !album[0] && !memcmp(fh, "TALB", 4)) { out = album; outn = bn; }

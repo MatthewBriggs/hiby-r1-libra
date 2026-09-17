@@ -32,6 +32,20 @@ uint16_t *cover_cached(const char *cache_key, const char *dir, int px);
  * failure -- the original file is left untouched either way. */
 int cover_downscale_max(const char *jpeg_path, int max_dim);
 
+/* Same shrink, but writing the result to dst_path and leaving src_path exactly
+ * as it was -- for art the app does not own, i.e. a cover.jpg sitting in the
+ * user's own album folder.
+ *
+ * Returns 1 if dst_path was written, 0 if src_path was already within max_dim
+ * (dst_path is NOT written in that case -- read the source directly, it needs
+ * no shrinking), -1 on failure (dst_path unusable).
+ *
+ * The 0 return is the point of the split: the caller it replaced copied every
+ * local cover into /tmp whether it needed shrinking or not, and /tmp is tmpfs,
+ * so the common case of an already-sensible cover was spending RAM to produce
+ * a byte-identical duplicate of a file it could simply have read. */
+int cover_downscale_to(const char *src_path, const char *dst_path, int max_dim);
+
 /* Converts a PNG (8-bit RGB or RGBA, non-interlaced only) to a baseline
  * JPEG at jpeg_path, write-then-rename -- png_path and jpeg_path may be the
  * same string, converting in place. For a network-fetched image whose

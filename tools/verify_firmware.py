@@ -35,6 +35,25 @@ MODULE_INIT_SCRIPT = "module_driver/driver_default_init_script.sh"
 ADB_INIT_SCRIPT = "etc/init.d/adb/S440adb"
 BRCMFMAC_FILES = ("lib/firmware/brcm/brcmfmac43430-sdio.bin",
                   "lib/firmware/brcm/brcmfmac43430-sdio.txt")
+# What --brcmfmac-switch itself produces, beyond the firmware blobs above: the
+# mainline driver and its loader scripts in, the cywdhd blob out, bt_init moved
+# to S12 (after the module script brings up the rail and the LPO), and the two
+# wifi scripts rewritten to rmmod/insmod the driver.
+#
+# Without these the custom-kernel build could not be checked with --against at
+# all -- every one of them read as an unexplained difference, so 0.52/0.52b
+# verified that image by hand checklist instead. That is the exact check a
+# machine should be doing: the 0.51.2 image that shipped and would not boot was
+# a rootfs assembled outside this pipeline, which a base-diff would have caught
+# immediately.
+BRCMFMAC_SWITCH_ADDED = ("module_driver/brcmfmac.ko", "module_driver/brcmutil.ko",
+                         "module_driver/r1_wlan_up.ko", "module_driver/brcmfmac.sh",
+                         "module_driver/wifi_late.sh",
+                         "etc/init.d/S12_bt_init", "etc/init.d/S91wifi")
+BRCMFMAC_SWITCH_REMOVED = ("module_driver/cywdhd.ko", "module_driver/cywdhd.sh")
+WIFI_SCRIPTS = ("usr/bin/wifi_on.sh", "usr/bin/wifi_off.sh",
+                # soc_msc gets wifi_reg_on=PB03 from the same switch.
+                "module_driver/soc_msc.sh")
 # Mirrors patch_firmware.py's own UNUSED_FONTS/UNUSED_BINARIES/LITEGUI_DIR --
 # strip_unused_resources() deletes these unconditionally on any standalone
 # build (not gated on --brcmfmac-switch), so a --against diff run against a
@@ -421,6 +440,7 @@ def main():
                             # when this allowlist was last updated.
                             "module_driver/soc_utils.sh"}
                 expected |= set(SET_FUNCTIONS_FILES)
+                expected |= set(WIFI_SCRIPTS)   # --brcmfmac-switch rewrites both
                 # kernel_build_id: --kernel-build-id re-stamps this file, which
                 # shows up as "changed" (not "added") whenever the base image
                 # already carried a stamp from an earlier pass -- both are
@@ -439,6 +459,7 @@ def main():
                 expected_added = {"etc/init.d/S90adb", "usr/resource/kernel_build_id",
                                   "etc/init.d/S22_bt_init", EMBED_BINARY}
                 expected_added |= set(BRCMFMAC_FILES)
+                expected_added |= set(BRCMFMAC_SWITCH_ADDED)
                 # start_patchram_earlier() runs before hasten_bt_init() and
                 # renames whichever of S80_bt_init/S22_bt_init it finds
                 # straight to S11b_bt_init (plus S21mount_ubifs ->
@@ -454,6 +475,7 @@ def main():
                 # S21mount_ubifs on its way to S11amount_ubifs.
                 expected_removed = {"etc/init.d/S80_bt_init", "etc/init.d/S21mount_ubifs"}
                 expected_removed |= set(STRIPPED_FONTS_AND_BINARIES)
+                expected_removed |= set(BRCMFMAC_SWITCH_REMOVED)
 
                 def removed_ok(path):
                     return path in expected_removed or path.startswith(LITEGUI_DIR)

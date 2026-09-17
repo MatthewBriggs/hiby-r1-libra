@@ -250,8 +250,21 @@ static int scan_one(sqlite3 *widb, const char *real, const struct stat *st) {
  * card's root, since the exclusion exists to avoid a category mismatch
  * (an episode or chapter showing up as a plain "track"), not to describe
  * one specific folder layout. */
-static void scan_dir(sqlite3 *widb, const char *dir, int *batch) {
+/* Depth cap. Each level of this walk holds a LIB_PATH_LEN buffer plus a struct
+ * stat on the stack, and it runs on a background thread rather than the main
+ * one, so an unbounded descent is a stack overflow rather than an error. The
+ * card is exFAT (mounted symlink=0, so a symlink loop -- the usual way this
+ * goes wrong -- cannot exist there), but nothing about this walk should depend
+ * on which filesystem it happens to be pointed at. 40 is far past any real
+ * music layout and still nowhere near the stack. */
+#define SCAN_MAX_DEPTH 40
+
+static void scan_dir(sqlite3 *widb, const char *dir, int *batch, int depth) {
     if (g_usb_paused) return;
+    if (depth > SCAN_MAX_DEPTH) {
+        slog("[scanner] depth cap reached, not descending: %s\n", dir);
+        return;
+    }
     DIR *d = opendir(dir);
     if (!d) return;
     struct dirent *e;
@@ -261,13 +274,21 @@ static void scan_dir(sqlite3 *widb, const char *dir, int *batch) {
         char full[LIB_PATH_LEN];
         snprintf(full, sizeof(full), "%s/%s", dir, e->d_name);
 
+        /* lstat, so a symlink is identified as one rather than silently
+         * resolved: a link back to an ancestor would otherwise be walked
+         * forever. A symlinked *file* is still worth indexing, so that case
+         * resolves deliberately; a symlinked directory is skipped. */
         struct stat st;
-        if (stat(full, &st) != 0) continue;
+        if (lstat(full, &st) != 0) continue;
+        if (S_ISLNK(st.st_mode)) {
+            if (stat(full, &st) != 0) continue;     /* dangling */
+            if (S_ISDIR(st.st_mode)) continue;
+        }
 
         if (S_ISDIR(st.st_mode)) {
             if (!strcasecmp(e->d_name, "Podcasts") || !strcasecmp(e->d_name, "Audiobooks"))
                 continue;
-            scan_dir(widb, full, batch);
+            scan_dir(widb, full, batch, depth + 1);
             continue;
         }
         if (!S_ISREG(st.st_mode) || !is_audio_ext(e->d_name)) continue;
@@ -324,7 +345,7 @@ static void *scan_worker(void *arg) {
          * own Podcasts/Audiobooks exclusion already keeps those two
          * subsystems' own files out of this table regardless of where they
          * sit. */
-        scan_dir(widb, SD_ROOT, &batch);
+        scan_dir(widb, SD_ROOT, &batch, 0);
         sqlite3_exec(widb, "commit", NULL, NULL, NULL);
         g_scan_running = 0;
         slog("[scanner] scan pass done: %d files seen, %d (re)written\n", g_scanned, g_written);
