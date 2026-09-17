@@ -134,15 +134,30 @@ def stamp_version_file(text, rom_version):
 # being accepted and then ignored — the WH-1000XM4 simply never sent the
 # IPHONEACCEV that carries the level. Answering "iPhone" produced it
 # immediately.
+#
+# --a2dp-force-audio-cd: negotiate 44.1 kHz rather than bluealsa's default of
+# 48 kHz whenever the headset offers both. Classic aptX has no bitrate knob --
+# it is a fixed 4:1 of 16-bit stereo, so the rate *is* the bitrate: measured
+# over the air (host ACL TX, which only advances as the controller's 8 buffers
+# drain) at 389-416 kbps on a 48 kHz link and 374-377 kbps on 44.1 kHz. That
+# ~7% of airtime is margin in a crowded 2.4 GHz area, where hi-res tracks were
+# reported breaking up outdoors and fine at home -- the controller's automatic
+# flush timeout is infinite, so a link that falls behind delivers late rather
+# than dropping, and the headset's buffer runs dry. It also stops the CD-rate
+# majority of the library being upsampled 44.1 -> 48 by ALSA's filterless
+# linear converter on every play; 48 kHz sources now take that converter in the
+# other direction instead.
 ANCHOR_BT = ('/usr/bin/bluealsa -p a2dp-source '
              '--a2dp-volume --sbc-quality=xq &')
 INSERT_BT = ('/usr/bin/bluealsa -p a2dp-source -p hfp-ag '
-             '--a2dp-volume --sbc-quality=xq --xapl-resp-name=iPhone &')
+             '--a2dp-volume --sbc-quality=xq --a2dp-force-audio-cd '
+             '--xapl-resp-name=iPhone &')
 
 
 ANCHOR_BT_VANILLA = '/usr/bin/bluealsa -p a2dp-source --a2dp-volume &'
 INSERT_BT_VANILLA = ('/usr/bin/bluealsa -p a2dp-source -p hfp-ag '
-                     '--a2dp-volume --xapl-resp-name=iPhone &')
+                     '--a2dp-volume --a2dp-force-audio-cd '
+                     '--xapl-resp-name=iPhone &')
 
 
 def patch_bt_init(text):
