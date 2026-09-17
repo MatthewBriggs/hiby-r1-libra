@@ -132,6 +132,13 @@ typedef struct {
     int        aac_frames, aac_taken;   /* into the shared PCM buffer below, whichever decoder filled it */
     vorbis_dec_t vorbis;
     opus_dec_t   opus;
+    /* Where M4A decodes land. NULL means the shared g_aacpcm, which is only
+     * safe for the one playback decoder: the waveform scan (audio_envelope())
+     * runs a second decoder on its own thread at the same time, and two AAC or
+     * ALAC decodes writing one buffer would put its samples into the track
+     * that is actually playing. Set through dec_open_buf(), never after an
+     * open -- see its comment. */
+    short       *pcm;
 } dec_t;
 
 /* Only lossless formats above 16 bits have anything worth dithering when
@@ -612,9 +619,10 @@ static int m4a_prime(dec_t *d) {
     for (int i = 0; i < 8; i++) {
         int len = mp4_next(&d->mp4, au, sizeof(au));
         if (len <= 0) return -1;
+        short *pcm = d->pcm ? d->pcm : g_aacpcm;
         int fr = d->alac
-               ? alac_decode(d->alac, au, (unsigned)len, g_aacpcm, DEC_MAX_FRAMES)
-               : aac_decode(d->aac, au, (unsigned)len, g_aacpcm, DEC_MAX_FRAMES);
+               ? alac_decode(d->alac, au, (unsigned)len, pcm, DEC_MAX_FRAMES)
+               : aac_decode(d->aac, au, (unsigned)len, pcm, DEC_MAX_FRAMES);
         if (fr < 0) return -1;
         if (fr > 0) { d->aac_frames = fr; d->aac_taken = 0; return 0; }
     }
@@ -683,8 +691,12 @@ static int dec_open_m4a_probe(dec_t *d, const char *path) {
     return 0;
 }
 
-static int dec_open(dec_t *d, const char *path) {
+/* pcm: see dec_t's own field. Taken here rather than set by the caller after
+ * the open, because an M4A open already decodes (m4a_prime()) and so would
+ * have written the shared buffer before the caller got a say. */
+static int dec_open_buf(dec_t *d, const char *path, short *pcm) {
     memset(d, 0, sizeof(*d));
+    d->pcm = pcm;
     switch (sniff(path)) {
         case DEC_FLAC:
             d->flac = drflac_open_file(path, NULL);
@@ -735,6 +747,8 @@ static int dec_open(dec_t *d, const char *path) {
             return -1;
     }
 }
+
+static int dec_open(dec_t *d, const char *path) { return dec_open_buf(d, path, NULL); }
 
 /* Only the lossless formats have more than 16 bits to give. MP3 and AAC are
  * decoded to 16 either way, so they never take this path. */
@@ -825,9 +839,10 @@ static uint64_t dec_read(dec_t *d, short *out, uint64_t want) {
                 unsigned char au[M4A_AU_MAX];
                 int len = mp4_next(&d->mp4, au, sizeof(au));
                 if (len <= 0) break;
+                short *pcm = d->pcm ? d->pcm : g_aacpcm;
                 int fr = d->alac
-                       ? alac_decode(d->alac, au, (unsigned)len, g_aacpcm, DEC_MAX_FRAMES)
-                       : aac_decode(d->aac, au, (unsigned)len, g_aacpcm, DEC_MAX_FRAMES);
+                       ? alac_decode(d->alac, au, (unsigned)len, pcm, DEC_MAX_FRAMES)
+                       : aac_decode(d->aac, au, (unsigned)len, pcm, DEC_MAX_FRAMES);
                 if (fr < 0) break;
                 if (fr == 0) continue;          /* wants more input (AAC only) */
                 d->aac_frames = fr;
@@ -836,7 +851,7 @@ static uint64_t dec_read(dec_t *d, short *out, uint64_t want) {
             int avail = d->aac_frames - d->aac_taken;
             uint64_t take = (uint64_t)avail < (want - done) ? (uint64_t)avail : (want - done);
             memcpy(out + done * (size_t)d->channels,
-                   g_aacpcm + (size_t)d->aac_taken * (size_t)d->channels,
+                   (d->pcm ? d->pcm : g_aacpcm) + (size_t)d->aac_taken * (size_t)d->channels,
                    (size_t)take * (size_t)d->channels * sizeof(short));
             d->aac_taken += (int)take;
             done += take;
@@ -1335,18 +1350,143 @@ static int   g_advance;             /* bumped each time the worker rolls on */
  * so a skip reuses the gapless handover instead of closing the device. */
 static int   g_skip_now;
 static int   g_speed = 1000;        /* permille, WSOLA time-stretch; 1000 = bypass */
-/* R29: raw abs-sample peak of the most recent chunk actually written to the
- * output, computed in the decode worker right after the volume gain that
- * already runs there and published under g_lock in the same critical
- * section as g_pos_ms just below it -- no extra locking cost, since that
- * lock is already taken there every chunk regardless. Deliberately not
- * scaled to any fixed 0..N range: the two source paths (16-bit `short`,
- * hires `int32_t` shifted for whatever S24_LE/S32_LE the device opened)
- * have different natural magnitudes, so audio_current_peak() hands back
- * the raw value and callers building a waveform normalize it against their
- * own observed max over a whole track -- scale-invariant, and it doesn't
- * need to know which path produced it. */
-static int32_t g_last_peak;
+/* ---- waveform envelope --------------------------------------------------- */
+/* The loudness shape of a whole track, for waveform.c: one RMS level per
+ * column, from a full decode of the file on a private decoder.
+ *
+ * RMS, not peak. Anything mastered in the last few decades reaches within a
+ * hair of full scale somewhere inside nearly every slice of a few dozen, so a
+ * peak per column draws a flat rectangle; mean power is what actually varies
+ * across a track. And from the file, not from playback: R29 used to sample
+ * the chunk peak of whatever the output was playing, which only produced a
+ * shape on the second play, lost it to any seek or skip, and folded the
+ * volume setting into it.
+ *
+ * The track's length is not needed up front, which matters because MP3
+ * deliberately does not know it (see dec_open_buf()). Power is summed into
+ * fixed-length slices; when the table fills, neighbours are merged pairwise
+ * and the slice length doubles. Any length of track ends between ENV_SLICES/2
+ * and ENV_SLICES slices -- far finer than the columns it is binned into -- in
+ * constant memory, and with a compare per run of frames rather than a 64-bit
+ * divide per frame, which this CPU does not have in hardware.
+ *
+ * Runs alongside playback: dec_open_buf() gives this decoder its own M4A
+ * buffer (see dec_t's pcm field), and nothing else here touches shared state
+ * for a local file. keep_going is asked once per chunk, so abandoning a track
+ * costs at most one chunk of decode.
+ *
+ * And it is paced while something is playing. SCHED_IDLE (waveform.c) keeps
+ * the worker off the CPU, but says nothing about the card: measured on device,
+ * scanning an 886 MB 24/192 WAV while streaming to a headset pulled Bluetooth
+ * throughput from 391 kbps down to 231 and cost one underrun, because reading
+ * a file that size flat out starves playback's own reads. This kernel's mmc
+ * queue uses the deadline scheduler, which ignores I/O priority, so there is
+ * nothing to ask politely with -- the fix is to not read flat out. A sleep of
+ * a sixth of each chunk's own duration holds the scan to roughly six times
+ * real time, which still finishes a track in well under a minute and leaves
+ * the card free between bursts. Nothing playing, nothing to protect: the scan
+ * runs at full speed. Returns 1 with level[] filled, 0 if
+ * there is nothing to measure (unreadable, unsupported, empty), -1 if
+ * keep_going said stop. */
+#define ENV_SLICES 1024
+#define ENV_CHUNK  4096
+#define ENV_MAX_CH 8
+
+static uint32_t isqrt64(uint64_t v) {
+    uint64_t r = 0, bit = (uint64_t)1 << 62;
+    while (bit > v) bit >>= 2;
+    while (bit) {
+        if (v >= r + bit) { v -= r + bit; r = (r >> 1) + bit; }
+        else              { r >>= 1; }
+        bit >>= 2;
+    }
+    return (uint32_t)r;
+}
+
+int audio_envelope(const char *path, uint32_t *level, int n,
+                   int (*keep_going)(void *), void *ctx) {
+    if (!path || !path[0] || !level || n <= 0) return 0;
+
+    short    *pcm = malloc((size_t)DEC_MAX_FRAMES * 8 * sizeof(short));
+    short    *buf = malloc((size_t)ENV_CHUNK * ENV_MAX_CH * sizeof(short));
+    uint64_t *pw  = calloc(ENV_SLICES, sizeof(uint64_t));
+    uint32_t *cnt = calloc(ENV_SLICES, sizeof(uint32_t));
+    int rc = 0;
+    dec_t d;
+    int opened = 0;
+    if (!pcm || !buf || !pw || !cnt) goto out;
+    if (dec_open_buf(&d, path, pcm) != 0) goto out;
+    opened = 1;
+    if (d.channels < 1 || d.channels > ENV_MAX_CH || d.rate == 0) goto out;
+
+    uint32_t ch = (uint32_t)d.channels;
+    uint32_t slice_len = d.rate / 20;          /* 50 ms to start with */
+    if (slice_len == 0) slice_len = 1;
+    int cur = 0;
+    uint32_t in_slice = 0;
+    rc = 1;
+    for (;;) {
+        if (keep_going && !keep_going(ctx)) { rc = -1; break; }
+        uint64_t got = dec_read(&d, buf, ENV_CHUNK);
+        if (got == 0) break;
+        pthread_mutex_lock(&g_lock);
+        int busy = g_active && !g_paused;
+        pthread_mutex_unlock(&g_lock);
+        if (busy) usleep((useconds_t)(got * 1000000ull / d.rate / 6));
+        const short *q = buf;
+        uint32_t left = (uint32_t)got;
+        while (left) {
+            uint32_t take = slice_len - in_slice;
+            if (take > left) take = left;
+            uint32_t samples = take * ch;
+            uint64_t sum = 0;
+            /* A 16-bit sample squares to at most 2^30, so the square fits
+             * 32 bits; only the running sum needs 64. */
+            for (uint32_t i = 0; i < samples; i++) {
+                int32_t v = q[i];
+                sum += (uint32_t)(v * v);
+            }
+            q += samples;
+            pw[cur] += sum;
+            cnt[cur] += samples;
+            in_slice += take;
+            left -= take;
+            if (in_slice == slice_len) {
+                in_slice = 0;
+                if (++cur == ENV_SLICES) {
+                    for (int i = 0; i < ENV_SLICES / 2; i++) {
+                        pw[i]  = pw[2 * i]  + pw[2 * i + 1];
+                        cnt[i] = cnt[2 * i] + cnt[2 * i + 1];
+                    }
+                    memset(pw  + ENV_SLICES / 2, 0, (ENV_SLICES / 2) * sizeof(*pw));
+                    memset(cnt + ENV_SLICES / 2, 0, (ENV_SLICES / 2) * sizeof(*cnt));
+                    cur = ENV_SLICES / 2;
+                    slice_len *= 2;
+                }
+            }
+        }
+    }
+    if (rc != 1) goto out;
+
+    int slices = cur + (in_slice ? 1 : 0);
+    if (slices == 0) { rc = 0; goto out; }
+    for (int b = 0; b < n; b++) {
+        /* More slices than columns (every real track): the column is the
+         * mean power of the slices it covers. Fewer (a clip of a few
+         * seconds): each column repeats the slice under it. */
+        int s0 = (int)((int64_t)b * slices / n);
+        int s1 = (int)((int64_t)(b + 1) * slices / n);
+        if (s1 <= s0) s1 = s0 + 1;
+        uint64_t p = 0, c = 0;
+        for (int i = s0; i < s1 && i < slices; i++) { p += pw[i]; c += cnt[i]; }
+        level[b] = c ? isqrt64(p / c) : 0;
+    }
+
+out:
+    if (opened) dec_close(&d);
+    free(pcm); free(buf); free(pw); free(cnt);
+    return rc;
+}
 
 /* ---- output routing ------------------------------------------------------ */
 /* An A2DP sink shows up as a bluealsa PCM ending in /sink. */
@@ -2842,29 +2982,6 @@ static void *worker(void *arg) {
             for (size_t i = 0; i < n; i++) buf[i] = (short)((buf[i] * gain) >> 8);
         }
 
-        /* R29: cheap abs-max scan for the waveform seek bar, over exactly
-         * what's about to be written (post-gain, so a quiet volume reads as
-         * a quiet waveform too -- callers only compare this against other
-         * samples from the same track's own capture, so that's consistent
-         * within a track rather than wrong in any way that matters). Every
-         * sample, not a stride -- n tops out around CHUNK_FRAMES*channels,
-         * a few thousand plain comparisons, negligible next to the decode
-         * this loop already does every chunk. */
-        int32_t chunk_peak = 0;
-        if (hires) {
-            for (size_t i = 0; i < n; i++) {
-                int32_t v = buf32[i];
-                if (v < 0) v = -v;
-                if (v > chunk_peak) chunk_peak = v;
-            }
-        } else {
-            for (size_t i = 0; i < n; i++) {
-                int32_t v = buf[i];
-                if (v < 0) v = -v;
-                if (v > chunk_peak) chunk_peak = v;
-            }
-        }
-
         /* WSOLA changes what leaves the buffer from here on, not how much
          * content was decoded -- done and g_pos_ms below still count decoded
          * (content) frames, exactly as before this existed, so position and
@@ -2903,7 +3020,6 @@ static void *worker(void *arg) {
 
         done += got_src;
         pthread_mutex_lock(&g_lock);
-        g_last_peak = chunk_peak;
         g_pos_ms = (int)(done * 1000 / rate);
         pthread_mutex_unlock(&g_lock);
     }
@@ -3051,10 +3167,6 @@ void audio_toggle(void) {
 int audio_is_active(void) { pthread_mutex_lock(&g_lock); int v=g_active; pthread_mutex_unlock(&g_lock); return v; }
 int audio_is_paused(void) { pthread_mutex_lock(&g_lock); int v=g_paused; pthread_mutex_unlock(&g_lock); return v; }
 int audio_pos_ms(void)    { pthread_mutex_lock(&g_lock); int v=g_pos_ms; pthread_mutex_unlock(&g_lock); return v; }
-/* R29: see g_last_peak's own comment -- a raw abs-sample peak, scale
- * depends on which decode path produced it, meaningful only relative to
- * other reads taken during the same track's own capture. */
-int32_t audio_current_peak(void) { pthread_mutex_lock(&g_lock); int32_t v=g_last_peak; pthread_mutex_unlock(&g_lock); return v; }
 int audio_seek_pending_ms(void) { pthread_mutex_lock(&g_lock); int v=g_seek_to_ms; pthread_mutex_unlock(&g_lock); return v; }
 int audio_dur_ms(void)    { pthread_mutex_lock(&g_lock); int v=g_dur_ms; pthread_mutex_unlock(&g_lock); return v; }
 void audio_set_volume(int p){ if(p<0)p=0; if(p>100)p=100; pthread_mutex_lock(&g_lock); g_vol=p; pthread_mutex_unlock(&g_lock); }

@@ -23,5 +23,5 @@ zig cc -target mipsel-linux-gnueabihf.2.22 \
   -Wall -Wextra -Wno-unused-parameter \
   -O2 -s -fvisibility=hidden -fno-common -Ivendor \
   -DSQLITE_THREADSAFE=2 -DSQLITE_DEFAULT_MEMSTATUS=0 -DSQLITE_OMIT_LOAD_EXTENSION=1 -DSQLITE_OMIT_DEPRECATED=1 -DSQLITE_TEMP_STORE=2 \
-  -o library_standalone standalone_main.c music_hook.c library.c audiobook.c podcast.c lastfm.c spotify.c audio.c radio_buffer.c wsola.c eq.c eqprofile.c mseb.c recent.c cover.c art.c status.c radio.c playlist.c tags.c index.c scanner.c zlbm.c aac.c alac.c mp4.c ts.c hls.c ogg_io.c vorbis_dec.c opus_dec.c vendor/ogg/framing.c vendor/dr_impl.c vendor/miniz/miniz.c text.c vendor/sqlite3.c -lpthread -lm -ldl
+  -o library_standalone standalone_main.c music_hook.c library.c audiobook.c podcast.c lastfm.c spotify.c audio.c waveform.c radio_buffer.c wsola.c eq.c eqprofile.c mseb.c recent.c cover.c art.c status.c radio.c playlist.c tags.c index.c scanner.c zlbm.c aac.c alac.c mp4.c ts.c hls.c ogg_io.c vorbis_dec.c opus_dec.c vendor/ogg/framing.c vendor/dr_impl.c vendor/miniz/miniz.c text.c vendor/sqlite3.c -lpthread -lm -ldl
 ls -la library_standalone

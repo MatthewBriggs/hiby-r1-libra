@@ -172,16 +172,78 @@ static void stored_path(char *dst, size_t n, const char *real) {
  * else read its tags and container header once and upsert. Returns 1 if a
  * write happened, 0 if skipped -- same convention index.c's scan_one()
  * uses, for the same Settings-row progress readout. */
+/* What the folder layout says, when the file itself says nothing.
+ *
+ * A file with no tags at all used to be indexed as "Unknown Album" with no
+ * artist, which put every such track into one unnamed heap: 161 tracks from
+ * 41 different folders on this card, including two whole albums that were
+ * reported as missing from the library because that is exactly what it looks
+ * like from the outside. Nothing was wrong with the files -- they are WAV and
+ * Ogg rips carrying no tags whatsoever (checked on device: no RIFF LIST/INFO
+ * chunk, no Vorbis comment block), so there is nothing a better tag reader
+ * could have found.
+ *
+ * The layout knows anyway, because it is the same everywhere on this card:
+ * <artist>/<album>/<track>. So the containing folder names the album and its
+ * parent names the artist, which is what every other player does with an
+ * untagged library. A track loose in the card root has neither, and keeps
+ * R91's named bucket so it stays reachable rather than invisible. */
+static void folder_fallback(const char *real, char *album, size_t an,
+                            char *artist, size_t bn) {
+    const char *rel = real;
+    if (!strncmp(rel, SD_ROOT, strlen(SD_ROOT))) rel += strlen(SD_ROOT);
+    while (*rel == '/') rel++;
+
+    /* rel is what is left below the card root: [<artist>/]<album>/<track>,
+     * or just <track> for something loose in the root. */
+    const char *slash1 = strrchr(rel, '/');          /* before the filename */
+    if (!slash1) {
+        if (!album[0]) snprintf(album, an, "Unknown Album");
+        return;
+    }
+    const char *slash2 = NULL;                       /* before the album folder */
+    for (const char *q = slash1 - 1; q >= rel; q--)
+        if (*q == '/') { slash2 = q; break; }
+
+    if (!album[0]) {
+        const char *start = slash2 ? slash2 + 1 : rel;
+        size_t len = (size_t)(slash1 - start);
+        if (len == 0) snprintf(album, an, "Unknown Album");
+        else {
+            if (len >= an) len = an - 1;
+            memcpy(album, start, len);
+            album[len] = '\0';
+        }
+    }
+    if (!artist[0] && slash2) {
+        size_t alen = (size_t)(slash2 - rel);
+        if (alen > 0) {
+            if (alen >= bn) alen = bn - 1;
+            memcpy(artist, rel, alen);
+            artist[alen] = '\0';
+        }
+    }
+}
+
 static int scan_one(sqlite3 *widb, const char *real, const struct stat *st) {
     char path[LIB_PATH_LEN];
     stored_path(path, sizeof(path), real);
 
-    static const char *check_sql = "select mtime from MEDIA_TABLE where path = ?";
+    /* The album comes back too, not just the mtime: a row left by the stock
+     * firmware's own scanner carries no tags at all (its 161 such rows are
+     * what folder_fallback() exists for), and an unchanged mtime would
+     * otherwise mean this scanner never looked at the file again and never
+     * filled them in. A row that already has an album is left alone. */
+    static const char *check_sql = "select mtime, album from MEDIA_TABLE where path = ?";
     sqlite3_stmt *cst;
     if (sqlite3_prepare_v2(widb, check_sql, -1, &cst, NULL) == SQLITE_OK) {
         sqlite3_bind_text(cst, 1, path, -1, SQLITE_TRANSIENT);
-        int current = sqlite3_step(cst) == SQLITE_ROW &&
-                     (time_t)sqlite3_column_int64(cst, 0) == st->st_mtime;
+        int current = 0;
+        if (sqlite3_step(cst) == SQLITE_ROW &&
+            (time_t)sqlite3_column_int64(cst, 0) == st->st_mtime) {
+            const unsigned char *alb = sqlite3_column_text(cst, 1);
+            current = alb && alb[0];
+        }
         sqlite3_finalize(cst);
         if (current) return 0;
     }
@@ -198,7 +260,11 @@ static int scan_one(sqlite3 *widb, const char *real, const struct stat *st) {
      * nothing being there, which is exactly what happened. A named bucket
      * is reachable and self-explanatory the same way "no album" fallbacks
      * work in most other music apps. */
-    if (!album[0]) snprintf(album, sizeof(album), "Unknown Album");
+    folder_fallback(real, album, sizeof(album), artist, sizeof(artist));
+    /* Album artist follows the artist when the file did not name one, so an
+     * untagged album groups under the same name in "Album artists" as it
+     * does everywhere else rather than falling into the blank group. */
+    if (!album_artist[0]) snprintf(album_artist, sizeof(album_artist), "%s", artist);
     /* Title tag when the container states one (currently FLAC only -- see
      * tag_title()'s own comment); the filename otherwise, same fallback
      * library.c itself reaches for reading a track the index never saw. */

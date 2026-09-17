@@ -68,6 +68,7 @@ typedef struct {
 #include "audiobook.h"
 #include "podcast.h"
 #include "audio.h"
+#include "waveform.h"
 #include "eq.h"
 #include "eqprofile.h"
 #include "mseb.h"
@@ -1060,7 +1061,7 @@ static void derive_palette_from_bits(const uint16_t *bits, uint16_t *out_bg,
  * either here, live, the first time it's actually played, or ahead of time
  * by cover_prewarm_worker() for a recently-added album that was never
  * opened at all. Keyed on artist+album (a djb2 hash, same shape
- * wave_cache_path() already uses for a track path) since that's the
+ * cover.c's cache_path() uses) since that's the
  * granularity the whole feature themes at -- every track on an album
  * shares one palette, the same reasoning art_request()'s own R84 same-
  * album skip already established for the art bitmap itself.
@@ -1071,7 +1072,7 @@ static void derive_palette_from_bits(const uint16_t *bits, uint16_t *out_bg,
  * fix) still theming wrong, because the *palette* cached from the old,
  * corrupted decode had no way to know it was ever built from bad input.
  * Bumping PAL_CACHE_VERSION invalidates every existing entry the same way
- * WAVE_CACHE_VERSION already does for the waveform cache -- the right
+ * cover.c's CACHE_VERSION does for the cover cache -- the right
  * lever for exactly this "derive_palette_from_bits()'s own output for the
  * same input just changed" case, which a per-file mtime check (the cover
  * art itself didn't change; how it's read did) couldn't have caught
@@ -2292,8 +2293,15 @@ static int live_x, live_y;          /* where the finger is now, while it is down
 /* Quick settings, pulled down from the status strip. Brightness, Wi-Fi and
  * Bluetooth are wanted often enough that leaving the app to reach them is the
  * annoyance; everything else stays in the firmware's own settings. */
-#define QS_H       634   /* +QS_ROW_H over 562, for the new format/quality row (R83) */
 #define QS_ROW_H   72
+/* R-qsgrid: derived, not a literal any more -- Wi-Fi/Bluetooth, EQ/MSEB and
+ * Cover colours/USB now pair up two-to-a-row (see qs_col_x()'s own comment
+ * further down), with Format spanning both columns in its own row below the
+ * grid. Was a hand-maintained literal through R-qsicon (600) and R-qscover
+ * (672); tying it to STATUS_H + the brightness row's own known offset (96)
+ * + 4 rows (3 of grid, 1 of Format) means it can't drift out of sync with
+ * qs_codec_y() the way a hand-typed number already had once. */
+#define QS_H       (STATUS_H + 96 + 4 * QS_ROW_H)
 /* Row label column. Was a bare 68 until the Wi-Fi/Bluetooth/EQ row icons grew
  * larger -- Wi-Fi's natural width at its new height puts its right edge
  * exactly at 68, no gap at all, so the label column moved out to clear it.
@@ -2311,6 +2319,24 @@ static int live_x, live_y;          /* where the finger is now, while it is down
 static int qs_open;
 static int qs_bright, qs_bright_max = 101, qs_wifi, qs_bt;
 static int qs_dragging;         /* on the brightness bar */
+
+/* R-qsslide: explicit request -- pulling the panel down used to be an
+ * instant cut the moment the drag passed QS_PULL, with nothing to show for
+ * the drag itself. qs_slide is the panel's own live 0..QS_H reveal height:
+ * driven directly off the finger while qs_pulling (one-to-one, no easing --
+ * see the main tick loop), then eased toward qs_open ? QS_H : 0 the rest of
+ * the way once the finger lifts, by the same per-tick step regardless of
+ * *why* qs_open changed (a committed pull, a cancelled one, tapping away, the
+ * handle swipe, back) -- every path that flips qs_open gets a smooth reveal/
+ * dismissal for free, none of them needed their own animation code. */
+static int qs_slide;
+/* Tracks a pull that hasn't been released yet, i.e. "still deciding" -- same
+ * shape vol_dragging/qs_dragging already use for their own release
+ * detection (a plain flag, set while live, checked against touch_down to
+ * catch the release), rather than leaning on the g==1/g==2 gesture
+ * classifier, which only fires once, on release, and would show nothing
+ * live in between. */
+static int qs_pulling;
 
 static void qs_refresh(void) {
     qs_bright = st_brightness();
@@ -5219,147 +5245,46 @@ static void queue_remove_display(int display_i) {
 }
 
 /* R29: waveform seek bar, Music only (per its own backlog entry --
- * audiobooks/podcasts explicitly excluded). Built from real playback, not
- * a separate offline decode pass: the first time a track plays, its
- * amplitude envelope is sampled from the exact PCM already being decoded
- * for output (audio_current_peak(), polled alongside audio_pos_ms() in the
- * main loop) and cached to the card; every playthrough after that loads
- * the cache instead of capturing again -- "appears on every playthrough
- * after the first", requested live, literally. */
+ * audiobooks/podcasts explicitly excluded). The shape itself comes from
+ * waveform.c: a background decode of the file at idle priority, kept in one
+ * cache file on the card. It used to be sampled from the live output instead,
+ * which meant nothing on a track's first play, nothing after any seek or skip
+ * during that play (the capture had to cover the whole track), a peak-based
+ * outline that draws modern masters as a solid block, and the volume setting
+ * baked into the result. */
 /* R86 follow-up: reported live as uneven bar thickness, after the previous
  * fix already fixed uneven gaps -- 120 doesn't divide the available 432px
  * (FB_W-48) evenly (432/120 = 3.6), so no integer-pixel column width can
  * be perfectly uniform: some columns end up 3px, others 4px, no matter how
  * the remainder is distributed. 144 is the closest bucket count to 120
  * that divides 432 exactly (3px per column, zero remainder) -- every
- * column is now genuinely, not just approximately, the same width. Also
- * invalidates every existing cache file (their on-disk length no longer
- * matches WAVE_BUCKETS, so wave_load()'s exact-size check simply misses
- * and the next play recaptures) -- harmless and self-healing, not
- * something that needed its own separate migration. */
-#define WAVE_BUCKETS 144
-#define WAVE_CACHE_DIR "/data/mnt/sd_0/.music_waveforms"
-/* Bump on any change to what a cache file actually contains, so old files
- * from before the change become unreachable orphans rather than being
- * misread -- same discipline cover.c's own CACHE_VERSION documents. */
-#define WAVE_CACHE_VERSION "1"
+ * column is now genuinely, not just approximately, the same width. */
+#define WAVE_BUCKETS WAVEFORM_BUCKETS
 
-static uint8_t  wave_buckets[WAVE_BUCKETS];   /* currently displayed, valid only if wave_loaded */
-static int      wave_loaded;
-static int      wave_capturing;
-static uint32_t wave_capture[WAVE_BUCKETS];   /* raw running peak per bucket, this playthrough */
-static uint8_t  wave_touched[WAVE_BUCKETS];   /* 1 once a bucket has been sampled at all, separate
-                                                  from wave_capture[]'s value -- real silence also
-                                                  writes 0, so the peak alone can't tell "sampled,
-                                                  quiet" from "never sampled". */
-static char     wave_capture_path[LIB_PATH_LEN];
-static int      wave_last_bucket;             /* highest bucket touched so far, -1 = none yet */
-
-/* Same djb2-and-hex-name shape as cover.c's own cache_path() -- a track
- * path can contain anything the filesystem allows, so hashing it into a
- * fixed-width hex name sidesteps sanitizing it into something legal. */
-static void wave_cache_path(const char *track_path, char *out, size_t n) {
-    unsigned long h = 5381;
-    for (const unsigned char *p = (const unsigned char *)track_path; *p; p++)
-        h = ((h << 5) + h) ^ *p;
-    for (const unsigned char *p = (const unsigned char *)WAVE_CACHE_VERSION; *p; p++)
-        h = ((h << 5) + h) ^ *p;
-    mkdir(WAVE_CACHE_DIR, 0755);
-    snprintf(out, n, "%s/%08lx.wave", WAVE_CACHE_DIR, h & 0xFFFFFFFFul);
-}
-
-/* 1 and out filled if a fresh cache exists, 0 otherwise (including a stale
- * one -- older than the track file itself, same rule cover.c's own
- * load_cache() uses for a replaced cover.jpg -- which is deleted so a
- * later capture doesn't collide with it under the same hash). */
-static int wave_load(const char *track_path, uint8_t *out) {
-    char p[512];
-    wave_cache_path(track_path, p, sizeof(p));
-    struct stat cs, ts;
-    if (stat(p, &cs) != 0) return 0;
-    if (stat(track_path, &ts) == 0 && ts.st_mtime > cs.st_mtime) {
-        unlink(p);
-        return 0;
-    }
-    FILE *f = fopen(p, "rb");
-    if (!f) return 0;
-    size_t got = fread(out, 1, WAVE_BUCKETS, f);
-    fclose(f);
-    return got == WAVE_BUCKETS;
-}
-
-static void wave_save(const char *track_path, const uint8_t *buckets) {
-    char p[512], tmp[520];
-    wave_cache_path(track_path, p, sizeof(p));
-    snprintf(tmp, sizeof(tmp), "%s.tmp", p);
-    FILE *f = fopen(tmp, "wb");
-    if (!f) return;
-    int ok = fwrite(buckets, 1, WAVE_BUCKETS, f) == WAVE_BUCKETS;
-    fclose(f);
-    if (!ok || rename(tmp, p) != 0) unlink(tmp);
-}
-
-/* Called every time play_index() is about to move on to a different track
- * -- whichever track was capturing (if any) just had its playthrough end,
- * whether by reaching the end, being skipped, or the queue advancing. */
-static void wave_finish_capture(void) {
-    if (!wave_capturing) return;
-    wave_capturing = 0;
-    /* A capture that never got near the end (an early skip, or a track
-     * abandoned for the session) is not "a play through" -- saving it
-     * would cache a misleadingly short/empty shape that never gets a
-     * chance to be completed later, since a cache file existing at all is
-     * what stops a future play from capturing again. */
-    if (wave_last_bucket < WAVE_BUCKETS - 4) return;
-    /* Reaching a late bucket is not the same as having sampled every bucket
-     * along the way: a forward seek, or resuming past a stretch only ever
-     * partly sampled earlier, jumps straight to a late bucket without ever
-     * touching the ones in between, which still satisfies the check above.
-     * Reported live: a Bruckner movement's cached waveform had real data for
-     * the first few seconds, then 88 of 144 buckets flat zero, then real
-     * data again from ~63% onward -- exactly that shape, from a mid-track
-     * seek. Require near-total coverage of 0..wave_last_bucket, not just
-     * that the far end was reached. */
-    int touched = 0;
-    for (int i = 0; i <= wave_last_bucket; i++) if (wave_touched[i]) touched++;
-    if (touched < wave_last_bucket + 1 - 4) return;
-    uint32_t maxv = 0;
-    for (int i = 0; i < WAVE_BUCKETS; i++) if (wave_capture[i] > maxv) maxv = wave_capture[i];
-    if (maxv == 0) return;   /* silence throughout, e.g. output was lost -- nothing real to show */
-    uint8_t out[WAVE_BUCKETS];
-    for (int i = 0; i < WAVE_BUCKETS; i++)
-        out[i] = (uint8_t)(wave_capture[i] * 255 / maxv);
-    wave_save(wave_capture_path, out);
-}
+static uint8_t wave_buckets[WAVE_BUCKETS];    /* currently displayed, valid only if wave_loaded */
+static int     wave_loaded;
+/* The track wave_buckets is for -- or is being worked out for. Empty when
+ * nothing on screen should have a waveform. The draw checks it against the
+ * track it is drawing, so a shape can never outlive its track onto an
+ * audiobook or a different queue that did not come through here. */
+static char    wave_path[LIB_PATH_LEN];
 
 /* Everything a track change needs to do to wave_* state, regardless of
  * whether it arrived via play_index() (a tap, a skip button, a playlist
  * pick) or the gapless worker rolling on by itself at a track boundary.
- * R86 follow-up: the gapless path used to skip this entirely, since it
- * never went through play_index() -- cur_track moved on but wave_capturing/
- * wave_capture[]/wave_capture_path kept pointing at the track that just
- * ended, so peaks sampled during the new track were written into the old
- * track's buffer at the old track's bucket math. Reported live as the
- * waveform "often doesn't appear" after the first track in a queue, and
- * once as a track showing a flat line of dots -- a capture blended from
- * two different tracks' position/duration mapping normalizes to almost
- * nothing. Music only, same as play_index()'s own gate: podcast_mode is
- * checked explicitly since this helper runs before podcast_mode is known
- * to be off for a caller that isn't play_index(). */
+ * Music only, same as play_index()'s own gate: podcast_mode is checked
+ * explicitly since this helper runs before podcast_mode is known to be off
+ * for a caller that isn't play_index(). Asks the worker straight away --
+ * a cached shape comes back on the next poll -- and waveform_get("") for a
+ * podcast stops any decode still running for the previous track. */
 static void wave_track_changed(const char *path) {
-    wave_finish_capture();
     wave_loaded = 0;
-    wave_capturing = 0;
-    if (!podcast_mode) {
-        if (wave_load(path, wave_buckets)) {
-            wave_loaded = 1;
-        } else {
-            wave_capturing = 1;
-            memset(wave_capture, 0, sizeof(wave_capture));
-            memset(wave_touched, 0, sizeof(wave_touched));
-            snprintf(wave_capture_path, sizeof(wave_capture_path), "%s", path);
-            wave_last_bucket = -1;
-        }
+    if (!podcast_mode && path && path[0]) {
+        snprintf(wave_path, sizeof(wave_path), "%s", path);
+        wave_loaded = waveform_get(wave_path, wave_buckets);
+    } else {
+        wave_path[0] = '\0';
+        waveform_get("", NULL);
     }
 }
 
@@ -5758,19 +5683,22 @@ static int mini_visible(void) {
  * of any list screen. A live stream has no art to show -- art_request("") is
  * what play_station() already clears art_bits with -- so radio keeps the
  * original text-only layout instead of a thumbnail-shaped hole. */
-/* R-miniplayer: whether draw_mini() follows the cover palette -- same R92
- * scoping Now Playing itself uses (see compute_cover_palette()'s own call
- * site): audiobook_mode keeps its plain colours, everything else (music,
- * podcast, radio) follows np_bg/np_accent/np_fg, which by this point in the
- * frame are current for whichever of those is actually playing (radio's own
- * write path, radio_art_worker(), runs independently of screen/mini_visible()
- * already; music/podcast's is compute_cover_palette(), now also kept fresh
- * whenever the mini-player is on screen -- see its own call site's comment). */
-static int np_mini_themed(void) { return cover_palette_enabled && !audiobook_mode; }
+/* R-miniplayer: whether floating chrome drawn over any screen (the
+ * mini-player, the volume popup, the quick-settings dropdown) follows the
+ * cover palette -- same R92 scoping Now Playing itself uses (see
+ * compute_cover_palette()'s own call site): audiobook_mode keeps its plain
+ * colours, everything else (music, podcast, radio) follows np_bg/np_accent/
+ * np_fg, which by this point in the frame are current for whichever of
+ * those is actually playing (radio's own write path, radio_art_worker(),
+ * runs independently of screen/mini_visible() already; music/podcast's is
+ * compute_cover_palette(), kept fresh whenever the mini-player is on screen
+ * -- see its own call site's comment -- which covers every screen any of
+ * this chrome can appear over). */
+static int np_chrome_themed(void) { return cover_palette_enabled && !audiobook_mode; }
 
 static void draw_mini(uint16_t *fb) {
     int by = FB_H - MINI_H;
-    int themed = np_mini_themed();
+    int themed = np_chrome_themed();
     fill_rect(fb, 0, by, FB_W, MINI_H, themed ? np_col_bg() : COL_HEADER);
     fill_rect(fb, 0, by, FB_W, 1, themed ? np_col_line() : COL_LINE);
 
@@ -5915,7 +5843,7 @@ static void draw_mini(uint16_t *fb) {
         /* Plain white -10/+10, no circle -- play/pause is the only filled
          * button in the row, so it stays the one thing that reads as "the
          * button" at a glance. Never themed -- audiobook_mode is excluded
-         * from np_mini_themed() the same way it's excluded on Now Playing. */
+         * from np_chrome_themed() the same way it's excluded on Now Playing. */
         const char *back_lbl = "-10", *fwd_lbl = "+10";
         draw_text(fb, MINI_BACK_CX - text_width(back_lbl, TEXT_PX_SMALL) / 2,
                   cy - TEXT_PX_SMALL / 2 + 2, back_lbl, COL_TEXT, TEXT_PX_SMALL, FB_W);
@@ -7059,14 +6987,15 @@ static void draw_screen(uint16_t *fb) {
         int byy = wave_cy - bh / 2;
         /* R29: the waveform seek bar, when this track has a cached one
          * (Music only -- wave_loaded is never set for a podcast episode,
-         * see play_index()'s own comment, so this always falls through to
-         * the plain bar below for those). Same column count as
+         * see play_index()'s own comment, and the wave_path match keeps an
+         * audiobook or any other track from inheriting one, so those always
+         * fall through to the plain bar below). Same column count as
          * WAVE_BUCKETS, spread evenly across the same width the plain bar
          * fills; each column's height comes straight from its cached 0-255
-         * peak. Coloured up to the played fraction, dim past it -- the
+         * loudness level. Coloured up to the played fraction, dim past it -- the
          * same played/unplayed language the plain fill already used, just
          * shaped instead of flat. */
-        if (wave_loaded) {
+        if (wave_loaded && !audiobook_mode && !strcmp(t->path, wave_path)) {
             int wave_w = FB_W - 48;
             int played_col = dur > 0 ? WAVE_BUCKETS * pos / dur : 0;
             /* Reported live, twice: first as uneven spacing (a fixed col_w
@@ -9179,23 +9108,66 @@ static void draw_sheet(uint16_t *fb) {
     }
 }
 
-/* Geometry shared by the drawing and the hit tests. */
-static int qs_bar_y(void)  { return STATUS_H + 74; }
-static int qs_wifi_y(void) { return STATUS_H + 130; }
-static int qs_bt_y(void)   { return qs_wifi_y() + QS_ROW_H; }
-static int qs_usb_y(void)  { return qs_bt_y() + QS_ROW_H; }
-static int qs_eq_y(void)   { return qs_usb_y() + QS_ROW_H; }
-static int qs_mseb_y(void) { return qs_eq_y() + QS_ROW_H; }
+/* R-poptheme: the volume/brightness popup shape -- rounded, inset from the
+ * status bar rather than flush against it, an icon on the left instead of a
+ * text label. Defined here, ahead of every one of draw_quick_settings()'s
+ * own geometry functions just below (which now reuse VOL_ICON_W/GAP for the
+ * in-panel brightness row too -- see qs_bar_x()'s own comment), the
+ * collapsed-while-dragging brightness popup further down in that same
+ * function, and draw_volume(). Sizes shared with the touch handlers too
+ * (the live-drag block and the tap-to-set-level block), so the bar a finger
+ * tracks is always the bar actually on screen. VOL_H (the touch/gesture
+ * zone's own height -- "don't treat this as a QS pull" etc.) stays as it
+ * was: taller than the popup itself is fine, it's a generous catch zone,
+ * not the visual bound. */
+#define VOL_POP_X   20     /* popup left/right edge, inset from the screen edge */
+#define VOL_POP_PAD 20     /* popup edge to its own content (icon/bar) */
+#define VOL_POP_R   24
+#define VOL_POP_GAP 12     /* status bar bottom to popup top -- keeps it off the very top */
+#define VOL_ICON_W  20
+#define VOL_ICON_GAP 14    /* icon's right edge to the bar's left edge */
+
+static int vol_pop_top(void) { return STATUS_H + VOL_POP_GAP; }
+static int vol_pop_h(void)   { return 64; }
+static int vol_bar_x(void)   { return VOL_POP_X + VOL_POP_PAD + VOL_ICON_W + VOL_ICON_GAP; }
+static int vol_bar_w(void)   { return FB_W - VOL_POP_X - VOL_POP_PAD - vol_bar_x(); }
+static int vol_bar_y(void)   { return vol_pop_top() + vol_pop_h() / 2 - 4; }
+
+/* Geometry shared by the drawing and the hit tests.
+ * R-qsicon: "Brightness"/cog row dropped (see draw_quick_settings()'s own
+ * comment) -- the bar moved up to sit right under the status/route row,
+ * same vertical placement the volume popup itself uses (STATUS_H+12 gap,
+ * bar centred in a 64px band -> +40), and every row below it shifted up by
+ * the same 34px this freed (74 -> 40) so the whole list stays QS_ROW_H-
+ * spaced, just starting sooner. */
+static int qs_bar_y(void)  { return STATUS_H + 40; }
+/* Icon-left-of-bar, same shape the volume popup and the brightness-drag
+ * popup both use: a 20px glyph, a 14px gap, then the bar to the row's own
+ * right margin (FB_W - 24, matching every other row here). */
+static int qs_bar_icon_x(void) { return 24; }
+static int qs_bar_x(void)      { return qs_bar_icon_x() + VOL_ICON_W + VOL_ICON_GAP; }
+static int qs_bar_w(void)      { return FB_W - 24 - qs_bar_x(); }
+/* R-qsgrid: two columns instead of one long stack of rows -- explicit
+ * request. qs_col_x(0)/qs_col_x(1) are each cell's own left edge, qs_col_w()
+ * how wide it is; both the draw code and the touch handler's own column
+ * split (which half of the row a tap landed in) share these, the same way
+ * the single-column layout's row functions used to be shared. */
+#define QS_COL_GAP 24
+static int qs_col_w(void)       { return (FB_W - 48 - QS_COL_GAP) / 2; }
+static int qs_col_x(int col)    { return 24 + col * (qs_col_w() + QS_COL_GAP); }
+static int qs_wifi_y(void)  { return STATUS_H + 96; }
+static int qs_bt_y(void)    { return qs_wifi_y(); }              /* same row, right column */
+static int qs_eq_y(void)    { return qs_wifi_y() + QS_ROW_H; }
+static int qs_mseb_y(void)  { return qs_eq_y(); }                /* same row, right column */
+/* R-qscover: cover_palette_enabled (previously only reachable from
+ * Settings) flipped from here too. */
+static int qs_cover_y(void) { return qs_eq_y() + QS_ROW_H; }
+static int qs_usb_y(void)   { return qs_cover_y(); }             /* same row, right column */
 /* R83: what's actually playing's own format/quality -- moved here, under
- * MSEB, from the top bar next to volume (see draw_quick_settings()'s own
- * comment on the earlier spot this held). */
-static int qs_codec_y(void) { return qs_mseb_y() + QS_ROW_H; }
-/* R51: top-right corner, level with "Brightness" opposite it -- not its own
- * row (tried first, corrected live: too much space for what it does, and
- * putting a whole row's worth of weight behind a single shortcut read as
- * more important than it is). */
-static int qs_gear_x(void) { return FB_W - 24 - 20; }
-static int qs_gear_y(void) { return STATUS_H + 6; }
+ * the grid, from the top bar next to volume (see draw_quick_settings()'s
+ * own comment on the earlier spot this held). Spans both columns -- there's
+ * only one of it, and it was already exactly this wide. */
+static int qs_codec_y(void) { return qs_cover_y() + QS_ROW_H; }
 
 static void draw_bt_icon(uint16_t *fb, int x, int y, uint16_t c) {
     draw_icon(fb, FB_W, FB_H, x, y, &icon_bt_qs, c);
@@ -9224,14 +9196,6 @@ static void draw_eq_icon(uint16_t *fb, int x, int y, uint16_t c) {
     for (int i = 0; i < 5; i++)
         fill_circle(fb, x + px[i], y + py[i], 3, c);
 }
-
-/* R51: a cog for the quick-settings row leading to the full Settings menu.
- * Vendored from Font Awesome's gear-solid-full.svg the same way wifi/
- * bluetooth's own icons already are -- see gen_icons.py and THIRD_PARTY.md. */
-static void draw_gear_icon(uint16_t *fb, int x, int y, uint16_t c) {
-    draw_icon(fb, FB_W, FB_H, x, y, &icon_gear_qs, c);
-}
-
 
 /* R83: what's actually playing's own format/quality, in the same shape
  * each mode's Now Playing screen used to compute independently at the foot
@@ -9316,8 +9280,41 @@ static void qs_format_info(char *out, size_t outsz) {
 }
 
 static void draw_quick_settings(uint16_t *fb) {
-    fill_rect(fb, 0, 0, FB_W, QS_H, COL_HEADER);
-    fill_rect(fb, 0, QS_H - 1, FB_W, 1, COL_LINE);
+    /* R-qstheme: unlike the mini-player and the volume popup (which follow
+     * the playing track's palette from anywhere, on purpose -- both are
+     * glanceable while browsing elsewhere), this panel only themes while
+     * actually on Now Playing. Reported live: pulled down over a plain list
+     * screen, the panel still carried the last-played track's colours,
+     * which read as a leftover/stuck theme rather than anything to do with
+     * the screen underneath it -- unlike the mini-player, this panel has no
+     * cover art of its own on screen to justify it. */
+    int themed = np_chrome_themed() && screen == SC_PLAYING;
+
+    /* R-poptheme: while the brightness bar is actually being dragged, the
+     * rest of the panel disappears and only a small rounded slider is shown
+     * -- same popup, same geometry (vol_pop_top()/vol_pop_h()/vol_bar_x()/
+     * vol_bar_w()/vol_bar_y()), same sun-vs-icon_vol_* left-of-bar shape, as
+     * draw_volume() -- explicit request, so the two floating sliders read as
+     * one design rather than two. The touch handler's own live-drag block
+     * (qs_open && qs_dragging && touch_down) already tracks the finger
+     * against this exact geometry once dragging -- see its own comment. */
+    if (qs_dragging) {
+        int top = vol_pop_top(), ph = vol_pop_h();
+        fill_round_rect(fb, VOL_POP_X, top, FB_W - 2 * VOL_POP_X, ph, VOL_POP_R,
+                        themed ? np_col_bg() : COL_HEADER);
+        int icon_x = VOL_POP_X + VOL_POP_PAD, icon_y = top + (ph - VOL_ICON_W) / 2;
+        draw_icon(fb, FB_W, FB_H, icon_x, icon_y, &icon_sun, themed ? np_col_dim() : COL_DIM);
+        int by = vol_bar_y(), bx = vol_bar_x(), bw = vol_bar_w();
+        fill_pill(fb, bx, by, bw, 8, themed ? np_col_line() : COL_LINE);
+        int filled = qs_bright_max > 0 ? bw * qs_bright / qs_bright_max : 0;
+        uint16_t accent = themed ? np_col_accent() : COL_ACCENT;
+        if (filled > 0) fill_pill(fb, bx, by, filled, 8, accent);
+        fill_circle(fb, bx + filled, by + 4, 13, accent);
+        return;
+    }
+
+    fill_rect(fb, 0, 0, FB_W, QS_H, themed ? np_col_bg() : COL_HEADER);
+    fill_rect(fb, 0, QS_H - 1, FB_W, 1, themed ? np_col_line() : COL_LINE);
     draw_status(fb);
 
     /* R83: route (Bluetooth/USB/3.5mm), moved here from the foot of each
@@ -9338,62 +9335,66 @@ static void draw_quick_settings(uint16_t *fb) {
         const char *route_kind = audio_output();   /* "3.5 mm" / "USB" / "Bluetooth" */
         const icon_t *ric = !strcmp(route_kind, "Bluetooth") ? &icon_bt_sm
                            : !strcmp(route_kind, "USB")      ? &icon_usb_sm : NULL;
+        uint16_t dim = themed ? np_col_dim() : COL_DIM;
         if (ric) {
-            draw_icon(fb, FB_W, FB_H, rx, mid - ric->h / 2, ric, COL_DIM);
+            draw_icon(fb, FB_W, FB_H, rx, mid - ric->h / 2, ric, dim);
         } else {
-            draw_text(fb, rx, mid - TEXT_PX_SMALL / 2, route_kind, COL_DIM, TEXT_PX_SMALL, FB_W);
+            draw_text(fb, rx, mid - TEXT_PX_SMALL / 2, route_kind, dim, TEXT_PX_SMALL, FB_W);
         }
     }
 
-    draw_text(fb, 24, STATUS_H + 12, "Brightness", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
-    /* R51: quick access to the full Settings menu. Dim, same weight as
-     * "Brightness" opposite it -- a shortcut, not something with its own
-     * on/off state to draw attention to. */
-    draw_gear_icon(fb, qs_gear_x(), qs_gear_y(), COL_DIM);
-    int by = qs_bar_y(), bw = FB_W - 48;
-    fill_pill(fb, 24, by, bw, 8, COL_LINE);
+    /* R-qsicon: no more "Brightness" label or cog -- explicit request, same
+     * icon-left-of-bar, no-text shape the volume popup and the
+     * brightness-drag popup above both already use, so this row reads as
+     * one more instance of that language rather than a labelled row like
+     * Wi-Fi/Bluetooth below it. */
+    int by = qs_bar_y();
+    draw_icon(fb, FB_W, FB_H, qs_bar_icon_x(), by + 4 - VOL_ICON_W / 2, &icon_sun,
+             themed ? np_col_dim() : COL_DIM);
+    int bx = qs_bar_x(), bw = qs_bar_w();
+    fill_pill(fb, bx, by, bw, 8, themed ? np_col_line() : COL_LINE);
     int filled = qs_bright_max > 0 ? bw * qs_bright / qs_bright_max : 0;
-    if (filled > 0) fill_pill(fb, 24, by, filled, 8, COL_ACCENT);
-    fill_circle(fb, 24 + filled, by + 4, 13, COL_ACCENT);
+    uint16_t bright_accent = themed ? np_col_accent() : COL_ACCENT;
+    if (filled > 0) fill_pill(fb, bx, by, filled, 8, bright_accent);
+    fill_circle(fb, bx + filled, by + 4, 13, bright_accent);
 
-    /* Icon, name, and what it is actually attached to — the useful part, and
-     * what stock shows. Coloured when on, so state reads without the toggle. */
+    /* R-qsgrid: no toggle switches any more (explicit request) -- the icon
+     * (and its label) going accent-vs-dim IS the on/off indicator now, for
+     * every row that's a real binary toggle. USB working mode and Format
+     * are the two exceptions, same as before: USB isn't a binary setting
+     * (it's tap-to-open, marked with its own chevron) and Format is a
+     * status readout, not a setting at all -- neither ever had a switch to
+     * remove. Two columns instead of one long stack, explicit request --
+     * qs_col_x(0)/qs_col_x(1) and qs_col_w() (see their own comment) are
+     * shared with the touch handler's own column split. */
     char nm[64];
+    uint16_t dim = themed ? np_col_dim() : COL_DIM, fg = themed ? np_col_fg() : COL_TEXT;
+    uint16_t accent = themed ? np_col_accent() : COL_ACCENT;
+    int c0 = qs_col_x(0), c1 = qs_col_x(1), cw = qs_col_w();
+    int label_dx = QS_LABEL_X - 24;   /* icon-column-to-label offset every row here shares */
+
+    /* Wi-Fi (left) / Bluetooth (right), same row. +16/+10 icon placements
+     * unchanged from the single-column layout -- see their own original
+     * comments on why (centroid-matching between the two icons' shapes). */
     int wy = qs_wifi_y();
-    /* +16, not +12: a bounding-box center undersells this icon's shape.
-     * Almost all of its ink is the arcs in the top two-thirds -- the dot is
-     * a handful of pixels -- so a box-centered placement put the visible
-     * mass level with "Wi-Fi" and left it reading as floating above "off"
-     * rather than spanning to it, even though the box itself matched the
-     * text block exactly. Placed by alpha-weighted centroid instead (row
-     * 11.7 of 34 in the bitmap), matched to Bluetooth's own weighted
-     * centroid (row 18 of 38 at its +10 offset -> 28 from the row top). */
-    draw_wifi_icon(fb, 24, wy + 16, qs_wifi ? COL_ACCENT : COL_DIM);
-    /* QS_LABEL_X, not the old 68: at its new, larger size the Wi-Fi icon's
-     * natural width (its source aspect ratio times the target height) puts
-     * its right edge exactly at 68 -- zero gap, reading as crowding into the
-     * "W". 76 clears it with room to spare. */
-    draw_text(fb, QS_LABEL_X, wy + 6, "Wi-Fi", qs_wifi ? COL_TEXT : COL_DIM, TEXT_PX_SMALL, 200);
+    draw_wifi_icon(fb, c0, wy + 16, qs_wifi ? accent : dim);
+    draw_text(fb, c0 + label_dx, wy + 6, "Wi-Fi", qs_wifi ? fg : dim, TEXT_PX_SMALL, c0 + cw);
     st_wifi_ssid(nm, sizeof(nm));
-    draw_text(fb, QS_LABEL_X, wy + 32, qs_wifi ? (nm[0] ? nm : "not connected") : "off",
-              COL_DIM, TEXT_PX_SMALL, FB_W - 180);
-    draw_toggle_switch(fb, wy, qs_wifi);
+    draw_text(fb, c0 + label_dx, wy + 32, qs_wifi ? (nm[0] ? nm : "not connected") : "off",
+              dim, TEXT_PX_SMALL, c0 + cw);
 
     int by2 = qs_bt_y();
-    /* Block-centered vertically, same as Wi-Fi above. x=34, not the icon
-     * column's usual 24-26: measured on a real screenshot, this icon's own
-     * alpha-weighted horizontal centroid landed at x=38 against Wi-Fi's 46 --
-     * a real, visible 8px gap between the two icons' center lines, not
-     * merely a left-edge difference. Left-aligning icons of different
-     * natural widths does not make them share a center; +8 here matches
-     * this one's centroid to Wi-Fi's rather than its left edge. */
-    draw_bt_icon(fb, 34, by2 + 10, qs_bt ? COL_ACCENT : COL_DIM);
-    draw_text(fb, QS_LABEL_X, by2 + 6, "Bluetooth", qs_bt ? COL_TEXT : COL_DIM, TEXT_PX_SMALL, 200);
+    draw_bt_icon(fb, c1 + 10, by2 + 10, qs_bt ? accent : dim);
+    draw_text(fb, c1 + label_dx, by2 + 6, "Bluetooth", qs_bt ? fg : dim, TEXT_PX_SMALL, c1 + cw);
     st_bt_name(nm, sizeof(nm));
     if (qs_bt && nm[0]) {
         /* The codec and the headset's own battery used to sit on the Now
-         * Playing screen's route line; they moved here, next to the name they
-         * actually describe, freeing that line for the device's own battery. */
+         * Playing screen's route line; they moved here, next to the name
+         * they actually describe. Narrower column now than when this was
+         * written (was FB_W - 180 wide; is qs_col_w() - label_dx, about
+         * 130px) -- draw_text's own right-edge clip just cuts it short
+         * rather than overflowing into Wi-Fi's column, which for a longer
+         * device+codec name it now routinely will. */
         char codec[32]; int batt;
         pthread_mutex_lock(&bt_lock);
         snprintf(codec, sizeof(codec), "%s", bt_codec_cached);
@@ -9402,139 +9403,138 @@ static void draw_quick_settings(uint16_t *fb) {
         char base[80];
         if (codec[0]) snprintf(base, sizeof(base), "%s \xc2\xb7 %s", nm, codec);
         else          snprintf(base, sizeof(base), "%s", nm);
-        draw_text(fb, QS_LABEL_X, by2 + 32, base, COL_DIM, TEXT_PX_SMALL, FB_W - 180);
+        int rx = c1 + cw;
+        draw_text(fb, c1 + label_dx, by2 + 32, base, dim, TEXT_PX_SMALL, rx);
         if (batt >= 0) {
-            int tx = QS_LABEL_X + text_width(base, TEXT_PX_SMALL);
-            draw_text(fb, tx, by2 + 32, " \xc2\xb7 ", COL_DIM, TEXT_PX_SMALL, FB_W - 180);
-            tx += text_width(" \xc2\xb7 ", TEXT_PX_SMALL);
-            draw_battery(fb, tx, by2 + 37, batt, 0);
-            tx += 30;
-            char pct[8];
-            snprintf(pct, sizeof(pct), "%d%%", batt);
-            draw_text(fb, tx, by2 + 32, pct, COL_DIM, TEXT_PX_SMALL, FB_W - 180 - (tx - QS_LABEL_X));
+            int tx = c1 + label_dx + text_width(base, TEXT_PX_SMALL);
+            if (tx < rx) {
+                draw_text(fb, tx, by2 + 32, " \xc2\xb7 ", dim, TEXT_PX_SMALL, rx);
+                tx += text_width(" \xc2\xb7 ", TEXT_PX_SMALL);
+            }
+            if (tx < rx) {
+                draw_battery(fb, tx, by2 + 37, batt, 0);
+                tx += 30;
+                char pct[8];
+                snprintf(pct, sizeof(pct), "%d%%", batt);
+                draw_text(fb, tx, by2 + 32, pct, dim, TEXT_PX_SMALL, rx);
+            }
         }
     } else {
-        draw_text(fb, QS_LABEL_X, by2 + 32, qs_bt ? "not connected" : "off",
-                  COL_DIM, TEXT_PX_SMALL, FB_W - 180);
-    }
-    draw_toggle_switch(fb, by2, qs_bt);
-
-    /* No toggle switch here, unlike Wi-Fi/Bluetooth above -- USB working
-     * mode isn't a binary on/off, so the row is tap-to-open rather than
-     * tap-to-flip. A chevron says that the way the toggle says the other
-     * two rows are switches. */
-    int byu = qs_usb_y();
-    int usb_mode = st_usb_mode();
-    draw_usb_icon(fb, 34, byu + 7, COL_DIM);
-    draw_text(fb, QS_LABEL_X, byu + 6, "USB working mode", COL_TEXT, TEXT_PX_SMALL, 260);
-    draw_text(fb, QS_LABEL_X, byu + 32,
-              usb_mode == 0 ? "ADB" : usb_mode == 1 ? "USB Storage" : "unplugged",
-              COL_DIM, TEXT_PX_SMALL, FB_W - 180);
-    {
-        int cx = FB_W - 24 - 10, cy = byu + QS_ROW_H / 2;
-        draw_line(fb, cx - 8, cy - 8, cx, cy, COL_DIM);
-        draw_line(fb, cx, cy, cx - 8, cy + 8, COL_DIM);
+        draw_text(fb, c1 + label_dx, by2 + 32, qs_bt ? "not connected" : "off",
+                  dim, TEXT_PX_SMALL, c1 + cw);
     }
 
+    /* Parametric EQ (left) / MSEB (right), same row. */
     int by3 = qs_eq_y();
     /* R89: on's own preference is untouched by USB Transport Mode -- see
-     * its engage-site comment -- but showing the toggle as ON while the
-     * bypass has actually skipped processing entirely reads as "PEQ is
-     * still on" (reported live), which is backwards: it's the one thing
-     * that's genuinely off right now. Drawn state follows what is actually
+     * its engage-site comment -- but showing this as ON while the bypass
+     * has actually skipped processing entirely reads as "PEQ is still on"
+     * (reported live), which is backwards: it's the one thing that's
+     * genuinely off right now. Drawn state follows what is actually
      * running, not the saved setting, same distinction the volume toast
      * already draws for the locked value vs. the saved one. */
     int on = eq_enabled() && !usb_bypass_active;
-    /* Block-centered vertically, same as Wi-Fi/Bluetooth above (y was +6
-     * when the icon was smaller and merely aligned to the title line). x=29
-     * for the same centroid-matching reason as Bluetooth's +34 above --
-     * measured centroid 42 against Wi-Fi's 46, so +5. */
-    draw_eq_icon(fb, 29, by3 + 16, on ? COL_ACCENT : COL_DIM);
-    draw_text(fb, QS_LABEL_X, by3 + 6, "Parametric EQ", on ? COL_TEXT : COL_DIM, TEXT_PX_SMALL, 200);
-    draw_text(fb, QS_LABEL_X, by3 + 32,
-              usb_bypass_active ? "USB Transport Mode" : eq_cur_path[0] ? eq_cur.name : "no profile",
-              COL_DIM, TEXT_PX_SMALL, FB_W - 180);
-    draw_toggle_switch(fb, by3, on);
+    draw_eq_icon(fb, c0 + 5, by3 + 16, on ? accent : dim);
+    draw_text(fb, c0 + label_dx, by3 + 6, "Parametric EQ", on ? fg : dim, TEXT_PX_SMALL, c0 + cw);
+    draw_text(fb, c0 + label_dx, by3 + 32,
+              usb_bypass_active ? "USB Transport" : eq_cur_path[0] ? eq_cur.name : "no profile",
+              dim, TEXT_PX_SMALL, c0 + cw);
 
-    /* Same shape as the Parametric EQ row above -- a quick toggle, not a way
-     * in to editing the 9 bands (that stays under Parametric EQ in the main
-     * menu). Reuses the same squiggle icon: MSEB is still, visually, "an
-     * EQ" -- a distinct glyph for it would say otherwise. */
+    /* Same shape as Parametric EQ -- a quick toggle, not a way in to editing
+     * the 9 bands (that stays under Parametric EQ in the main menu). Reuses
+     * the same squiggle icon: MSEB is still, visually, "an EQ" -- a distinct
+     * glyph for it would say otherwise. */
     int by4 = qs_mseb_y();
     int mseb_shown = mseb_on && !usb_bypass_active;
-    draw_eq_icon(fb, 29, by4 + 16, mseb_shown ? COL_ACCENT : COL_DIM);
-    draw_text(fb, QS_LABEL_X, by4 + 6, "MSEB", mseb_shown ? COL_TEXT : COL_DIM, TEXT_PX_SMALL, 200);
-    draw_text(fb, QS_LABEL_X, by4 + 32,
-              usb_bypass_active ? "USB Transport Mode" : "HiBy tuning bands",
-              COL_DIM, TEXT_PX_SMALL, FB_W - 180);
-    draw_toggle_switch(fb, by4, mseb_shown);
+    draw_eq_icon(fb, c1 + 5, by4 + 16, mseb_shown ? accent : dim);
+    draw_text(fb, c1 + label_dx, by4 + 6, "MSEB", mseb_shown ? fg : dim, TEXT_PX_SMALL, c1 + cw);
+    draw_text(fb, c1 + label_dx, by4 + 32,
+              usb_bypass_active ? "USB Transport" : "HiBy tuning bands",
+              dim, TEXT_PX_SMALL, c1 + cw);
+
+    /* Cover colours (left) / USB working mode (right), same row. USB keeps
+     * its own chevron (tap-to-open, not a binary toggle -- see its original
+     * comment) rather than the accent-vs-dim treatment every other icon in
+     * this grid now uses for on/off, since "on" doesn't mean anything for
+     * a three-way mode. Its chevron moves to its own column's right edge
+     * rather than the panel's. */
+    int by6 = qs_cover_y();
+    draw_icon(fb, FB_W, FB_H, c0 + 1, by6 + 14, &icon_palette_qs, cover_palette_enabled ? accent : dim);
+    draw_text(fb, c0 + label_dx, by6 + 6, "Cover colours", cover_palette_enabled ? fg : dim, TEXT_PX_SMALL, c0 + cw);
+    draw_text(fb, c0 + label_dx, by6 + 32, "From album art", dim, TEXT_PX_SMALL, c0 + cw);
+
+    int byu = qs_usb_y();
+    int usb_mode = st_usb_mode();
+    draw_usb_icon(fb, c1 + 10, byu + 7, dim);
+    draw_text(fb, c1 + label_dx, byu + 6, "USB mode", fg, TEXT_PX_SMALL, c1 + cw);
+    draw_text(fb, c1 + label_dx, byu + 32,
+              usb_mode == 0 ? "ADB" : usb_mode == 1 ? "USB Storage" : "unplugged",
+              dim, TEXT_PX_SMALL, c1 + cw);
+    {
+        int cx = c1 + cw - 10, cy = byu + QS_ROW_H / 2;
+        draw_line(fb, cx - 8, cy - 8, cx, cy, dim);
+        draw_line(fb, cx, cy, cx - 8, cy + 8, dim);
+    }
 
     /* R83: what's actually playing's own format/quality -- moved here,
-     * under MSEB, from the top bar next to volume (asked for live, a
-     * second time, after the top bar placement first shipped). No icon or
-     * toggle, so text stays at QS_LABEL_X rather than x=24 -- aligned under
-     * the rows above it instead of ragged against them. */
+     * below the grid, from the top bar next to volume (asked for live, a
+     * second time, after the top bar placement first shipped). No icon, so
+     * text stays at the label column rather than the icon one -- aligned
+     * under the rows above it instead of ragged against them. Spans both
+     * columns -- there's only one of it. */
     int by5 = qs_codec_y();
-    draw_text(fb, QS_LABEL_X, by5 + 6, "Format", COL_DIM, TEXT_PX_SMALL, 200);
+    draw_text(fb, c0 + label_dx, by5 + 6, "Format", dim, TEXT_PX_SMALL, c0 + cw);
     char fmt[64];
     qs_format_info(fmt, sizeof(fmt));
-    draw_text(fb, QS_LABEL_X, by5 + 32, fmt[0] ? fmt : "Nothing playing",
-              fmt[0] ? COL_ACCENT : COL_DIM, TEXT_PX_SMALL, FB_W - 48);
+    draw_text(fb, c0 + label_dx, by5 + 32, fmt[0] ? fmt : "Nothing playing",
+              fmt[0] ? accent : dim, TEXT_PX_SMALL, c1 + cw);
 
     /* A grab handle, so it is obvious the panel goes back up. */
-    fill_rect(fb, FB_W / 2 - 26, QS_H - 14, 52, 4, COL_LINE);
+    fill_rect(fb, FB_W / 2 - 26, QS_H - 14, 52, 4, themed ? np_col_line() : COL_LINE);
 }
 
-static int vol_bar_y(void) { return STATUS_H + VOL_H / 2 + 6; }
-
 static void draw_volume(uint16_t *fb) {
-    int top = STATUS_H;
-    fill_rect(fb, 0, top, FB_W, VOL_H, COL_HEADER);
-    fill_rect(fb, 0, top + VOL_H - 1, FB_W, 1, COL_LINE);
+    int themed = np_chrome_themed();
+    int top = vol_pop_top(), ph = vol_pop_h();
+    fill_round_rect(fb, VOL_POP_X, top, FB_W - 2 * VOL_POP_X, ph, VOL_POP_R,
+                    themed ? np_col_bg() : COL_HEADER);
 
     int v = vol_dragging && vol_drag_pct >= 0 ? vol_drag_pct : audio_volume();
+    int icon_x = VOL_POP_X + VOL_POP_PAD, icon_y = top + (ph - VOL_ICON_W) / 2;
+    int by = vol_bar_y(), bx = vol_bar_x(), bw = vol_bar_w();
+
     /* R89: USB Transport Mode pins and locks volume (see its own engage
      * comment) -- a hardware button press still lands here (vol_ticks is
      * set unconditionally in the key handler) even though audio_volume_step()
      * itself is a no-op while locked, which without this looked like a
-     * press that silently did nothing. Dimmed the same way any other
-     * disabled control in this app is (COL_DIM, matching R81's USB Storage
-     * Mode banner), with the label saying why rather than just showing an
-     * unmoving percentage. */
+     * press that silently did nothing. No text label to say why any more
+     * (R-poptheme dropped all of them) -- dim throughout (icon, bar, thumb)
+     * is now the only signal, same as every other disabled control in this
+     * app already reads as (COL_DIM). */
     if (usb_bypass_active) {
-        draw_text(fb, 24, top + 10, "Volume locked", COL_DIM, TEXT_PX_SMALL, FB_W - 160);
-        draw_text(fb, FB_W - 24 - text_width("USB Transport Mode", TEXT_PX_SMALL),
-                  top + 10, "USB Transport Mode", COL_DIM, TEXT_PX_SMALL, FB_W);
-        int by = vol_bar_y(), bw = FB_W - 48;
-        fill_rect(fb, 24, by, bw, 8, COL_LINE);
+        uint16_t dim = themed ? np_col_dim() : COL_DIM;
+        const icon_t *vic = v <= 0 ? &icon_vol_mute : v < 34 ? &icon_vol_low
+                           : v < 67 ? &icon_vol_mid : &icon_vol_high;
+        draw_icon(fb, FB_W, FB_H, icon_x, icon_y, vic, dim);
+        fill_rect(fb, bx, by, bw, 8, themed ? np_col_line() : COL_LINE);
         int filled = bw * v / 100;
-        fill_rect(fb, 24, by, filled, 8, COL_DIM);
-        fill_circle(fb, 24 + filled, by + 4, 13, COL_DIM);
+        if (filled > 0) fill_rect(fb, bx, by, filled, 8, dim);
+        fill_circle(fb, bx + filled, by + 4, 13, dim);
         return;
     }
 
-    char buf[16];
-    /* R95 follow-up: current/total steps for every output, not just
-     * Bluetooth -- explicit correction after the first cut only changed
-     * this on BT. Derived from the same 0-100 v every output already
-     * agrees on (wired's own software gain included), rather than reading
-     * the BT-only raw mixer value this used to -- one formula instead of
-     * a per-output branch. */
-    {
-        int steps = audio_bt_vol_steps();
-        int cur = (v * steps + 50) / 100;
-        if (cur < 0) cur = 0; if (cur > steps) cur = steps;
-        snprintf(buf, sizeof(buf), "%d/%d", cur, steps);
-    }
-    draw_text(fb, 24, top + 10, "Volume", COL_DIM, TEXT_PX_SMALL, FB_W - 120);
-    int tw = text_width(buf, TEXT_PX_SMALL);
-    draw_text(fb, FB_W - 24 - tw, top + 10, buf, COL_TEXT, TEXT_PX_SMALL, FB_W);
+    /* R-poptheme: same glyph, same thresholds, as draw_status()'s own top-bar
+     * volume icon -- one already-established "what does this level look
+     * like" mapping, not a second one invented for this popup. */
+    const icon_t *vic = v <= 0 ? &icon_vol_mute : v < 34 ? &icon_vol_low
+                       : v < 67 ? &icon_vol_mid : &icon_vol_high;
+    draw_icon(fb, FB_W, FB_H, icon_x, icon_y, vic, themed ? np_col_dim() : COL_DIM);
 
-    int by = vol_bar_y(), bw = FB_W - 48;
-    fill_rect(fb, 24, by, bw, 8, COL_LINE);
+    fill_rect(fb, bx, by, bw, 8, themed ? np_col_line() : COL_LINE);
     int filled = bw * v / 100;
-    fill_rect(fb, 24, by, filled, 8, COL_ACCENT);
-    fill_circle(fb, 24 + filled, by + 4, 13, COL_ACCENT);
+    uint16_t accent = themed ? np_col_accent() : COL_ACCENT;
+    if (filled > 0) fill_rect(fb, bx, by, filled, 8, accent);
+    fill_circle(fb, bx + filled, by + 4, 13, accent);
 }
 
 /* R60: confirms a hardware seek actually landed, and by how much -- see
@@ -9716,13 +9716,78 @@ static void draw_ui(uint16_t *fb) {
     /* One lock/unlock for the whole frame -- see g_view_art_gone_frame's own
      * comment above view_art_gone(). */
     g_view_art_gone_frame = view_art_gone();
-    draw_screen(fb);
-    if (index_visible()) draw_index(fb);
-    if (mini_visible()) draw_mini(fb);
-    if (sheet_open) draw_sheet(fb);
-    if (qs_open) draw_quick_settings(fb);
-    else if (vol_ticks > 0) draw_volume(fb);
-    else if (screen == SC_PLAYING && seek_toast_ticks > 0) draw_seek_toast(fb);
+
+    /* R-qsslide: qs_slide, not qs_open, gates what's actually painted --
+     * see its own comment.
+     *
+     * Reported live, three times: (1) this wants to read like pulling down
+     * a blind, not a panel growing downward from the top -- a small pull
+     * should show the *bottom* of the panel first (the grab handle end),
+     * with more of it arriving from there as the pull continues, the panel
+     * itself only finally reaching its own top edge right as it settles
+     * fully open. So the visible sliver [0, qs_slide) on screen is always
+     * the panel's own *last* qs_slide rows, [QS_H - qs_slide, QS_H) -- the
+     * copy below reads from that offset, not from the scratch buffer's
+     * start. (2) a full draw_quick_settings() call every single tick of the
+     * drag was "extremely unperformant": every row's icons/text/toggle
+     * redrawn dozens of times a second for content that, during a pull, has
+     * not actually changed at all (Wi-Fi/Bluetooth state, the format
+     * readout -- nothing on this panel updates from user input while the
+     * user's own finger is busy dragging the reveal itself). (3) "still
+     * could be faster" -- draw_screen()/draw_index()/draw_mini()/
+     * draw_sheet() were still repainting the *entire* screen underneath
+     * from scratch every one of those same ticks, unconditionally, before
+     * this block even runs, for the exact same reason (3): none of it can
+     * change while the finger is occupied dragging this. qs_bg_scratch is
+     * that answer applied to the background the same way qs_slide_scratch
+     * already was to the panel -- rendered once per reveal, into its own
+     * cache, and every subsequent tick of the SAME reveal restores it with
+     * a plain memcpy (far cheaper than repainting text/icons/art) rather
+     * than calling any of those draw functions again. Both caches share one
+     * fresh flag: they always go stale together (a new reveal starting) and
+     * come back together, so one flag is enough. Only [0, QS_H) of the
+     * background needs caching at all -- the strip below the panel's own
+     * max extent (QS_H) is never touched by any of this in any state, so
+     * whatever's already sitting in fb there from before the reveal started
+     * is already correct and is simply left alone. */
+    static uint16_t *qs_bg_scratch, *qs_slide_scratch;
+    static int qs_scratch_fresh;
+    if (qs_slide > 0 && qs_slide < QS_H) {
+        if (!qs_bg_scratch)    qs_bg_scratch    = malloc((size_t)FB_W * QS_H * sizeof(uint16_t));
+        if (!qs_slide_scratch) qs_slide_scratch = malloc((size_t)FB_W * FB_H * sizeof(uint16_t));
+        if (qs_bg_scratch && qs_slide_scratch) {
+            if (!qs_scratch_fresh) {
+                draw_screen(fb);
+                if (index_visible()) draw_index(fb);
+                if (mini_visible()) draw_mini(fb);
+                if (sheet_open) draw_sheet(fb);
+                memcpy(qs_bg_scratch, fb, (size_t)FB_W * QS_H * sizeof(uint16_t));
+                draw_quick_settings(qs_slide_scratch);
+                qs_scratch_fresh = 1;
+            } else {
+                memcpy(fb, qs_bg_scratch, (size_t)FB_W * QS_H * sizeof(uint16_t));
+            }
+            memcpy(fb, qs_slide_scratch + (size_t)(QS_H - qs_slide) * FB_W,
+                  (size_t)FB_W * qs_slide * sizeof(uint16_t));
+        } else {
+            /* malloc failed -- fall all the way back to painting everything
+             * fresh every tick, same as before any of this existed. */
+            draw_screen(fb);
+            if (index_visible()) draw_index(fb);
+            if (mini_visible()) draw_mini(fb);
+            if (sheet_open) draw_sheet(fb);
+            draw_quick_settings(fb);
+        }
+    } else {
+        qs_scratch_fresh = 0;   /* next partial reveal renders both caches fresh again */
+        draw_screen(fb);
+        if (index_visible()) draw_index(fb);
+        if (mini_visible()) draw_mini(fb);
+        if (sheet_open) draw_sheet(fb);
+        if (qs_slide >= QS_H) draw_quick_settings(fb);
+        else if (vol_ticks > 0) draw_volume(fb);
+        else if (screen == SC_PLAYING && seek_toast_ticks > 0) draw_seek_toast(fb);
+    }
     if (edge_active) draw_back_hint(fb);
     if (home_edge_active) draw_home_hint(fb);
     if (power_hold_ui_shown) draw_power_hold(fb);   /* R77: on top of everything else */
@@ -11231,6 +11296,7 @@ int music_entry(void *a0, void *a1) {
 
     bt_poll_run = 1;
     bt_thread_valid = (pthread_create(&bt_thread, NULL, bt_poll, NULL) == 0);
+    waveform_start(mlog);   /* R29: background shape worker -- see waveform.c */
 
     /* Redrawing every 33 ms regardless burns CPU on a screen that is usually
      * static, and this app exists partly because the stock one is not smooth.
@@ -11427,16 +11493,22 @@ int music_entry(void *a0, void *a1) {
         }
         /* Also opened on a completed drag, not only by following the finger
          * down. A quick flick can be delivered entirely within one poll, and
-         * then the live tracking never sees a finger that is still down. */
-        if (!qs_open && g == 2 && touch_y < QS_PULL_ZONE &&
+         * then the live tracking never sees a finger that is still down.
+         * !qs_pulling: if the live tracking below in the main tick loop DID
+         * see this drag, it has already decided open-or-cancel for itself
+         * off the real reveal distance (qs_slide) by the time release gets
+         * here -- this fallback re-deciding off `y` against the much lower
+         * QS_PULL bar could force it back open right after a genuine
+         * cancel. */
+        if (!qs_open && !qs_pulling && g == 2 && touch_y < QS_PULL_ZONE &&
             !(vol_ticks > 0 && touch_y >= STATUS_H) && y > QS_PULL) {
             qs_open = 1;
             qs_refresh();
             dirty = 1; idle = 0;
         } else if (vol_ticks > 0 && !qs_open && g == 1 &&
                    y >= STATUS_H && y < STATUS_H + VOL_H) {
-            int bw = FB_W - 48;
-            int v = (x - 24) * 100 / (bw > 0 ? bw : 1);
+            int bw = vol_bar_w();
+            int v = (x - vol_bar_x()) * 100 / (bw > 0 ? bw : 1);
             audio_volume_set(v < 0 ? 0 : (v > 100 ? 100 : v));
             vol_ticks = VOL_TICKS;
             dirty = 1; idle = 0;
@@ -11461,55 +11533,80 @@ int music_entry(void *a0, void *a1) {
                 qs_open = 0;
             } else if (g == 1) {
                 int by = qs_bar_y();
-                if (x > qs_gear_x() - 16 && y < qs_gear_y() + 36) {
-                    /* R51: straight to the full Settings menu, closing the
-                     * panel first -- left open behind it, the next "back"
-                     * from Settings would have reopened this instead of
-                     * returning to wherever the panel was pulled down over. */
-                    qs_open = 0;
-                    screen = SC_SETTINGS;
-                    reset_scroll();
-                } else if (y > by - 26 && y < by + 26) {
-                    int bw = FB_W - 48;
-                    int v = (x - 24) * qs_bright_max / (bw > 0 ? bw : 1);
+                /* R-qsicon: the Settings-shortcut cog is gone (see
+                 * draw_quick_settings()'s own comment) -- this row is just
+                 * the brightness bar now, full stop. */
+                if (y > by - 26 && y < by + 26) {
+                    int bw = qs_bar_w();
+                    int v = (x - qs_bar_x()) * qs_bright_max / (bw > 0 ? bw : 1);
                     qs_bright = v < 1 ? 1 : (v > qs_bright_max ? qs_bright_max : v);
                     st_brightness_set(qs_bright);
                     saved_brightness = qs_bright;
                     brightness_pref = qs_bright;
                     save_conf();          /* R64 */
                 } else if (y > qs_wifi_y() && y < qs_wifi_y() + QS_ROW_H) {
-                    qs_wifi = !qs_wifi;
-                    st_wifi_set(qs_wifi);
-                    wifi_pref = qs_wifi;
-                    save_conf();          /* R64 */
-                } else if (y > qs_bt_y() && y < qs_bt_y() + QS_ROW_H) {
-                    qs_bt = !qs_bt;
-                    st_bt_set(qs_bt);
-                    bt_pref = qs_bt;
-                    save_conf();          /* R64 */
-                } else if (y > qs_usb_y() && y < qs_usb_y() + QS_ROW_H) {
-                    qs_open = 0;
-                    screen = SC_SETTINGS_USB; reset_scroll();
-                } else if (y > qs_eq_y() && y < qs_eq_y() + QS_ROW_H) {
-                    if (x > FB_W - 100) {
-                        eq_set_enabled(!eq_enabled());
-                        save_conf();          /* BG38 */
+                    /* R-qsgrid: Wi-Fi (left) / Bluetooth (right), same row
+                     * now -- x < FB_W / 2 is which cell a tap landed in,
+                     * same split the draw code's own two columns use. */
+                    if (x < FB_W / 2) {
+                        qs_wifi = !qs_wifi;
+                        st_wifi_set(qs_wifi);
+                        wifi_pref = qs_wifi;
+                        save_conf();          /* R64 */
                     } else {
-                        /* Closed first, not left open behind the sheet --
-                         * qs_open && g==1 is checked ahead of sheet_open in
-                         * this chain, so a sheet row tap would otherwise be
-                         * swallowed here instead of reaching the sheet. */
-                        qs_open = 0;
-                        eq_profile_n = ep_scan(eq_profiles, EP_MAX_PROFILES);
-                        sheet_open = 3;
+                        qs_bt = !qs_bt;
+                        st_bt_set(qs_bt);
+                        bt_pref = qs_bt;
+                        save_conf();          /* R64 */
                     }
-                } else if (y > qs_mseb_y() && y < qs_mseb_y() + QS_ROW_H) {
-                    /* No sheet to open for this one -- there's nothing to
-                     * pick, just the one fixed set of bands -- so the whole
-                     * row toggles, not just the switch end of it. */
-                    mseb_on = !mseb_on;
-                    eq_set_mseb(mseb_on, mseb_gain);
-                    mseb_save(mseb_gain, mseb_on);
+                } else if (y > qs_eq_y() && y < qs_eq_y() + QS_ROW_H) {
+                    /* Parametric EQ (left) / MSEB (right), same row. EQ
+                     * keeps its own two-zone split within its cell -- the
+                     * icon toggles enable/disable in place (no switch to do
+                     * that with any more), the rest of the cell still opens
+                     * the profile picker, since unlike MSEB there's
+                     * something to pick. */
+                    if (x < FB_W / 2) {
+                        if (x < qs_col_x(0) + 50) {
+                            eq_set_enabled(!eq_enabled());
+                            save_conf();          /* BG38 */
+                        } else {
+                            /* Closed first, not left open behind the sheet --
+                             * qs_open && g==1 is checked ahead of sheet_open
+                             * in this chain, so a sheet row tap would
+                             * otherwise be swallowed here instead of
+                             * reaching the sheet. */
+                            qs_open = 0;
+                            eq_profile_n = ep_scan(eq_profiles, EP_MAX_PROFILES);
+                            sheet_open = 3;
+                        }
+                    } else {
+                        /* No sheet to open for this one -- there's nothing
+                         * to pick, just the one fixed set of bands -- so the
+                         * whole cell toggles. */
+                        mseb_on = !mseb_on;
+                        eq_set_mseb(mseb_on, mseb_gain);
+                        mseb_save(mseb_gain, mseb_on);
+                    }
+                } else if (y > qs_cover_y() && y < qs_cover_y() + QS_ROW_H) {
+                    /* Cover colours (left) / USB working mode (right), same
+                     * row. */
+                    if (x < FB_W / 2) {
+                        /* Same toggle + side effects as Settings' own row
+                         * for this (see its comment there): force a
+                         * recompute so the change is visible immediately
+                         * rather than on the next track/album change, and
+                         * catch up any covers a scan already indexed while
+                         * this was off. */
+                        cover_palette_enabled = !cover_palette_enabled;
+                        np_palette_seq = -1;
+                        np_view_palette_seq = -1;
+                        if (cover_palette_enabled) cover_prewarm_start();
+                        save_conf();
+                    } else {
+                        qs_open = 0;
+                        screen = SC_SETTINGS_USB; reset_scroll();
+                    }
                 } else if (y > QS_H) {
                     qs_open = 0;                    /* tapped away */
                 }
@@ -12779,24 +12876,21 @@ int music_entry(void *a0, void *a1) {
          * matter, infrequent enough not to wear the card writing it. */
         if (++ab_pos_tick >= 450) { ab_pos_tick = 0; ab_save_current_pos(); pod_save_current_pos(); }
 
-        /* R29: waveform seek bar, Music only -- sampled on this same poll
-         * every other live readout in this app already runs on, not a
-         * callback from the decode thread. Paused reads nothing (a paused
-         * chunk's peak is stale, from whenever playback actually last
-         * wrote), which is fine -- the bucket it would have landed in gets
-         * filled in on the next unpaused tick at the same position. */
-        if (wave_capturing && audio_is_active() && !audio_is_paused()) {
-            int dur = audio_dur_ms();
-            if (dur > 0) {
-                int pos = audio_pos_ms();
-                int b = (int)((int64_t)pos * WAVE_BUCKETS / dur);
-                if (b < 0) b = 0;
-                if (b >= WAVE_BUCKETS) b = WAVE_BUCKETS - 1;
-                int32_t peak = audio_current_peak();
-                if (peak > (int32_t)wave_capture[b]) wave_capture[b] = (uint32_t)peak;
-                wave_touched[b] = 1;
-                if (b > wave_last_bucket) wave_last_bucket = b;
-            }
+        /* R29: pick up the shape once waveform.c's worker has it. A lock and
+         * a string compare while waiting, and nothing at all once loaded. */
+        if (!wave_loaded && wave_path[0] && waveform_get(wave_path, wave_buckets)) {
+            wave_loaded = 1;
+            if (screen == SC_PLAYING) dirty = 1;
+            /* Settled, so the worker is about to go idle: point it at whatever
+             * this queue plays next, which is where it is needed a few minutes
+             * from now. Only for plain music -- next_track_index() answers for
+             * audiobooks, podcasts and radio too (see its own comment), and
+             * none of those draw a waveform. A skip drops the prefetch
+             * mid-decode; see waveform.c's still_wanted(). */
+            int nxt = (!podcast_mode && !audiobook_mode && !radio_mode &&
+                       !recording_playback_mode) ? next_track_index() : -1;
+            waveform_prefetch(nxt >= 0 && nxt < queue_n && nxt != cur_track
+                              ? queue[nxt].path : "");
         }
 
         /* The LIVE/-M:SS readout needs to visibly advance in real time even
@@ -12895,8 +12989,8 @@ int music_entry(void *a0, void *a1) {
         if (vol_ticks > 0 && touch_down && !qs_open && !usb_bypass_active &&
             touch_y >= STATUS_H && touch_y < STATUS_H + VOL_H) {
             if (!vol_dragging) { vol_dragging = 1; vol_applied = audio_volume(); }
-            int bw = FB_W - 48;
-            int v = (live_x - 24) * 100 / (bw > 0 ? bw : 1);
+            int bw = vol_bar_w();
+            int v = (live_x - vol_bar_x()) * 100 / (bw > 0 ? bw : 1);
             if (v < 0) v = 0;
             if (v > 100) v = 100;
             if (v != vol_drag_pct) { vol_drag_pct = v; dirty = 1; }
@@ -12922,20 +13016,63 @@ int music_entry(void *a0, void *a1) {
         }
 
         /* Pull down from the status strip to open quick settings; the panel is
-         * modal while it is open, so nothing below it needs to know. */
+         * modal while it is open, so nothing below it needs to know.
+         * R-qsslide: qs_slide now follows the finger one-to-one for as long
+         * as it's down (qs_pulling latches once the drag clears QS_PULL, so
+         * the finger doesn't have to stay past that exact line to keep
+         * tracking -- only to start). Release decides open or cancel below,
+         * off the real reveal distance rather than a fixed early threshold. */
         if (!qs_open && touch_down && touch_y < QS_PULL_ZONE &&
             !(vol_ticks > 0 && touch_y >= STATUS_H) &&
-            live_y - touch_y > QS_PULL) {
-            qs_open = 1;
-            qs_refresh();
+            (qs_pulling || live_y - touch_y > QS_PULL)) {
+            qs_pulling = 1;
+            int d = live_y - touch_y;
+            qs_slide = d < 0 ? 0 : (d > QS_H ? QS_H : d);
             dirty = 1; idle = 0;
+        } else if (qs_pulling && !touch_down) {
+            qs_pulling = 0;
+            /* A third of the way down commits to opening, same spirit as
+             * QS_PULL's own "how far before it counts" but measured against
+             * the real reveal now that there is one, not a fixed 40px that
+             * made sense only for an instant all-or-nothing flip. */
+            if (qs_slide >= QS_H / 3) {
+                qs_open = 1;
+                qs_refresh();
+            }
+            dirty = 1; idle = 0;
+        }
+
+        /* R-qsslide: eases qs_slide toward qs_open ? QS_H : 0 every tick it
+         * isn't already there -- covers every way qs_open can change
+         * (opening from the block above, a cancelled pull snapping back,
+         * tapping away, the grab-handle swipe, back) with one shared
+         * animation rather than each needing its own. Skipped while
+         * qs_pulling: that block is already driving qs_slide directly off
+         * the finger, which reads as far more responsive than easing toward
+         * a live-moving target would. */
+        if (!qs_pulling) {
+            int target = qs_open ? QS_H : 0;
+            if (qs_slide != target) {
+                int step = (target - qs_slide) / 3;
+                if (step == 0) step = target > qs_slide ? 1 : -1;
+                qs_slide += step;
+                if ((step > 0 && qs_slide > target) || (step < 0 && qs_slide < target))
+                    qs_slide = target;
+                dirty = 1;
+            }
         }
 
         /* Dragging the brightness bar sets it live rather than on release: it
          * is the one setting where you want to see the result while choosing. */
         if (qs_open && qs_dragging && touch_down) {
-            int bw = FB_W - 48;
-            int v = (live_x - 24) * qs_bright_max / (bw > 0 ? bw : 1);
+            /* R-poptheme: the panel visually collapses to just the slider
+             * while dragging (see draw_quick_settings()'s own comment) --
+             * tracks the finger against that collapsed bar's geometry
+             * (shared with the volume popup, vol_bar_x()/vol_bar_w()), not
+             * the full panel's, since that's what's actually on screen once
+             * qs_dragging is true. */
+            int bw = vol_bar_w();
+            int v = (live_x - vol_bar_x()) * qs_bright_max / (bw > 0 ? bw : 1);
             if (v != qs_bright) {
                 qs_bright = v < 1 ? 1 : (v > qs_bright_max ? qs_bright_max : v);
                 st_brightness_set(qs_bright);
@@ -13726,10 +13863,10 @@ int music_entry(void *a0, void *a1) {
                         (now.tv_nsec - touch_at.tv_nsec) / 1000000L;
             if (held >= HOLD_MS) {
                 screen_t target = SC_MENU;   /* sentinel: no row held */
+                /* R-qsgrid: Wi-Fi/Bluetooth share one row now, split by
+                 * column (touch_x) same as the tap handler's own. */
                 if (touch_y > qs_wifi_y() && touch_y < qs_wifi_y() + QS_ROW_H)
-                    target = SC_SETTINGS_WIFI;
-                else if (touch_y > qs_bt_y() && touch_y < qs_bt_y() + QS_ROW_H)
-                    target = SC_SETTINGS_BT;
+                    target = touch_x < FB_W / 2 ? SC_SETTINGS_WIFI : SC_SETTINGS_BT;
                 if (target != SC_MENU) {
                     hold_fired = 1;
                     qs_open = 0;

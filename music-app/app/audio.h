@@ -46,13 +46,13 @@ int  audio_is_active(void);
 int  audio_is_paused(void);
 int  audio_pos_ms(void);
 int  audio_dur_ms(void);
-/* R29: raw abs-sample peak of the most recent output chunk -- see
- * g_last_peak's own comment in audio.c for why this is deliberately
- * unscaled. For the Music-only waveform seek bar: sample this on a UI-
- * thread poll while a track plays and bucket it by audio_pos_ms(), the
- * same way every other live readout in this app is built from a poll
- * rather than a callback. */
-int32_t audio_current_peak(void);
+/* The loudness shape of a whole local file: level[0..n-1] gets the RMS of
+ * each of n equal stretches of it, from a private decode that is safe to run
+ * alongside playback. keep_going (may be NULL) is asked between chunks.
+ * 1 = filled, 0 = nothing measurable, -1 = stopped by keep_going. See the
+ * comment above its definition. Slow -- call from a background thread. */
+int audio_envelope(const char *path, uint32_t *level, int n,
+                   int (*keep_going)(void *), void *ctx);
 
 /* Radio time-shift seeking (radio streams only -- audio_dur_ms()/
  * audio_pos_ms() do not apply to a live stream). See radio_buffer.h for the

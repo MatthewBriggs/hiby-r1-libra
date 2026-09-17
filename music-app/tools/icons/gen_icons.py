@@ -60,6 +60,16 @@ SPECS = [
     ("batt", "battery-half-solid-full.svg.png",           "batt_50", [(26, 14, "")]),
     ("batt", "battery-three-quarters-solid-full.svg.png", "batt_75", [(26, 14, "")]),
     ("batt", "battery-full-solid-full.svg.png",           "batt_100",[(26, 14, "")]),
+    # Brightness glyph for the quick-settings slider, same left-of-bar spot
+    # the volume popup's own icon_vol_* sits in. Font Awesome Free has no
+    # graduated low/mid/high brightness family the way volume does (no
+    # "brightness-low.svg" etc. exist) -- one glyph, themed/dimmed the same
+    # way any other single-state icon in this app already is, rather than a
+    # fabricated multi-shape family with no real source asset behind it.
+    ("sun", "sun-solid-full.svg.png", "sun", [(20, 20, "")]),
+    # Quick-settings row icon for the cover-colours toggle -- same 28x28
+    # weight as the Wi-Fi/Bluetooth/EQ glyphs sharing that column.
+    ("palette", "palette-solid-full.svg.png", "palette", [(28, 28, "_qs")]),
 ]
 
 def load_full(path):
