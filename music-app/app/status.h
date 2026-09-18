@@ -24,6 +24,9 @@ void st_bt_name(char *out, unsigned n);
  *
  * paired: bluez's own Paired property, filled by bt_fill_details(). */
 typedef struct { char mac[18]; char name[48]; int rssi; int paired; } bt_found_dev_t;
+/* The a2dp sink PCM of the connected headset, as bluealsa names it, or 0 if
+ * there is none. Same match bt_pcm_path() documents internally. */
+int st_bt_pcm_path(char *out, unsigned n);
 void bt_scan_start(void);
 int  bt_scan_devices(bt_found_dev_t *out, int max);   /* returns count found, <= max */
 /* Fills in the rssi and paired fields of an already-populated

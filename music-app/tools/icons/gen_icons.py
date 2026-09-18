@@ -38,10 +38,20 @@ SPECS = [
     ("skiprot", "arrow-rotate-left-solid-full.svg.png",  "skip_back",    [(56, 56, "")]),
     ("skiprot", "arrow-rotate-right-solid-full.svg.png", "skip_forward", [(56, 56, "")]),
     ("bt",   "bluetooth-brands-solid-full.svg.png", "bt",   [(26, 38, "_qs"), (16, 16, "_sm")]),
-    ("usb",  "usb-brands-solid-full.svg.png",       "usb",  [(16, 16, "_sm"), (32, 32, "_qs")]),
+    # _qs bumped 32 -> 38: reported live sitting next to Wi-Fi/Bluetooth in
+    # quick settings' USB mode row, it read a touch smaller than those two
+    # (48x34 and 26x38) despite being close on paper -- USB's own glyph has
+    # more internal padding baked into the source SVG, so matching the
+    # bounding box wasn't matching the visual weight.
+    ("usb",  "usb-brands-solid-full.svg.png",       "usb",  [(16, 16, "_sm"), (38, 38, "_qs")]),
     ("wifi", "wifi-solid-full.svg.png",             "wifi", [(48, 34, "_qs")]),
     ("gear", "gear-solid-full.svg.png",             "gear", [(20, 20, "_qs")]),
-    ("disc", "compact-disc-solid-full.svg.png",     "disc", [(28, 28, "")]),
+    # _qs added: quick settings' own Format row reuses this glyph at the
+    # same 38x38 weight as Cover colours/USB mode in that panel (reported
+    # live, still the small 28 while its neighbours grew) -- kept separate
+    # from the plain "" variant, which is the multi-disc album banner's own
+    # icon in the track list and must stay its own tuned size.
+    ("disc", "compact-disc-solid-full.svg.png",     "disc", [(28, 28, ""), (38, 38, "_qs")]),
     # Family, not three singletons: these three swap for one another at the
     # exact same on-screen spot (Now Playing's mode-cycle button), so they
     # need the shared-crop-box treatment the family mechanism exists for --
@@ -55,11 +65,18 @@ SPECS = [
     ("vol",  "volume-low-solid-full.svg.png",       "vol_low",  [(20, 20, "")]),
     ("vol",  "volume-solid-full.svg.png",           "vol_mid",  [(20, 20, "")]),
     ("vol",  "volume-high-solid-full.svg.png",      "vol_high", [(20, 20, "")]),
-    ("batt", "battery-empty-solid-full.svg.png",          "batt_0",  [(26, 14, "")]),
-    ("batt", "battery-quarter-solid-full.svg.png",        "batt_25", [(26, 14, "")]),
-    ("batt", "battery-half-solid-full.svg.png",           "batt_50", [(26, 14, "")]),
-    ("batt", "battery-three-quarters-solid-full.svg.png", "batt_75", [(26, 14, "")]),
-    ("batt", "battery-full-solid-full.svg.png",           "batt_100",[(26, 14, "")]),
+    # _qs: quick-settings' own Format row sits the battery glyph next to the
+    # disc icon (28x28) on the same row -- explicit request that it read at
+    # the same size as every other icon in that panel instead of the small
+    # native 26x14 this family was originally sized for (a plain status-bar
+    # inline reading, still used unchanged everywhere else). 20px tall to
+    # match icon_gear_qs; width follows from the family's own aspect ratio
+    # (~1.86:1), not set independently.
+    ("batt", "battery-empty-solid-full.svg.png",          "batt_0",  [(26, 14, ""), (37, 20, "_qs")]),
+    ("batt", "battery-quarter-solid-full.svg.png",        "batt_25", [(26, 14, ""), (37, 20, "_qs")]),
+    ("batt", "battery-half-solid-full.svg.png",           "batt_50", [(26, 14, ""), (37, 20, "_qs")]),
+    ("batt", "battery-three-quarters-solid-full.svg.png", "batt_75", [(26, 14, ""), (37, 20, "_qs")]),
+    ("batt", "battery-full-solid-full.svg.png",           "batt_100",[(26, 14, ""), (37, 20, "_qs")]),
     # Brightness glyph for the quick-settings slider, same left-of-bar spot
     # the volume popup's own icon_vol_* sits in. Font Awesome Free has no
     # graduated low/mid/high brightness family the way volume does (no
@@ -69,7 +86,9 @@ SPECS = [
     ("sun", "sun-solid-full.svg.png", "sun", [(20, 20, "")]),
     # Quick-settings row icon for the cover-colours toggle -- same 28x28
     # weight as the Wi-Fi/Bluetooth/EQ glyphs sharing that column.
-    ("palette", "palette-solid-full.svg.png", "palette", [(28, 28, "_qs")]),
+    # Bumped 28 -> 38, same reasoning and same live report as USB just
+    # above -- sits next to Wi-Fi/Bluetooth-sized glyphs in the same panel.
+    ("palette", "palette-solid-full.svg.png", "palette", [(38, 38, "_qs")]),
 ]
 
 def load_full(path):

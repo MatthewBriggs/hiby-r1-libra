@@ -26,8 +26,15 @@ int  audio_seek_pending_ms(void);
  * may be NULL. Returns 0 on success (a format this app can open at all),
  * -1 otherwise. See audio_probe_format()'s own comment in audio.c for what
  * each field costs to get and how MP3 differs from everything else. */
+/* `codec` reports which of two codecs an .m4a turned out to hold, the one
+ * case a container's own format code cannot express: AAC and Apple Lossless
+ * share the same container and the same code. AUDIO_CODEC_OTHER for every
+ * other format, where the container already answers. May be NULL. */
+#define AUDIO_CODEC_OTHER 0
+#define AUDIO_CODEC_AAC   1
+#define AUDIO_CODEC_ALAC  2
 int audio_probe_format(const char *path, int *bits, int *rate,
-                       int *bitrate_bps, int *dur_ms);
+                       int *bitrate_bps, int *dur_ms, int *codec);
 /* Pitch-preserving playback speed (WSOLA), permille: 1000 = 1.0x, clamped to
  * [800,2000]. 1000 bypasses WSOLA entirely -- exact passthrough, same as
  * before this existed. Applies to the 16-bit output path only; a hires

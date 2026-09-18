@@ -27,11 +27,15 @@ void waveform_start(void (*log)(const char *fmt, ...));
  * compare, and a copy once ready. */
 int waveform_get(const char *path, uint8_t *out);
 
-/* The track likely to be wanted next -- the queue's next entry. Worked out
- * only once the track on screen is settled, and dropped the instant that
- * stops being true, so it never delays the shape anybody is waiting for. The
- * result goes to the cache rather than to waveform_get(), which finds it
- * there when the track actually arrives. "" to want nothing. */
-void waveform_prefetch(const char *path);
+/* The next two tracks in the queue, in that order. Worked out only once the
+ * track on screen is settled, first then second, and dropped the instant that
+ * stops being true, so they never delay the shape anybody is waiting for.
+ * Results go to the cache rather than to waveform_get(), which finds them
+ * there when those tracks actually arrive. Either may be "" for nothing.
+ *
+ * Two rather than one so a skip forward lands on a shape that is already
+ * there: by the time the second track starts, the third is normally done and
+ * the fourth has been armed in its place. */
+void waveform_prefetch(const char *first, const char *second);
 
 #endif

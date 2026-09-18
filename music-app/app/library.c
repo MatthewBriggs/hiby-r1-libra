@@ -475,6 +475,52 @@ static int track_no_from_path(const char *path) {
     return v;
 }
 
+/* Drop a leading track number from a track's display name.
+ *
+ * Files are routinely named "01 - Title", "01. Title", "01 Title" or
+ * "Disc 1 - 01 - Title", and where no title tag exists the scanner falls back
+ * to that filename -- so the number shows up in the title, beside the track
+ * number the list already draws in its own column. Asked for: remove it
+ * wherever it appears.
+ *
+ * `track` is what makes this safe. The number is only dropped when it matches
+ * the track's own number, so "99 Problems" as track 3 keeps its title, and a
+ * "1999 - ..." that track_no_from_path() already refuses to read as a number
+ * is never touched either. With no known track number, only the unambiguous
+ * separators are accepted -- a plain space could be part of the title.
+ *
+ * Leaves the name alone rather than emptying it if there is nothing after the
+ * number: a file called "01.flac" has its number for a name and nothing else
+ * to show. */
+static void strip_track_prefix(char *name, int track) {
+    char *p = name;
+    if (!strncasecmp(p, "disc", 4)) {
+        char *dash = strchr(p, '-');
+        if (!dash) return;
+        p = dash + 1;
+        while (*p == ' ' || *p == '_') p++;
+    }
+    if (!isdigit((unsigned char)*p)) return;
+
+    char *d = p;
+    int v = 0, digits = 0;
+    while (isdigit((unsigned char)*d) && digits < 3) { v = v * 10 + (*d++ - '0'); digits++; }
+    if (isdigit((unsigned char)*d)) return;      /* a longer run: a year, not a track */
+
+    /* The separator, and how much trust it earns on its own. */
+    char *t = d;
+    int marked = 0;
+    while (*t == ' ' || *t == '_') t++;
+    if (*t == '-' || *t == '.' || *t == ')') { marked = 1; t++; }
+    while (*t == ' ' || *t == '_') t++;
+    if (t == d) return;                          /* no separator at all */
+    if (!marked && track != v) return;           /* "99 Problems" keeps its 99 */
+    if (track > 0 && v != track && !marked) return;
+    if (!*t) return;                             /* nothing left to show */
+
+    memmove(name, t, strlen(t) + 1);
+}
+
 /* Files here are often named "01-03 Title" — disc, then track. Where the tags
  * do not carry a disc number, that prefix is the only thing separating one
  * disc of a boxed set from the next. */
@@ -735,7 +781,7 @@ static int tracks_query(const char *artist, const char *album, int use_artist,
          * library that's already fine. */
         if (t->bitrate <= 0 && is_mp3_path(t->path)) {
             int pbits, prate, pbitrate, pdur;
-            if (audio_probe_format(t->path, &pbits, &prate, &pbitrate, &pdur) == 0 && pbitrate > 0)
+            if (audio_probe_format(t->path, &pbits, &prate, &pbitrate, &pdur, NULL) == 0 && pbitrate > 0)
                 t->bitrate = pbitrate;
         }
         if (t->dur_ms <= 0) t->dur_ms = audio_probe_dur_ms(t->path, t->bitrate);
@@ -751,6 +797,7 @@ static int tracks_query(const char *artist, const char *album, int use_artist,
         }
         if (t->track <= 0) t->track = track_no_from_path(t->path);
         if (t->disc <= 0) t->disc = disc_no_from_path(t->path);
+        strip_track_prefix(t->name, t->track);
         n++;
     }
     sqlite3_finalize(st);
@@ -980,7 +1027,7 @@ int lib_track_by_path(const char *real, lib_track_t *out) {
          * see its own comment (BG-revolver). */
         if (out->bitrate <= 0 && is_mp3_path(out->path)) {
             int pbits, prate, pbitrate, pdur;
-            if (audio_probe_format(out->path, &pbits, &prate, &pbitrate, &pdur) == 0 && pbitrate > 0)
+            if (audio_probe_format(out->path, &pbits, &prate, &pbitrate, &pdur, NULL) == 0 && pbitrate > 0)
                 out->bitrate = pbitrate;
         }
         if (out->dur_ms <= 0) out->dur_ms = audio_probe_dur_ms(out->path, out->bitrate);
@@ -992,6 +1039,7 @@ int lib_track_by_path(const char *real, lib_track_t *out) {
         }
         if (out->track <= 0) out->track = track_no_from_path(out->path);
         if (out->disc <= 0) out->disc = disc_no_from_path(out->path);
+        strip_track_prefix(out->name, out->track);
         rc = 0;
     }
     sqlite3_finalize(st);
@@ -1054,6 +1102,11 @@ const char *lib_format_name(int code) {
         case 61868: case 0: return "FLAC";
         case 85:            return "MP3";
         case 278: case 41388: return "AAC";
+        /* This app's own codes, never written by the stock scanner: an .m4a
+         * holds AAC or Apple Lossless and 278 cannot say which, so scanner.c
+         * records what the probe actually found. */
+        case LIB_FORMAT_ALAC:    return "ALAC";
+        case LIB_FORMAT_AAC_M4A: return "AAC";
         case 1:             return "WAV";
         default:            return "?";
     }

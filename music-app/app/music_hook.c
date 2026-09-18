@@ -1041,13 +1041,47 @@ static void derive_palette_from_bits(const uint16_t *bits, uint16_t *out_bg,
     float bh, bs, bl, ah, as, al;
     rgb8_to_hsl(bgr, bgg, bgb, &bh, &bs, &bl);
     rgb8_to_hsl(acr, acg, acb, &ah, &as, &al);
+
+    /* R-npbgsat: reported live -- "bright red background", Billy Bragg's
+     * England, Half English. Luma (0.299R + 0.587G + 0.114B) rates pure red
+     * a mere 0.299, so a vivid, fully-saturated red lands well inside the
+     * < 0.45 "dark" pool hist_dark draws backgrounds from despite reading
+     * as anything but dark to an eye -- saturation, not luma, is what makes
+     * a colour feel "bright" here, and nothing capped it for the
+     * background the way NP_MAX_SAT already does for the accent just
+     * below. Capped tighter than the accent (0.32 vs 0.55): this fills the
+     * *entire screen*, not a slider a few pixels wide, so even a moderate
+     * saturation reads as overwhelming at that size. Same hue survives,
+     * same as the accent's own cap. */
+    #define NP_MAX_BG_SAT 0.32f
+    if (bs > NP_MAX_BG_SAT) {
+        bs = NP_MAX_BG_SAT;
+        hsl_to_rgb8(bh, bs, bl, &bgr, &bgg, &bgb);
+    }
+
+    /* R-npsat: reported live -- a fully-saturated primary (bright red/blue/
+     * yellow) the histogram above sometimes picks reads as garish once it's
+     * filling a whole slider or toggle rather than sitting in a few pixels
+     * of album art. Capped, not avoided at selection time: this keeps the
+     * winning *hue* (still "that album is red"), just backs off how intense
+     * it's allowed to render at -- 0.55 leaves real colour on screen
+     * without ever reaching the eye-searing top of the scale. Applied
+     * before the lightness push below, and unconditionally (not only when
+     * that push also fires), since a too-saturated accent that already had
+     * enough contrast against the background would otherwise skip this
+     * entirely. */
+    #define NP_MAX_SAT 0.55f
+    int sat_capped = as > NP_MAX_SAT;
+    if (sat_capped) as = NP_MAX_SAT;
+
     #define NP_MIN_L_DELTA 0.35f
-    if (al - bl < NP_MIN_L_DELTA) {
+    int need_l_push = al - bl < NP_MIN_L_DELTA;
+    if (need_l_push) {
         al = bl + NP_MIN_L_DELTA;
         if (al > 1.0f) al = 1.0f;
         if (as < 0.15f) as = 0.4f;   /* a washed-out accent gained no hue to push toward */
-        hsl_to_rgb8(ah, as, al, &acr, &acg, &acb);
     }
+    if (sat_capped || need_l_push) hsl_to_rgb8(ah, as, al, &acr, &acg, &acb);
 
     *out_bg     = rgb8_to_rgb565(bgr, bgg, bgb);
     *out_accent = rgb8_to_rgb565(acr, acg, acb);
@@ -1078,7 +1112,12 @@ static void derive_palette_from_bits(const uint16_t *bits, uint16_t *out_bg,
  * art itself didn't change; how it's read did) couldn't have caught
  * anyway. */
 #define PAL_CACHE_DIR "/data/mnt/sd_0/.cover_palettes"
-#define PAL_CACHE_VERSION 2
+/* Bumped twice so far, same reasoning both times (see the version-byte
+ * comment above): derive_palette_from_bits()'s own output for the same
+ * input changed. 2 -> 3 was NP_MAX_SAT (the accent's saturation cap);
+ * 3 -> 4 (R-npbgsat) is NP_MAX_BG_SAT, the same idea applied to the
+ * background after a live report of a fully-saturated red one. */
+#define PAL_CACHE_VERSION 4
 static void pal_cache_path(const char *artist, const char *album, char *out, size_t n) {
     unsigned long h = 5381;
     for (const unsigned char *p = (const unsigned char *)artist; *p; p++)
@@ -2294,14 +2333,28 @@ static int live_x, live_y;          /* where the finger is now, while it is down
  * Bluetooth are wanted often enough that leaving the app to reach them is the
  * annoyance; everything else stays in the firmware's own settings. */
 #define QS_ROW_H   72
+/* R-qsnotop/R-qsvol/R-qsnotop's own footer -- see qs_bar_y()/qs_vol_y()/
+ * qs_footer_y()'s own comments further down in this file for what each of
+ * these is. Defined up here too, ahead of QS_H just below, since a #define
+ * needs its pieces defined first and QS_H is derived from all three now. */
+/* R-qsshift: +10 (33 -> 43), taken from the Format-to-footer gap just below
+ * (QS_FORMAT_FOOTER_GAP, QS_ROW_H's own 72 -> 62) rather than added on top
+ * -- explicit request, and QS_H's own total stays exactly what it was
+ * either way (both sides of the trade cancel in the sum below). */
+#define QS_TOP_PAD      43
+#define QS_SLIDER_ROW_H 56
+#define QS_FOOTER_H     56
+#define QS_FORMAT_FOOTER_GAP 62   /* was QS_ROW_H (72) -- see QS_TOP_PAD's own comment */
 /* R-qsgrid: derived, not a literal any more -- Wi-Fi/Bluetooth, EQ/MSEB and
- * Cover colours/USB now pair up two-to-a-row (see qs_col_x()'s own comment
+ * Cover colours/USB pair up two-to-a-row (see qs_col_x()'s own comment
  * further down), with Format spanning both columns in its own row below the
- * grid. Was a hand-maintained literal through R-qsicon (600) and R-qscover
- * (672); tying it to STATUS_H + the brightness row's own known offset (96)
- * + 4 rows (3 of grid, 1 of Format) means it can't drift out of sync with
- * qs_codec_y() the way a hand-typed number already had once. */
-#define QS_H       (STATUS_H + 96 + 4 * QS_ROW_H)
+ * grid, and a two-slider (brightness, volume) header above it, and a
+ * footer row (output route, Settings) below Format, offset from it by
+ * QS_FORMAT_FOOTER_GAP rather than a fourth full QS_ROW_H. Was a
+ * hand-maintained literal through R-qsicon (600) and R-qscover (672); tying
+ * it to its own known pieces means it can't drift out of sync with
+ * qs_footer_y() the way a hand-typed number already had once. */
+#define QS_H       (QS_TOP_PAD + 2 * QS_SLIDER_ROW_H + 12 + 3 * QS_ROW_H + QS_FORMAT_FOOTER_GAP + QS_FOOTER_H)
 /* Row label column. Was a bare 68 until the Wi-Fi/Bluetooth/EQ row icons grew
  * larger -- Wi-Fi's natural width at its new height puts its right edge
  * exactly at 68, no gap at all, so the label column moved out to clear it.
@@ -2793,7 +2846,7 @@ static int settings_content_rows(void) {
  * pushed by hand, not by CI against a tagged commit), so this stays a
  * literal that a human edits; the discipline is remembering to, not the
  * mechanism. */
-#define LIBRARY_VERSION "0.54"
+#define LIBRARY_VERSION "0.55"
 
 /* A custom-built kernel keeps uname()'s own release string exactly
  * "4.4.94+" on purpose -- that string is also the vermagic every one of the
@@ -3708,8 +3761,14 @@ static int  q_is_playlist;
  * queue_apply_pending() only once playback actually reaches that track
  * -- so the header keeps naming whatever is actually audible right up
  * until it changes for real. -1/empty when nothing is pending. */
-static char q_artist_pending[LIB_NAME_LEN];
-static char q_album_pending[LIB_NAME_LEN];
+/* R-qident: BG85's single pending slot (one path, one artist/album) is a
+ * set now -- see the qid registry's own comment further down. These two remain only as the queue's *base*
+ * identity, captured the first time anything from another album is queued
+ * (see qid_record()), so that stepping back onto one of the original
+ * album's tracks restores it rather than leaving the last queued track's
+ * album showing. */
+static char q_base_artist[LIB_NAME_LEN];
+static char q_base_album[LIB_NAME_LEN];
 /* Which track the pending identity belongs to, by path rather than by the
  * queue index it happened to be inserted at.
  *
@@ -3724,7 +3783,55 @@ static char q_album_pending[LIB_NAME_LEN];
  * and its R84 same-album check then keeps the previous cover and leaves the
  * album line naming the previous album -- reported as Play Next sometimes not
  * changing the artwork or the album name. Empty means nothing is pending. */
-static char q_pending_path[LIB_PATH_LEN];
+/* R-qident: replaced with a registry keyed by path. Reported live: play a
+ * Florence track, queue Love Will Tear Us Apart and Transmission, swap them
+ * -- the title/artist/waveform followed Transmission but the cover and album
+ * line stayed Florence's. Two separate holes in the old single slot:
+ *   1. It was only ever filled by queue_play_next(). "Add to queue" went
+ *      through queue_insert() alone and recorded nothing, so reaching such a
+ *      track left q_album at the old album's, and art_request()'s R84
+ *      same-album check then kept the old cover.
+ *   2. Even for Play Next it held *one* track's identity: queueing a second
+ *      track overwrote the first's, so whichever the queue reached first
+ *      might have nothing recorded at all.
+ * One entry per queued track (path -> the album/artist it was browsed
+ * from), looked up by whatever track playback actually lands on, means
+ * reordering, deleting and stacking several are all irrelevant -- the path
+ * is the only thing that has to be right. Cleared wherever the old slot
+ * was: a fresh queue has nothing recorded. */
+#define QID_MAX 64
+static struct {
+    char path[LIB_PATH_LEN];
+    char artist[LIB_NAME_LEN];
+    char album[LIB_NAME_LEN];
+} qid[QID_MAX];
+static int qid_n;
+static void qid_clear(void) { qid_n = 0; q_base_artist[0] = q_base_album[0] = '\0'; }
+static int qid_find(const char *path) {
+    for (int i = 0; i < qid_n; i++) if (!strcmp(qid[i].path, path)) return i;
+    return -1;
+}
+/* artist/album: the identity of the album this track was queued *from*
+ * (what was being browsed). The base identity is whatever q_artist/q_album
+ * held the moment the first entry is added -- at that point the queue is
+ * still purely its original album. */
+static void qid_record(const char *path, const char *artist, const char *album) {
+    if (qid_n == 0) {
+        snprintf(q_base_artist, sizeof(q_base_artist), "%s", q_artist);
+        snprintf(q_base_album,  sizeof(q_base_album),  "%s", q_album);
+    }
+    int i = qid_find(path);
+    if (i < 0) {
+        if (qid_n >= QID_MAX) {     /* full: forget the oldest rather than the new one */
+            memmove(&qid[0], &qid[1], sizeof(qid[0]) * (QID_MAX - 1));
+            qid_n = QID_MAX - 1;
+        }
+        i = qid_n++;
+    }
+    snprintf(qid[i].path,   sizeof(qid[i].path),   "%s", path);
+    snprintf(qid[i].artist, sizeof(qid[i].artist), "%s", artist);
+    snprintf(qid[i].album,  sizeof(qid[i].album),  "%s", album);
+}
 /* BG73 follow-up: set the moment queue_play_next() drops an album's
  * leftover tracks in favour of a played-next one from somewhere else --
  * from then on queue[] no longer represents one browsable album (its own
@@ -4475,7 +4582,7 @@ static void pod_play_episode(int idx) {
     cur_track = 0;
     q_album[0] = '\0';
     q_artist[0] = '\0';
-    q_pending_path[0] = '\0';   /* BG85: podcasts never go through queue_play_next() */
+    qid_clear();   /* BG85: podcasts never go through queue_play_next() */
     /* Reported live: opening an episode right after something was actively
      * playing over Bluetooth (an audiobook, say) made it look stuck at 0:00
      * for 10-20s before jumping to the real resumed position. Root cause
@@ -4790,7 +4897,8 @@ static void queue_follower(void);
  * does something sensible rather than nothing. */
 static void queue_insert(int track_idx, int at) {
     if (track_idx < 0 || track_idx >= track_n) return;
-    if (queue_n == 0) {
+    int cold = queue_n == 0;
+    if (cold) {
         snprintf(q_artist, sizeof(q_artist), "%s", cur_artist);
         snprintf(q_album,  sizeof(q_album),  "%s", cur_album);
         q_is_playlist = browsing_is_playlist;
@@ -4801,6 +4909,12 @@ static void queue_insert(int track_idx, int at) {
             sizeof(queue[0]) * (size_t)(queue_n - at));
     queue[at] = tracks[track_idx];
     queue_n++;
+    /* R-qident: both Play Next and Add to queue land here, so this is the one
+     * place that records where a queued track came from. Not for a cold
+     * start (this track *is* the queue's base album) or a playlist (already
+     * an arbitrary mix, nothing to name). */
+    if (!cold && !q_is_playlist)
+        qid_record(tracks[track_idx].path, cur_artist, cur_album);
     if (at <= cur_track && queue_n > 1) cur_track++;   /* keep pointing at the same song */
     /* Reported live: "Add to queue" (not just Play Next) from a different
      * album while one was playing had the same wrong-album-page-on-swipe-
@@ -4832,7 +4946,16 @@ static void queue_insert(int track_idx, int at) {
 static void queue_play_next(int track_idx) {
     if (track_idx < 0 || track_idx >= track_n) return;
     if (queue_n > 0 && !q_is_playlist && cur_track + 1 < queue_n) {
-        queue_n = cur_track + 1;      /* drop the old album's leftovers */
+        /* Drop the old album's leftovers -- but not anything the user queued
+         * themselves. R-qident: this used to be a bare `queue_n = cur_track
+         * + 1`, which threw away every track after the current one,
+         * including an earlier Play Next / Add to queue: queueing a second
+         * track quietly deleted the first. Tracks in the qid registry are
+         * exactly the user's own picks, so those are what survives. */
+        int w = cur_track + 1;
+        for (int r = cur_track + 1; r < queue_n; r++)
+            if (qid_find(queue[r].path) >= 0) queue[w++] = queue[r];
+        queue_n = w;
         /* queue_mixed is set below, inside queue_insert() -- true either
          * way once this truncation has happened, so no need to duplicate
          * it here. */
@@ -4844,15 +4967,9 @@ static void queue_play_next(int track_idx) {
         snprintf(q_artist, sizeof(q_artist), "%s", cur_artist);
         snprintf(q_album,  sizeof(q_album),  "%s", cur_album);
         q_is_playlist = browsing_is_playlist;
-    } else if (!q_is_playlist) {
-        /* BG85: defer -- see queue_apply_pending()'s own comment. The new
-         * track lands right after cur_track (queue_insert() below), so
-         * that's exactly the index playback has to reach for this to
-         * become true. */
-        snprintf(q_artist_pending, sizeof(q_artist_pending), "%s", cur_artist);
-        snprintf(q_album_pending,  sizeof(q_album_pending),  "%s", cur_album);
-        snprintf(q_pending_path, sizeof(q_pending_path), "%s", tracks[track_idx].path);
     }
+    /* BG85's deferred identity is recorded inside queue_insert() now (R-qident)
+     * -- Add to queue needed it too. */
     queue_insert(track_idx, cur_track + 1);
 }
 
@@ -4889,12 +5006,20 @@ static int queue_kind_conflict(void) {
  * it. A no-op whenever nothing is pending, or the newly-current track
  * hasn't reached it yet. */
 static void queue_apply_pending(void) {
-    if (!q_pending_path[0]) return;
+    if (qid_n == 0) return;
     if (cur_track < 0 || cur_track >= queue_n) return;
-    if (strcmp(queue[cur_track].path, q_pending_path) != 0) return;
-    snprintf(q_artist, sizeof(q_artist), "%s", q_artist_pending);
-    snprintf(q_album,  sizeof(q_album),  "%s", q_album_pending);
-    q_pending_path[0] = '\0';
+    /* R-qident: the track playback actually landed on decides, by path --
+     * recorded identity if it was queued from elsewhere, otherwise the
+     * queue's own base album (so stepping back onto one of its original
+     * tracks restores it, which the single slot never did). */
+    int i = qid_find(queue[cur_track].path);
+    if (i >= 0) {
+        snprintf(q_artist, sizeof(q_artist), "%s", qid[i].artist);
+        snprintf(q_album,  sizeof(q_album),  "%s", qid[i].album);
+    } else if (q_base_album[0]) {
+        snprintf(q_artist, sizeof(q_artist), "%s", q_base_artist);
+        snprintf(q_album,  sizeof(q_album),  "%s", q_base_album);
+    }
 }
 
 /* NRK program artwork (R111): see radio_fetch_nrk_art()'s own comment for
@@ -5124,11 +5249,25 @@ static void queue_move_display(int from, int to) {
             for (int i = 0; i < queue_n; i++)
                 if (!strcmp(queue[i].path, playing_path)) { cur_track = i; break; }
     }
+    /* R-qident: hand the worker the *new* next track. This was the missing
+     * call behind "the title said Transmission, the audio was Love Will Tear
+     * Us Apart": the worker holds its gapless follower (g_next_path) from
+     * the last queue_follower(), the drag rearranged what should come next
+     * without telling it, and at the boundary the worker rolled into the old
+     * pick while the UI -- following via next_track_index(), which reads the
+     * *current* order -- displayed the new one. Every other queue mutation
+     * (insert, remove) already refreshes it. */
+    queue_follower();
 }
 
 /* -1 means "nothing plays next" -- callers already treat that as a no-op,
  * since play_index() itself guards i<0. */
-static int next_track_index(void) {
+/* The step itself, from any point in the queue rather than only from the
+ * track playing. next_track_index() is the caller everything else uses; this
+ * takes `from` so the waveform prefetch can look two steps ahead without
+ * duplicating the shuffle/repeat rules. Identical logic otherwise -- `from`
+ * simply stands where cur_track stood. */
+static int next_index_after(int from) {
     if (queue_n == 0) return -1;
     /* Shuffle/repeat only ever change this for plain music. Audiobooks,
      * podcasts and radio fall straight through to the plain sequential step
@@ -5139,23 +5278,25 @@ static int next_track_index(void) {
      * two on-screen zones never did, relying on the mirrored queue[]
      * ab_play_chapter's own comment describes). */
     if (!audiobook_mode && !podcast_mode && !radio_mode) {
-        if (repeat_mode == REPEAT_ONE) return cur_track;
+        if (repeat_mode == REPEAT_ONE) return from;
         if (shuffle_enabled) {
             if (shuffle_n != queue_n) shuffle_regenerate();
-            int pos = shuffle_find_pos(cur_track);
+            int pos = shuffle_find_pos(from);
             if (pos < 0) return -1;
             int nxt = pos + 1;
             if (nxt >= shuffle_n) return (repeat_mode == REPEAT_ALL) ? shuffle_order[0] : -1;
             return shuffle_order[nxt];
         }
         if (repeat_mode == REPEAT_ALL) {
-            int nxt = cur_track + 1;
+            int nxt = from + 1;
             return (nxt >= queue_n) ? 0 : nxt;
         }
     }
-    int nxt = cur_track + 1;
+    int nxt = from + 1;
     return (nxt < queue_n) ? nxt : -1;
 }
+
+static int next_track_index(void) { return next_index_after(cur_track); }
 
 static int prev_track_index(void) {
     if (queue_n == 0) return -1;
@@ -5279,6 +5420,14 @@ static char    wave_path[LIB_PATH_LEN];
  * podcast stops any decode still running for the previous track. */
 static void wave_track_changed(const char *path) {
     wave_loaded = 0;
+    /* Drop the old queue's lookahead before anything else. The slots still
+     * name the previous track's neighbours, and the worker would otherwise
+     * pick one up in the moment between this call and the poll that arms the
+     * new pair -- seen live as a prefetch from the album just left restarting
+     * and being abandoned 155 ms later. Harmless, but it is work nobody
+     * wanted. The poll re-arms both as soon as this track's own shape is
+     * settled. */
+    waveform_prefetch("", "");
     if (!podcast_mode && path && path[0]) {
         snprintf(wave_path, sizeof(wave_path), "%s", path);
         wave_loaded = waveform_get(wave_path, wave_buckets);
@@ -5305,7 +5454,7 @@ static void play_index(int i) {
      * legitimately starts something that ISN'T a podcast -- a fresh
      * browse from Albums/Playlists -- sets podcast_mode = 0 itself
      * (play_from_list()), same as it already owns queue_mixed/
-     * q_pending_path's fresh-start reset. */
+     * the qid registry's fresh-start reset. */
     if (i < 0 || i >= queue_n) return;
     cur_track = i;
     queue_apply_pending();   /* BG85 */
@@ -5353,7 +5502,7 @@ static void play_from_list(int idx) {
     snprintf(q_album,  sizeof(q_album),  "%s", cur_album);
     q_is_playlist = browsing_is_playlist;    /* BG73 */
     queue_mixed = 0;                         /* BG73 follow-up: a fresh queue is always clean */
-    q_pending_path[0] = '\0';                /* BG85: a fresh queue has nothing pending */
+    qid_clear();                             /* BG85: a fresh queue has nothing recorded */
     podcast_mode = 0;                        /* R58: play_index() no longer clears this itself */
     play_index(idx);
 }
@@ -5405,7 +5554,7 @@ static void ab_play_chapter(int i) {
         queue_n = track_n;
         snprintf(q_album, sizeof(q_album), "%s", cur_album);
         q_artist[0] = '\0';
-        q_pending_path[0] = '\0';   /* BG85: audiobooks never go through queue_play_next() */
+        qid_clear();   /* BG85: audiobooks never go through queue_play_next() */
     }
     cur_track = i;
     const char *path = ab_book.files[ab_book.chap[i].file];
@@ -7332,19 +7481,18 @@ static void draw_screen(uint16_t *fb) {
                 if (show_edit)      buf[0] = '\0';
                 else if (t->track > 0) snprintf(buf, sizeof(buf), "%d", t->track);
                 else                buf[0] = '\0';
-                /* Reported live: on the playing row, np_view_col_accent()/
-                 * np_view_col_dim() read poorly against COL_ROW's own plain,
-                 * unthemed highlight fill -- COL_ROW doesn't follow the
-                 * album palette (still a flat theme colour), so an
-                 * art-derived text colour picked for contrast against
-                 * np_view_col_bg() has no such guarantee against it, and in
-                 * practice often didn't have one. The track number goes
-                 * plain black (0 -- true black at any bit depth) and the
-                 * name matches the time's own plain COL_DIM, the one colour
-                 * already proven to read against COL_ROW every row. */
+                /* Track number: still plain black on the playing row (0 --
+                 * true black at any bit depth) -- see the original contrast
+                 * report this was for, right below. Track name: back to
+                 * np_view_col_accent() on request, now that NP_MAX_SAT
+                 * (derive_palette_from_bits()'s own comment) keeps the
+                 * accent this could read against COL_ROW's plain, unthemed
+                 * highlight fill from ever being the fully-saturated
+                 * extreme that made it unreadable there in the first
+                 * place. */
                 draw_text_clip(fb, 20 + dx0, row_y + 22, buf, playing ? 0 : np_view_col_dim(), TEXT_PX_SMALL,
                               56 + dx0, 0, clip_bot);
-                draw_text_clip(fb, 68 + dx0, row_y + 20, t->name, playing ? COL_DIM : np_view_col_fg(),
+                draw_text_clip(fb, 68 + dx0, row_y + 20, t->name, playing ? np_view_col_accent() : np_view_col_fg(),
                               TEXT_PX_BODY, (show_edit ? FB_W - 150 : FB_W - 110) + dx0, 0, clip_bot);
                 if (t->dur_ms > 0) {
                     fmt_dur(buf, sizeof(buf), t->dur_ms);
@@ -8355,6 +8503,17 @@ static void draw_screen(uint16_t *fb) {
  * vertical drag started mid-screen is not mistaken for either edge
  * gesture. */
 #define EDGE_ZONE  100
+/* R-edgeswipe: a row's swipe-to-remove (queue, playlist, podcast episodes,
+ * saved recordings) must not start from a back-gesture. Reported live in the
+ * podcast list: swiping back from the left edge also latched the row under
+ * the finger as a delete swipe, because each list's own latch only asked "is
+ * horizontal travel leading vertical?" -- exactly what the edge swipe is
+ * too. Blocked for the whole gesture once edge_active has latched, and from
+ * the start for a rightward drag beginning inside EDGE_ZONE (the zone
+ * edge_active itself is decided from), so there is no window where the row
+ * latches first. Leftward drags from the same zone stay valid row swipes --
+ * that's not a back gesture. One definition shared by every list. */
+#define ROW_SWIPE_BLOCKED (edge_active || (touch_x < EDGE_ZONE && live_x > touch_x))
 #define EDGE_TRAVEL 60
 #define HOLD_MS     550
 /* R80: deliberately much narrower than EDGE_ZONE -- a normal scroll to the
@@ -9134,19 +9293,42 @@ static int vol_bar_w(void)   { return FB_W - VOL_POP_X - VOL_POP_PAD - vol_bar_x
 static int vol_bar_y(void)   { return vol_pop_top() + vol_pop_h() / 2 - 4; }
 
 /* Geometry shared by the drawing and the hit tests.
- * R-qsicon: "Brightness"/cog row dropped (see draw_quick_settings()'s own
- * comment) -- the bar moved up to sit right under the status/route row,
- * same vertical placement the volume popup itself uses (STATUS_H+12 gap,
- * bar centred in a 64px band -> +40), and every row below it shifted up by
- * the same 34px this freed (74 -> 40) so the whole list stays QS_ROW_H-
- * spaced, just starting sooner. */
-static int qs_bar_y(void)  { return STATUS_H + 40; }
+ * R-qsnotop: the status-strip-style header (volume%/battery%/route icon,
+ * drawn via draw_status()) is gone -- explicit request. Everything it
+ * showed moved somewhere that already had a natural home for it: battery
+ * next to Format (its own row, below), the output route to the new footer
+ * row at the very bottom (see qs_footer_y()), and volume gets its own
+ * slider here instead of a text percentage. So the grid now starts right
+ * at the top of the panel, padded by QS_TOP_PAD alone rather than a whole
+ * STATUS_H-tall strip (QS_TOP_PAD itself is #defined up near QS_ROW_H, with
+ * QS_SLIDER_ROW_H and QS_FOOTER_H -- QS_H needs all three). */
 /* Icon-left-of-bar, same shape the volume popup and the brightness-drag
  * popup both use: a 20px glyph, a 14px gap, then the bar to the row's own
- * right margin (FB_W - 24, matching every other row here). */
+ * right margin (FB_W - 24, matching every other row here). Shared by both
+ * sliders below -- same x/width, only y differs. */
 static int qs_bar_icon_x(void) { return 24; }
 static int qs_bar_x(void)      { return qs_bar_icon_x() + VOL_ICON_W + VOL_ICON_GAP; }
 static int qs_bar_w(void)      { return FB_W - 24 - qs_bar_x(); }
+/* R-qsvol: a second slider, volume, added below brightness -- explicit
+ * request, same icon-left-of-bar shape. QS_SLIDER_ROW_H is shorter than
+ * QS_ROW_H: a slider is one line of content (icon + bar), not two lines of
+ * text, and the original single-slider spacing (STATUS_H+96 minus
+ * STATUS_H+40, before R-qsnotop removed the header those were measured
+ * from) was already exactly this. */
+/* R-qsswap: volume first, brightness second -- explicit request. Function
+ * names kept as they were (qs_bar_y() is still "brightness's row",
+ * qs_vol_y() still "volume's row") since every touch handler and draw call
+ * already references them by name rather than by which one happens to sit
+ * on top; only the two formulas swap which offset each returns. */
+static int qs_vol_y(void) { return QS_TOP_PAD; }
+/* R-qsequidist: +62, not +QS_SLIDER_ROW_H (56) -- explicit request that
+ * brightness sit equidistant between volume above and Wi-Fi/Bluetooth
+ * below, not merely one slider-row-height down from volume regardless of
+ * where the grid actually starts. qs_wifi_y() below is qs_vol_y() + 124
+ * either way it's reached (via qs_bar_y() + 62, its own literal below);
+ * half of that, 62, is where brightness has to sit for the two gaps to
+ * match. */
+static int qs_bar_y(void) { return qs_vol_y() + 62; }
 /* R-qsgrid: two columns instead of one long stack of rows -- explicit
  * request. qs_col_x(0)/qs_col_x(1) are each cell's own left edge, qs_col_w()
  * how wide it is; both the draw code and the touch handler's own column
@@ -9155,7 +9337,13 @@ static int qs_bar_w(void)      { return FB_W - 24 - qs_bar_x(); }
 #define QS_COL_GAP 24
 static int qs_col_w(void)       { return (FB_W - 48 - QS_COL_GAP) / 2; }
 static int qs_col_x(int col)    { return 24 + col * (qs_col_w() + QS_COL_GAP); }
-static int qs_wifi_y(void)  { return STATUS_H + 96; }
+/* R-qsswapfix: was qs_vol_y() + QS_SLIDER_ROW_H, landing exactly on top of
+ * qs_bar_y() -- one slider row's worth after the *first* slider, not both.
+ * The grid ended up drawn directly over the second slider (brightness),
+ * reported live as the row icons looking covered by it. +12 past the two
+ * slider rows, not flush against the second one, for a real gap instead of
+ * the two kinds of row touching edge to edge. */
+static int qs_wifi_y(void)  { return qs_bar_y() + 62; }   /* R-qsequidist: see qs_bar_y()'s own comment */
 static int qs_bt_y(void)    { return qs_wifi_y(); }              /* same row, right column */
 static int qs_eq_y(void)    { return qs_wifi_y() + QS_ROW_H; }
 static int qs_mseb_y(void)  { return qs_eq_y(); }                /* same row, right column */
@@ -9166,8 +9354,17 @@ static int qs_usb_y(void)   { return qs_cover_y(); }             /* same row, ri
 /* R83: what's actually playing's own format/quality -- moved here, under
  * the grid, from the top bar next to volume (see draw_quick_settings()'s
  * own comment on the earlier spot this held). Spans both columns -- there's
- * only one of it, and it was already exactly this wide. */
+ * only one of it, and it was already exactly this wide. Battery moved in
+ * next to it (R-qsnotop) now that the header row that used to show it is
+ * gone. */
 static int qs_codec_y(void) { return qs_cover_y() + QS_ROW_H; }
+/* R-qsnotop: the output-route glyph, previously in the header, and a
+ * Settings shortcut (previously a top-right cog, dropped entirely by
+ * R-qsicon when the old single-column Brightness/cog row went away) both
+ * move here -- a footer row at the very bottom-right of the panel, explicit
+ * request. QS_FOOTER_H leaves room for that row plus the grab handle
+ * beneath it. */
+static int qs_footer_y(void) { return qs_codec_y() + QS_FORMAT_FOOTER_GAP; }
 
 static void draw_bt_icon(uint16_t *fb, int x, int y, uint16_t c) {
     draw_icon(fb, FB_W, FB_H, x, y, &icon_bt_qs, c);
@@ -9204,10 +9401,17 @@ static void draw_eq_icon(uint16_t *fb, int x, int y, uint16_t c) {
  * scratch here rather than shared with those -- each was built from locals
  * (t/ch/dur) only ever in scope mid-draw on that specific screen, not
  * reachable from quick settings, which can be pulled down from anywhere.
- * Empty string when there's nothing to show: radio (a live stream has no
- * file-based format to read) or nothing loaded at all. */
-static void qs_format_info(char *out, size_t outsz) {
-    out[0] = '\0';
+ * Empty strings when there's nothing to show: radio (a live stream has no
+ * file-based format to read) or nothing loaded at all.
+ *
+ * R-qsformat: split into two lines instead of one -- format/quality (and,
+ * for radio, the output route) in line1, bitrate alone in line2, matching
+ * the icon-plus-two-lines shape every other row in this panel already
+ * uses. line2 is left empty wherever there's no bitrate to show (recording
+ * playback, or a file this couldn't compute one for) -- the draw call
+ * simply skips an empty second line rather than leaving a blank gap. */
+static void qs_format_info(char *line1, size_t line1sz, char *line2, size_t line2sz) {
+    line1[0] = '\0'; line2[0] = '\0';
     /* R111 follow-up: was its own line at the bottom of the radio player
      * ("AAC stream  ·  3.5 mm"); moved here to match Music/Podcast/
      * Audiobook, which have never shown format/route on the Now Playing
@@ -9222,19 +9426,17 @@ static void qs_format_info(char *out, size_t outsz) {
     if (radio_mode) {
         if (audio_codec()[0]) {
             int hz = audio_radio_rate_hz(), kbps = audio_radio_kbps();
-            if (hz > 0 && kbps > 0)
-                snprintf(out, outsz, "%s  %g kHz  ~%d kbps  \xc2\xb7  %s",
-                        audio_codec(), hz / 1000.0, kbps, audio_output());
-            else if (hz > 0)
-                snprintf(out, outsz, "%s  %g kHz  \xc2\xb7  %s",
+            if (hz > 0)
+                snprintf(line1, line1sz, "%s  %g kHz  \xc2\xb7  %s",
                         audio_codec(), hz / 1000.0, audio_output());
             else
-                snprintf(out, outsz, "%s  \xc2\xb7  %s", audio_codec(), audio_output());
+                snprintf(line1, line1sz, "%s  \xc2\xb7  %s", audio_codec(), audio_output());
+            if (kbps > 0) snprintf(line2, line2sz, "~%d kbps", kbps);
         }
         return;
     }
     if (recording_playback_mode) {
-        if (audio_codec()[0]) snprintf(out, outsz, "%s  \xc2\xb7  %s", audio_codec(), audio_output());
+        if (audio_codec()[0]) snprintf(line1, line1sz, "%s  \xc2\xb7  %s", audio_codec(), audio_output());
         return;
     }
     if (cur_track < 0 || cur_track >= queue_n) return;
@@ -9248,14 +9450,14 @@ static void qs_format_info(char *out, size_t outsz) {
         int64_t file_dur = (ab_book.file_n == 1) ? ab_book.total_ms
                                                   : (ch ? ch->dur_ms : 0);
         int kbps = ab_file_bitrate_kbps(t->path, file_dur);
-        if (kbps > 0) snprintf(out, outsz, "%s  %d kbps", ext, kbps);
-        else          snprintf(out, outsz, "%s", ext);
+        snprintf(line1, line1sz, "%s", ext);
+        if (kbps > 0) snprintf(line2, line2sz, "%d kbps", kbps);
     } else if (podcast_mode) {
         int dur = audio_dur_ms();
         if (dur <= 0) dur = t->dur_ms;
         int kbps = ab_file_bitrate_kbps(t->path, dur);
-        if (kbps > 0) snprintf(out, outsz, "%s  %d kbps", ext, kbps);
-        else          snprintf(out, outsz, "%s", ext);
+        snprintf(line1, line1sz, "%s", ext);
+        if (kbps > 0) snprintf(line2, line2sz, "%d kbps", kbps);
     } else if (track_is_vbr_mp3(t->path)) {
         /* R101: reported live -- "just 'VBR' isn't right, give an
          * average". True by definition (a VBR file's own header states no
@@ -9267,15 +9469,12 @@ static void qs_format_info(char *out, size_t outsz) {
         int dur = audio_dur_ms();
         if (dur <= 0) dur = t->dur_ms;
         int kbps = ab_file_bitrate_kbps(t->path, dur);
-        if (kbps > 0)
-            snprintf(out, outsz, "%s  %d/%g kHz  VBR (avg %d kbps)",
-                     track_format_name(t), t->bits, t->rate / 1000.0, kbps);
-        else
-            snprintf(out, outsz, "%s  %d/%g kHz  VBR",
-                     track_format_name(t), t->bits, t->rate / 1000.0);
+        snprintf(line1, line1sz, "%s  %d/%g kHz", track_format_name(t), t->bits, t->rate / 1000.0);
+        if (kbps > 0) snprintf(line2, line2sz, "VBR (avg %d kbps)", kbps);
+        else          snprintf(line2, line2sz, "VBR");
     } else {
-        snprintf(out, outsz, "%s  %d/%g kHz  %d kbps",
-                 track_format_name(t), t->bits, t->rate / 1000.0, t->bitrate / 1000);
+        snprintf(line1, line1sz, "%s  %d/%g kHz", track_format_name(t), t->bits, t->rate / 1000.0);
+        snprintf(line2, line2sz, "%d kbps", t->bitrate / 1000);
     }
 }
 
@@ -9291,23 +9490,24 @@ static void draw_quick_settings(uint16_t *fb) {
     int themed = np_chrome_themed() && screen == SC_PLAYING;
 
     /* R-poptheme: while the brightness bar is actually being dragged, the
-     * rest of the panel disappears and only a small rounded slider is shown
+     * rest of the panel disappears and only a small rounded popup is shown
      * -- same popup, same geometry (vol_pop_top()/vol_pop_h()/vol_bar_x()/
-     * vol_bar_w()/vol_bar_y()), same sun-vs-icon_vol_* left-of-bar shape, as
-     * draw_volume() -- explicit request, so the two floating sliders read as
-     * one design rather than two. The touch handler's own live-drag block
-     * (qs_open && qs_dragging && touch_down) already tracks the finger
-     * against this exact geometry once dragging -- see its own comment. */
+     * vol_bar_w()/vol_bar_y()) the floating volume popup itself uses,
+     * explicit request, so the two read as one design. R-qsvolnocollapse:
+     * volume does NOT get this treatment any more -- explicit request, the
+     * in-panel volume row now just updates live in place instead (see its
+     * own draw code below), same as everything else in this panel already
+     * does while being adjusted. */
     if (qs_dragging) {
         int top = vol_pop_top(), ph = vol_pop_h();
         fill_round_rect(fb, VOL_POP_X, top, FB_W - 2 * VOL_POP_X, ph, VOL_POP_R,
                         themed ? np_col_bg() : COL_HEADER);
         int icon_x = VOL_POP_X + VOL_POP_PAD, icon_y = top + (ph - VOL_ICON_W) / 2;
-        draw_icon(fb, FB_W, FB_H, icon_x, icon_y, &icon_sun, themed ? np_col_dim() : COL_DIM);
         int by = vol_bar_y(), bx = vol_bar_x(), bw = vol_bar_w();
-        fill_pill(fb, bx, by, bw, 8, themed ? np_col_line() : COL_LINE);
-        int filled = qs_bright_max > 0 ? bw * qs_bright / qs_bright_max : 0;
         uint16_t accent = themed ? np_col_accent() : COL_ACCENT;
+        draw_icon(fb, FB_W, FB_H, icon_x, icon_y, &icon_sun, themed ? np_col_dim() : COL_DIM);
+        int filled = qs_bright_max > 0 ? bw * qs_bright / qs_bright_max : 0;
+        fill_pill(fb, bx, by, bw, 8, themed ? np_col_line() : COL_LINE);
         if (filled > 0) fill_pill(fb, bx, by, filled, 8, accent);
         fill_circle(fb, bx + filled, by + 4, 13, accent);
         return;
@@ -9315,33 +9515,8 @@ static void draw_quick_settings(uint16_t *fb) {
 
     fill_rect(fb, 0, 0, FB_W, QS_H, themed ? np_col_bg() : COL_HEADER);
     fill_rect(fb, 0, QS_H - 1, FB_W, 1, themed ? np_col_line() : COL_LINE);
-    draw_status(fb);
 
-    /* R83: route (Bluetooth/USB/3.5mm), moved here from the foot of each
-     * mode's Now Playing screen -- visible from wherever quick settings was
-     * pulled down, not just while actually looking at Now Playing, and the
-     * accessory's own codec/battery already live in the Bluetooth row below
-     * (see its own comment) so nothing here duplicates that. Right after
-     * the volume readout draw_status() just drew, in the same top strip.
-     * Format/quality itself moved again, live feedback, to its own row at
-     * the bottom of the panel instead -- see qs_codec_y() below. */
-    {
-        const int mid = STATUS_H / 2;
-        int vol = audio_volume();
-        char volbuf[16];
-        snprintf(volbuf, sizeof(volbuf), "%d%%", vol);
-        int rx = 24 + 26 + text_width(volbuf, TEXT_PX_SMALL) + 24;
-
-        const char *route_kind = audio_output();   /* "3.5 mm" / "USB" / "Bluetooth" */
-        const icon_t *ric = !strcmp(route_kind, "Bluetooth") ? &icon_bt_sm
-                           : !strcmp(route_kind, "USB")      ? &icon_usb_sm : NULL;
-        uint16_t dim = themed ? np_col_dim() : COL_DIM;
-        if (ric) {
-            draw_icon(fb, FB_W, FB_H, rx, mid - ric->h / 2, ric, dim);
-        } else {
-            draw_text(fb, rx, mid - TEXT_PX_SMALL / 2, route_kind, dim, TEXT_PX_SMALL, FB_W);
-        }
-    }
+    uint16_t dim = themed ? np_col_dim() : COL_DIM;
 
     /* R-qsicon: no more "Brightness" label or cog -- explicit request, same
      * icon-left-of-bar, no-text shape the volume popup and the
@@ -9349,14 +9524,34 @@ static void draw_quick_settings(uint16_t *fb) {
      * one more instance of that language rather than a labelled row like
      * Wi-Fi/Bluetooth below it. */
     int by = qs_bar_y();
-    draw_icon(fb, FB_W, FB_H, qs_bar_icon_x(), by + 4 - VOL_ICON_W / 2, &icon_sun,
-             themed ? np_col_dim() : COL_DIM);
+    draw_icon(fb, FB_W, FB_H, qs_bar_icon_x(), by + 4 - VOL_ICON_W / 2, &icon_sun, dim);
     int bx = qs_bar_x(), bw = qs_bar_w();
     fill_pill(fb, bx, by, bw, 8, themed ? np_col_line() : COL_LINE);
     int filled = qs_bright_max > 0 ? bw * qs_bright / qs_bright_max : 0;
     uint16_t bright_accent = themed ? np_col_accent() : COL_ACCENT;
     if (filled > 0) fill_pill(fb, bx, by, filled, 8, bright_accent);
     fill_circle(fb, bx + filled, by + 4, 13, bright_accent);
+
+    /* R-qsvol: same shape, volume -- explicit request. USB Transport Mode
+     * pins and locks volume (see its own engage comment on the floating
+     * popup's identical treatment), shown here the same way: dim throughout,
+     * no accent, matching every other disabled control in this app. */
+    int vy = qs_vol_y();
+    /* R-qsvolnocollapse: reflects vol_drag_pct live while vol_dragging, the
+     * same "read the in-progress drag value, not the applied one" shape
+     * brightness's own qs_bright already had -- needed now that this row
+     * stays on screen and updating throughout the drag instead of handing
+     * off to the collapsed popup above. */
+    int vv = vol_dragging && vol_drag_pct >= 0 ? vol_drag_pct : audio_volume();
+    const icon_t *vic = vv <= 0 ? &icon_vol_mute : vv < 34 ? &icon_vol_low
+                       : vv < 67 ? &icon_vol_mid : &icon_vol_high;
+    draw_icon(fb, FB_W, FB_H, qs_bar_icon_x(), vy + 4 - VOL_ICON_W / 2, vic, dim);
+    int vbx = qs_bar_x(), vbw = qs_bar_w();
+    fill_pill(fb, vbx, vy, vbw, 8, themed ? np_col_line() : COL_LINE);
+    int vfilled = vbw * vv / 100;
+    uint16_t vol_accent = usb_bypass_active ? dim : (themed ? np_col_accent() : COL_ACCENT);
+    if (vfilled > 0) fill_pill(fb, vbx, vy, vfilled, 8, vol_accent);
+    fill_circle(fb, vbx + vfilled, vy + 4, 13, vol_accent);
 
     /* R-qsgrid: no toggle switches any more (explicit request) -- the icon
      * (and its label) going accent-vs-dim IS the on/off indicator now, for
@@ -9368,7 +9563,7 @@ static void draw_quick_settings(uint16_t *fb) {
      * qs_col_x(0)/qs_col_x(1) and qs_col_w() (see their own comment) are
      * shared with the touch handler's own column split. */
     char nm[64];
-    uint16_t dim = themed ? np_col_dim() : COL_DIM, fg = themed ? np_col_fg() : COL_TEXT;
+    uint16_t fg = themed ? np_col_fg() : COL_TEXT;
     uint16_t accent = themed ? np_col_accent() : COL_ACCENT;
     int c0 = qs_col_x(0), c1 = qs_col_x(1), cw = qs_col_w();
     int label_dx = QS_LABEL_X - 24;   /* icon-column-to-label offset every row here shares */
@@ -9459,13 +9654,22 @@ static void draw_quick_settings(uint16_t *fb) {
      * a three-way mode. Its chevron moves to its own column's right edge
      * rather than the panel's. */
     int by6 = qs_cover_y();
-    draw_icon(fb, FB_W, FB_H, c0 + 1, by6 + 14, &icon_palette_qs, cover_palette_enabled ? accent : dim);
+    /* R-qsalign: x=c0, not c0+1 -- reported live as visibly out of line
+     * with Wi-Fi/Parametric EQ's own left edges in the column above it.
+     * icon_palette_qs is also 38x38 now, not 28 (R-qssize, reported live
+     * too small next to Wi-Fi/Bluetooth) -- y offset dropped from +14 to
+     * +9 to keep the glyph's own centre roughly where it was against the
+     * larger box (half the 10px height gain). */
+    draw_icon(fb, FB_W, FB_H, c0, by6 + 9, &icon_palette_qs, cover_palette_enabled ? accent : dim);
     draw_text(fb, c0 + label_dx, by6 + 6, "Cover colours", cover_palette_enabled ? fg : dim, TEXT_PX_SMALL, c0 + cw);
     draw_text(fb, c0 + label_dx, by6 + 32, "From album art", dim, TEXT_PX_SMALL, c0 + cw);
 
     int byu = qs_usb_y();
     int usb_mode = st_usb_mode();
-    draw_usb_icon(fb, c1 + 10, byu + 7, dim);
+    /* R-qssize: icon_usb_qs is 38x38 now, not 32 -- same live report as
+     * Cover colours just above. y offset dropped from +7 to +4 (half the
+     * 6px height gain) to keep its centre roughly in place. */
+    draw_usb_icon(fb, c1 + 10, byu + 4, dim);
     draw_text(fb, c1 + label_dx, byu + 6, "USB mode", fg, TEXT_PX_SMALL, c1 + cw);
     draw_text(fb, c1 + label_dx, byu + 32,
               usb_mode == 0 ? "ADB" : usb_mode == 1 ? "USB Storage" : "unplugged",
@@ -9478,16 +9682,80 @@ static void draw_quick_settings(uint16_t *fb) {
 
     /* R83: what's actually playing's own format/quality -- moved here,
      * below the grid, from the top bar next to volume (asked for live, a
-     * second time, after the top bar placement first shipped). No icon, so
-     * text stays at the label column rather than the icon one -- aligned
-     * under the rows above it instead of ragged against them. Spans both
-     * columns -- there's only one of it. */
+     * second time, after the top bar placement first shipped). Spans both
+     * columns -- there's only one of it.
+     *
+     * R-qsformat: explicit request -- a disc glyph instead of the word
+     * "Format" (matching every row above it having an icon rather than a
+     * plain label), format/quality on the icon row's own top line, bitrate
+     * moved down to its own line beneath rather than run together on one.
+     * qs_format_info() now fills two separate strings for exactly this. */
     int by5 = qs_codec_y();
-    draw_text(fb, c0 + label_dx, by5 + 6, "Format", dim, TEXT_PX_SMALL, c0 + cw);
-    char fmt[64];
-    qs_format_info(fmt, sizeof(fmt));
-    draw_text(fb, c0 + label_dx, by5 + 32, fmt[0] ? fmt : "Nothing playing",
+    char fmt[48], kbps_line[24];
+    qs_format_info(fmt, sizeof(fmt), kbps_line, sizeof(kbps_line));
+    /* R-qsalign: x=c0, not c0+1 -- same live report and same fix as Cover
+     * colours' own icon just above. R-qsdiscsize: icon_disc_qs (38x38), not
+     * the plain 28x28 icon_disc the multi-disc album banner uses -- still
+     * reported the small size live after Cover colours/USB grew. Offset
+     * +9, not +14, same halved-height-gain adjustment as those two. */
+    draw_icon(fb, FB_W, FB_H, c0, by5 + 9, &icon_disc_qs, fmt[0] ? accent : dim);
+    draw_text(fb, c0 + label_dx, by5 + 6, fmt[0] ? fmt : "Nothing playing",
               fmt[0] ? accent : dim, TEXT_PX_SMALL, c1 + cw);
+    if (kbps_line[0])
+        draw_text(fb, c0 + label_dx, by5 + 32, kbps_line, dim, TEXT_PX_SMALL, c1 + cw);
+
+    /* R-qsnotop: battery, to the right of Format -- explicit request, moved
+     * in now that the header row it used to sit in is gone.
+     * R-qsbattsize: the plain draw_battery() helper draws its own small
+     * 26x14 family, sized for an inline status-bar reading -- next to this
+     * row's own disc icon it read noticeably smaller than everything else
+     * in the panel, reported live. Picks from the 37x20 _qs family instead
+     * (same thresholds draw_battery() itself uses), with the percentage
+     * bumped from TEXT_PX_SMALL to TEXT_PX_BODY to match the larger
+     * glyph's own visual weight. Colour: accent while charging (the row's
+     * own themed accent, not plain COL_ACCENT -- everything else on this
+     * row already follows the cover palette), red under 15%, dim
+     * otherwise -- same rule as draw_battery(), just themed for the first
+     * case since this is drawn inline rather than through that helper.
+     * R-qsbattpos: x = c1 + 10, not right-edge-aligned -- reported live
+     * that it should sit directly under USB mode's own icon (same x) in
+     * the row above, not float at the panel's own right margin. */
+    int pct = st_battery_pct();
+    if (pct >= 0) {
+        int charging = st_charging();
+        const icon_t *bic = pct > 87 ? &icon_batt_100_qs : pct > 62 ? &icon_batt_75_qs
+                           : pct > 37 ? &icon_batt_50_qs  : pct > 12 ? &icon_batt_25_qs
+                           : &icon_batt_0_qs;
+        uint16_t batt_c = charging ? accent : (pct <= 15 ? RGB(230, 80, 70) : dim);
+        int bx = c1 + 10;
+        /* R-qsbattvalign: y = by5 + 18, not + 6 -- reported live as out of
+         * line with the disc glyph beside it. Disc is 38 tall at by5 + 9
+         * (centre by5 + 28); this icon is 20 tall, so by5 + 18 puts its
+         * own centre at the same by5 + 28. */
+        draw_icon(fb, FB_W, FB_H, bx, by5 + 18, bic, batt_c);
+        char pctbuf[8];
+        snprintf(pctbuf, sizeof(pctbuf), "%d%%", pct);
+        draw_text(fb, bx + 37 + 8, by5 + 16, pctbuf, batt_c, TEXT_PX_BODY, c1 + cw);
+    }
+
+    /* R-qsnotop: footer row -- the output-route glyph (previously in the
+     * header) and a Settings shortcut (previously a top-right cog, dropped
+     * by R-qsicon along with the old "Brightness" label row) both move to
+     * the very bottom-right of the panel, explicit request, above the grab
+     * handle. */
+    int fy = qs_footer_y();
+    int gear_x = FB_W - 24 - 20, gear_y = fy + 8;
+    draw_icon(fb, FB_W, FB_H, gear_x, gear_y, &icon_gear_qs, dim);
+    const char *route_kind = audio_output();   /* "3.5 mm" / "USB" / "Bluetooth" */
+    const icon_t *ric = !strcmp(route_kind, "Bluetooth") ? &icon_bt_sm
+                       : !strcmp(route_kind, "USB")      ? &icon_usb_sm : NULL;
+    if (ric) {
+        draw_icon(fb, FB_W, FB_H, gear_x - 16 - ric->w, gear_y + (20 - ric->h) / 2, ric, dim);
+    } else {
+        int tw = text_width(route_kind, TEXT_PX_SMALL);
+        draw_text(fb, gear_x - 16 - tw, gear_y + (20 - TEXT_PX_SMALL) / 2, route_kind,
+                  dim, TEXT_PX_SMALL, gear_x - 16);
+    }
 
     /* A grab handle, so it is obvious the panel goes back up. */
     fill_rect(fb, FB_W / 2 - 26, QS_H - 14, 52, 4, themed ? np_col_line() : COL_LINE);
@@ -11607,6 +11875,20 @@ int music_entry(void *a0, void *a1) {
                         qs_open = 0;
                         screen = SC_SETTINGS_USB; reset_scroll();
                     }
+                } else if (y > qs_footer_y() && y < qs_footer_y() + QS_FOOTER_H) {
+                    /* R-qsnotop: the footer's cog -- straight to the full
+                     * Settings menu, same as the old top-right one did.
+                     * Closed first, not left open behind it -- the next
+                     * "back" from Settings would otherwise have reopened
+                     * this instead of returning to wherever the panel was
+                     * pulled down over. The output-route glyph beside it is
+                     * informational only, same as it was in the old header
+                     * -- no tap target of its own. */
+                    if (x > FB_W - 24 - 20 - 16) {
+                        qs_open = 0;
+                        screen = SC_SETTINGS;
+                        reset_scroll();
+                    }
                 } else if (y > QS_H) {
                     qs_open = 0;                    /* tapped away */
                 }
@@ -12887,10 +13169,18 @@ int music_entry(void *a0, void *a1) {
              * audiobooks, podcasts and radio too (see its own comment), and
              * none of those draw a waveform. A skip drops the prefetch
              * mid-decode; see waveform.c's still_wanted(). */
-            int nxt = (!podcast_mode && !audiobook_mode && !radio_mode &&
-                       !recording_playback_mode) ? next_track_index() : -1;
-            waveform_prefetch(nxt >= 0 && nxt < queue_n && nxt != cur_track
-                              ? queue[nxt].path : "");
+            int music = !podcast_mode && !audiobook_mode && !radio_mode &&
+                        !recording_playback_mode;
+            int n1 = music ? next_index_after(cur_track) : -1;
+            int n2 = (n1 >= 0 && n1 != cur_track) ? next_index_after(n1) : -1;
+            /* Two ahead, in order. Each is dropped if it is really the track
+             * already playing or the other slot -- repeat-one answers with the
+             * current track, and a queue of one or two wraps straight back
+             * onto itself. */
+            int ok1 = n1 >= 0 && n1 < queue_n && n1 != cur_track;
+            int ok2 = n2 >= 0 && n2 < queue_n && n2 != cur_track && n2 != n1;
+            waveform_prefetch(ok1 ? queue[n1].path : "",
+                              ok2 ? queue[n2].path : "");
         }
 
         /* The LIVE/-M:SS readout needs to visibly advance in real time even
@@ -13006,7 +13296,14 @@ int music_entry(void *a0, void *a1) {
                 }
             }
             idle = 0;
-        } else if (vol_dragging && !touch_down) {
+        } else if (vol_dragging && !touch_down && !qs_open) {
+            /* R-qsvol: !qs_open added -- this used to be the only release
+             * path vol_dragging had. Now that dragging the in-panel volume
+             * row also sets vol_dragging (see the qs_open-scoped block
+             * further down), releasing *that* drag must not land here: it
+             * would set vol_ticks and show the floating popup moments
+             * later, over whatever screen the panel closes onto, from a
+             * press that never touched the hardware volume keys. */
             vol_dragging = 0;
             if (vol_drag_pct != vol_applied) {
                 audio_volume_set(vol_drag_pct);
@@ -13090,6 +13387,42 @@ int music_entry(void *a0, void *a1) {
             save_conf();
         }
 
+        /* R-qsvol: same live-while-dragging shape as brightness just above,
+         * for the in-panel volume row -- reuses vol_dragging/vol_drag_pct/
+         * vol_applied/vol_apply_tick, the exact same state (and the exact
+         * same throttled-apply reasoning: a fork+exec of amixer on every
+         * frame of a drag is real cost on Bluetooth) the floating popup's
+         * own hardware-volume-key drag already uses -- dragging this row
+         * *is* that same action, just started from a different touch zone.
+         * Locked the same way the floating popup's own drag is while USB
+         * Transport Mode pins volume: not entered at all. */
+        if (qs_open && vol_dragging && touch_down) {
+            int bw = vol_bar_w();
+            int v = (live_x - vol_bar_x()) * 100 / (bw > 0 ? bw : 1);
+            if (v < 0) v = 0;
+            if (v > 100) v = 100;
+            if (v != vol_drag_pct) { vol_drag_pct = v; dirty = 1; }
+            if (++vol_apply_tick >= 6) {
+                vol_apply_tick = 0;
+                if (vol_drag_pct != vol_applied) {
+                    audio_volume_set(vol_drag_pct);
+                    vol_applied = vol_drag_pct;
+                }
+            }
+            idle = 0;
+        } else if (vol_dragging && qs_open && !touch_down) {
+            vol_dragging = 0;
+            if (vol_drag_pct != vol_applied) {
+                audio_volume_set(vol_drag_pct);
+                vol_applied = vol_drag_pct;
+            }
+            /* No vol_ticks here (unlike the floating popup's own release,
+             * just above) -- the panel itself is still open and already
+             * showing the result; setting it would only queue up a
+             * floating popup to appear later, over whatever the panel
+             * closes onto, for a press that has nothing to do with it. */
+        }
+
         /* Running down the A-Z strip. The test is on where the finger went
          * down, not where it is: a touchscreen only reports an axis that has
          * changed, so during a vertical drag the live X reading is whatever it
@@ -13098,6 +13431,17 @@ int music_entry(void *a0, void *a1) {
             if (qs_open && touch_down && !qs_dragging &&
                 touch_y > qs_bar_y() - 26 && touch_y < qs_bar_y() + 26)
                 qs_dragging = 1;
+
+            /* R-qsvol: same start shape, for the in-panel volume row --
+             * locked the same way the floating popup's own hardware-key
+             * drag already is while USB Transport Mode pins the value. */
+            if (qs_open && touch_down && !vol_dragging && !usb_bypass_active &&
+                touch_y > qs_vol_y() - 26 && touch_y < qs_vol_y() + 26) {
+                vol_dragging = 1;
+                vol_applied = audio_volume();
+                vol_drag_pct = -1;
+                vol_apply_tick = 0;
+            }
 
             g_phase = "index";
             int was = index_active;
@@ -13242,7 +13586,7 @@ int music_entry(void *a0, void *a1) {
              * (queue_swipe_active persists below rather than being
              * recomputed from live_x/live_y every tick), the same "can't
              * un-become itself mid-drag" shape edge_active already has. */
-            if (!queue_swipe_active && touch_down && valid_row && !grip_hit) {
+            if (!queue_swipe_active && touch_down && valid_row && !grip_hit && !ROW_SWIPE_BLOCKED) {
                 int dx = live_x - touch_x, dy = live_y - touch_y;
                 if (abs(dx) > abs(dy) && abs(dx) > 10) {
                     queue_swipe_active = 1;
@@ -13314,7 +13658,7 @@ int music_entry(void *a0, void *a1) {
                 }
             }
 
-            if (!playlist_swipe_active && touch_down && valid_row && !grip_hit) {
+            if (!playlist_swipe_active && touch_down && valid_row && !grip_hit && !ROW_SWIPE_BLOCKED) {
                 int dx = live_x - touch_x, dy = live_y - touch_y;
                 if (abs(dx) > abs(dy) && abs(dx) > 10) {
                     playlist_swipe_active = 1;
@@ -13354,7 +13698,7 @@ int music_entry(void *a0, void *a1) {
             int valid_row = touch_y >= CONTENT_Y && touch_y < mini_bottom &&
                             press_idx >= 0 && press_idx < track_n &&
                             pod_eps[press_idx].downloaded;
-            if (!pod_swipe_active && touch_down && valid_row) {
+            if (!pod_swipe_active && touch_down && valid_row && !ROW_SWIPE_BLOCKED) {
                 int dx = live_x - touch_x, dy = live_y - touch_y;
                 if (abs(dx) > abs(dy) && abs(dx) > 10) {
                     pod_swipe_active = 1;
@@ -13390,7 +13734,7 @@ int music_entry(void *a0, void *a1) {
             int press_idx = (touch_y - CONTENT_Y + scroll * ROW_H + scroll_px) / ROW_H;
             int valid_row = touch_y >= CONTENT_Y && touch_y < FB_H &&
                             press_idx >= 0 && press_idx < radio_recording_n;
-            if (!rec_swipe_active && touch_down && valid_row) {
+            if (!rec_swipe_active && touch_down && valid_row && !ROW_SWIPE_BLOCKED) {
                 int dx = live_x - touch_x, dy = live_y - touch_y;
                 if (abs(dx) > abs(dy) && abs(dx) > 10) {
                     rec_swipe_active = 1;

@@ -95,6 +95,8 @@ static void wpa_unescape(const char *in, size_t inlen, char *out, size_t outsz) 
 }
 
 /* The first BlueALSA sink path, which both queries need. */
+/* Exposed as st_bt_pcm_path() below: audio.c needs the same path to set the
+ * PCM's SoftVolume property. */
 static int bt_pcm_path(char *out, unsigned n) {
     char buf[1024];
     run_cmd("bluealsa-cli list-pcms 2>/dev/null", buf, sizeof(buf));
@@ -789,3 +791,5 @@ int st_net_up(void) {
     fclose(f);
     return strncmp(s, "up", 2) == 0;
 }
+
+int st_bt_pcm_path(char *out, unsigned n) { return bt_pcm_path(out, n); }

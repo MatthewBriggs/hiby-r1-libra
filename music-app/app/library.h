@@ -5,6 +5,14 @@
 #define LIB_NAME_LEN 192
 #define LIB_PATH_LEN 384
 
+/* Format codes this app writes itself, above anything the stock scanner
+ * produces. An .m4a's own code (278) covers both AAC and Apple Lossless, so a
+ * lossless album was labelled AAC everywhere it was shown. Both are recorded
+ * explicitly instead, which also makes the one-time re-read in scanner.c
+ * self-terminating: once a row carries either of these it is never 278 again. */
+#define LIB_FORMAT_ALAC    2001
+#define LIB_FORMAT_AAC_M4A 2002
+
 /* BG15: lib_group() labels a blank album_artist/artist/genre "Unknown" for
  * display (out[n].owner[0] is set nonzero on that row to mark it), but the
  * database field itself is empty/NUL, not the literal text "Unknown". Pass

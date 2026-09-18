@@ -66,8 +66,15 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_wake = PTHREAD_COND_INITIALIZER;
 static int  g_started;
 static char g_wanted[512];      /* what the page wants */
-static char g_next[512];        /* the queue's next track, worked out when idle */
-static char g_pre_done[512];    /* the last prefetch settled, so it is not redone */
+#define WAVE_AHEAD 2            /* how far ahead of the playing track to work */
+static char g_next[WAVE_AHEAD][512];   /* the queue's next tracks, in order */
+/* The prefetches already settled, so the worker moves on to the next slot
+ * rather than starting the same one again. A ring of a few: two slots, and
+ * they shift down by one at every track change, so the path that was slot 1
+ * becomes slot 0 and must still be remembered as done. */
+#define WAVE_DONE_N 4
+static char g_pre_done[WAVE_DONE_N][512];
+static int  g_pre_done_i;
 static char g_have_path[512];   /* what g_have answers for -- set once settled */
 static int  g_have_ok;          /* 1: g_have is a shape; 0: this file has none */
 static uint8_t g_have[WAVEFORM_BUCKETS];
@@ -230,6 +237,23 @@ static void shape(const uint32_t *level, uint8_t *bars) {
  * the track on screen; a prefetch only for as long as nothing more urgent has
  * come along -- a new track starting drops it mid-decode, which is the whole
  * reason prefetching is safe to do at all. */
+/* Caller holds g_lock. */
+static int pre_settled(const char *path) {
+    for (int i = 0; i < WAVE_DONE_N; i++)
+        if (g_pre_done[i][0] && strcmp(g_pre_done[i], path) == 0) return 1;
+    return 0;
+}
+
+/* Caller holds g_lock. Which slot, if any, is worth starting: the first one
+ * naming a track that is not already settled and is not the one on screen. */
+static int pre_slot(void) {
+    for (int i = 0; i < WAVE_AHEAD; i++)
+        if (g_next[i][0] && !pre_settled(g_next[i]) &&
+            strcmp(g_next[i], g_have_path) != 0)
+            return i;
+    return -1;
+}
+
 static int still_wanted(void *ctx) {
     const char *path = (const char *)ctx;
     pthread_mutex_lock(&g_lock);
@@ -238,7 +262,10 @@ static int still_wanted(void *ctx) {
         ok = 1;
     } else {
         int cur_needs_work = g_wanted[0] && strcmp(g_wanted, g_have_path) != 0;
-        ok = !cur_needs_work && strcmp(g_next, path) == 0;
+        ok = 0;
+        if (!cur_needs_work)
+            for (int i = 0; i < WAVE_AHEAD && !ok; i++)
+                ok = strcmp(g_next[i], path) == 0;
     }
     pthread_mutex_unlock(&g_lock);
     return ok;
@@ -272,16 +299,17 @@ static void *worker(void *arg) {
         char path[sizeof(g_wanted)];
         int prefetch;
         pthread_mutex_lock(&g_lock);
+        int slot = -1;
         for (;;) {
             /* The track on screen first, always. Only when it is settled --
-             * or there is none -- is the queue's next track worth the core. */
+             * or there is none -- are the queue's next tracks worth the core,
+             * and then in order. */
             int cur = g_wanted[0] && strcmp(g_wanted, g_have_path) != 0;
-            int nxt = !cur && g_next[0] && strcmp(g_next, g_pre_done) != 0 &&
-                      strcmp(g_next, g_have_path) != 0;
-            if (cur || nxt) { prefetch = !cur; break; }
+            slot = cur ? -1 : pre_slot();
+            if (cur || slot >= 0) { prefetch = !cur; break; }
             pthread_cond_wait(&g_wake, &g_lock);
         }
-        snprintf(path, sizeof(path), "%s", prefetch ? g_next : g_wanted);
+        snprintf(path, sizeof(path), "%s", prefetch ? g_next[slot] : g_wanted);
         pthread_mutex_unlock(&g_lock);
 
         uint8_t bars[WAVEFORM_BUCKETS];
@@ -334,7 +362,8 @@ static void *worker(void *arg) {
                 g_have_ok = outcome == 1;
                 if (g_have_ok) memcpy(g_have, bars, WAVEFORM_BUCKETS);
             } else if (prefetch) {
-                snprintf(g_pre_done, sizeof(g_pre_done), "%s", path);
+                snprintf(g_pre_done[g_pre_done_i], sizeof(g_pre_done[0]), "%s", path);
+                g_pre_done_i = (g_pre_done_i + 1) % WAVE_DONE_N;
             }
         }
         pthread_mutex_unlock(&g_lock);
@@ -360,13 +389,18 @@ void waveform_start(void (*log)(const char *fmt, ...)) {
     pthread_detach(t);
 }
 
-void waveform_prefetch(const char *path) {
-    if (!path) path = "";
+void waveform_prefetch(const char *first, const char *second) {
+    const char *want[WAVE_AHEAD];
+    want[0] = first  ? first  : "";
+    want[1] = second ? second : "";
     pthread_mutex_lock(&g_lock);
-    if (strcmp(g_next, path) != 0) {
-        snprintf(g_next, sizeof(g_next), "%s", path);
-        pthread_cond_signal(&g_wake);
-    }
+    int changed = 0;
+    for (int i = 0; i < WAVE_AHEAD; i++)
+        if (strcmp(g_next[i], want[i]) != 0) {
+            snprintf(g_next[i], sizeof(g_next[i]), "%s", want[i]);
+            changed = 1;
+        }
+    if (changed) pthread_cond_signal(&g_wake);
     pthread_mutex_unlock(&g_lock);
 }
 

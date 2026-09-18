@@ -229,12 +229,17 @@ static int scan_one(sqlite3 *widb, const char *real, const struct stat *st) {
     char path[LIB_PATH_LEN];
     stored_path(path, sizeof(path), real);
 
-    /* The album comes back too, not just the mtime: a row left by the stock
-     * firmware's own scanner carries no tags at all (its 161 such rows are
-     * what folder_fallback() exists for), and an unchanged mtime would
+    /* The album and format come back too, not just the mtime.
+     *
+     * A row left by an older scan carries no tags at all (the 161 such rows
+     * are what folder_fallback() exists for), and an unchanged mtime would
      * otherwise mean this scanner never looked at the file again and never
-     * filled them in. A row that already has an album is left alone. */
-    static const char *check_sql = "select mtime, album from MEDIA_TABLE where path = ?";
+     * filled them in. The same applies to an .m4a still carrying the
+     * container's own code 278, which says nothing about whether the bytes
+     * inside are AAC or Apple Lossless -- those get re-probed once and then
+     * carry LIB_FORMAT_ALAC or LIB_FORMAT_AAC_M4A, so this never fires for
+     * them again. A row with an album and a settled format is left alone. */
+    static const char *check_sql = "select mtime, album, format from MEDIA_TABLE where path = ?";
     sqlite3_stmt *cst;
     if (sqlite3_prepare_v2(widb, check_sql, -1, &cst, NULL) == SQLITE_OK) {
         sqlite3_bind_text(cst, 1, path, -1, SQLITE_TRANSIENT);
@@ -242,7 +247,10 @@ static int scan_one(sqlite3 *widb, const char *real, const struct stat *st) {
         if (sqlite3_step(cst) == SQLITE_ROW &&
             (time_t)sqlite3_column_int64(cst, 0) == st->st_mtime) {
             const unsigned char *alb = sqlite3_column_text(cst, 1);
-            current = alb && alb[0];
+            int fmt = sqlite3_column_int(cst, 2);
+            const char *ext = strrchr(real, '.');
+            int m4a_unresolved = fmt == 278 && ext && !strcasecmp(ext, ".m4a");
+            current = alb && alb[0] && !m4a_unresolved;
         }
         sqlite3_finalize(cst);
         if (current) return 0;
@@ -276,8 +284,13 @@ static int scan_one(sqlite3 *widb, const char *real, const struct stat *st) {
         if (dot) *dot = '\0';
     }
 
-    int bits = 0, rate = 0, bitrate = 0, dur_ms = 0;
-    audio_probe_format(real, &bits, &rate, &bitrate, &dur_ms);
+    int bits = 0, rate = 0, bitrate = 0, dur_ms = 0, codec = AUDIO_CODEC_OTHER;
+    audio_probe_format(real, &bits, &rate, &bitrate, &dur_ms, &codec);
+    /* The extension names the container; only the probe can say which codec is
+     * inside an .m4a. */
+    int fmt_code = format_code(real);
+    if (codec == AUDIO_CODEC_ALAC)     fmt_code = LIB_FORMAT_ALAC;
+    else if (codec == AUDIO_CODEC_AAC) fmt_code = LIB_FORMAT_AAC_M4A;
 
     static const char *up_sql =
         "insert or replace into MEDIA_TABLE "
@@ -289,7 +302,7 @@ static int scan_one(sqlite3 *widb, const char *real, const struct stat *st) {
     sqlite3_bind_text(ust, 1, path, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(ust, 2, (sqlite3_int64)st->st_mtime);
     sqlite3_bind_text(ust, 3, name, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(ust, 4, format_code(real));
+    sqlite3_bind_int(ust, 4, fmt_code);
     sqlite3_bind_int(ust, 5, bits);
     sqlite3_bind_int(ust, 6, rate);
     sqlite3_bind_int(ust, 7, bitrate);

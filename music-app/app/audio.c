@@ -139,6 +139,12 @@ typedef struct {
      * that is actually playing. Set through dec_open_buf(), never after an
      * open -- see its comment. */
     short       *pcm;
+    /* 1 when an M4A turned out to hold Apple Lossless rather than AAC. Kept
+     * on the decoder rather than read back from mp4.codec, because the probe
+     * path closes its mp4_t before returning and mp4_close() zeroes it --
+     * reading the field afterwards reported AAC for every file, which is
+     * exactly how a lossless album came to be labelled AAC. */
+    int          m4a_alac;
 } dec_t;
 
 /* Only lossless formats above 16 bits have anything worth dithering when
@@ -631,6 +637,7 @@ static int m4a_prime(dec_t *d) {
 
 static int dec_open_m4a(dec_t *d, const char *path) {
     if (mp4_open(&d->mp4, path) != 0) return -1;
+    d->m4a_alac = d->mp4.codec == MP4_CODEC_ALAC;
     if (d->mp4.codec == MP4_CODEC_ALAC) {
         d->alac = alac_open(d->mp4.asc, d->mp4.asc_len);
         if (!d->alac) { mp4_close(&d->mp4); return -1; }
@@ -668,6 +675,7 @@ static int dec_open_m4a(dec_t *d, const char *path) {
  * this stops right there. Bits is always 16 (both decoders hand back s16). */
 static int dec_open_m4a_probe(dec_t *d, const char *path) {
     if (mp4_open(&d->mp4, path) != 0) return -1;
+    d->m4a_alac = d->mp4.codec == MP4_CODEC_ALAC;
     if (d->mp4.codec == MP4_CODEC_ALAC) {
         d->alac = alac_open(d->mp4.asc, d->mp4.asc_len);
         if (!d->alac) { mp4_close(&d->mp4); return -1; }
@@ -1230,7 +1238,8 @@ int audio_mp3_is_vbr(const char *path) {
  * too would just be two places to keep in sync). MP3's bits is hardcoded 16 --
  * dec_open() leaves d.bits at 0 for it deliberately (no wide MP3 exists). */
 int audio_probe_format(const char *path, int *bits, int *rate,
-                       int *bitrate_bps, int *dur_ms) {
+                       int *bitrate_bps, int *dur_ms, int *codec) {
+    if (codec) *codec = AUDIO_CODEC_OTHER;
     dec_t d;
     memset(&d, 0, sizeof(d));
     /* M4A goes through dec_open_m4a_probe() instead of dec_open(), which for
@@ -1241,6 +1250,9 @@ int audio_probe_format(const char *path, int *bits, int *rate,
     int rc = (sniff(path) == DEC_M4A) ? dec_open_m4a_probe(&d, path) : dec_open(&d, path);
     if (rc != 0) return -1;
     dec_kind_t kind = d.kind;
+    /* d.m4a_alac, not d.mp4.codec: see its own comment in dec_t. */
+    if (codec && kind == DEC_M4A)
+        *codec = d.m4a_alac ? AUDIO_CODEC_ALAC : AUDIO_CODEC_AAC;
     if (rate) *rate = (int)d.rate;
     if (bits) *bits = (kind == DEC_MP3) ? 16 : d.bits;
     if (dur_ms) *dur_ms = (d.frames && d.rate) ? (int)(d.frames * 1000 / d.rate) : 0;
@@ -1375,19 +1387,41 @@ static int   g_speed = 1000;        /* permille, WSOLA time-stretch; 1000 = bypa
  * for a local file. keep_going is asked once per chunk, so abandoning a track
  * costs at most one chunk of decode.
  *
- * And it is paced while something is playing. SCHED_IDLE (waveform.c) keeps
- * the worker off the CPU, but says nothing about the card: measured on device,
- * scanning an 886 MB 24/192 WAV while streaming to a headset pulled Bluetooth
- * throughput from 391 kbps down to 231 and cost one underrun, because reading
- * a file that size flat out starves playback's own reads. This kernel's mmc
- * queue uses the deadline scheduler, which ignores I/O priority, so there is
- * nothing to ask politely with -- the fix is to not read flat out. A sleep of
- * a sixth of each chunk's own duration holds the scan to roughly six times
- * real time, which still finishes a track in well under a minute and leaves
- * the card free between bursts. Nothing playing, nothing to protect: the scan
- * runs at full speed. Returns 1 with level[] filled, 0 if
+ * And it is paced while something is playing -- but only for the files that
+ * need it. SCHED_IDLE (waveform.c) keeps the worker off the CPU, and says
+ * nothing about the card: measured on device, scanning an 886 MB 24/192 WAV
+ * while streaming to a headset pulled Bluetooth throughput from 391 kbps to
+ * 231 and cost an underrun, because reading a file that size flat out starves
+ * playback's own reads. This kernel's mmc queue uses the deadline scheduler
+ * and ignores I/O priority, so there is nothing to ask politely with; the fix
+ * is to not read flat out.
+ *
+ * What that must not do is slow every other file down with it. A hi-res WAV
+ * moves about 1.2 MB per second of audio; an ordinary 16/44.1 FLAC moves a
+ * tenth of that, and scanning those at full speed never cost an underrun even
+ * before any pacing existed (a five-minute FLAC scanned in 15.6 s while
+ * streaming, cleanly). Pacing them anyway made the next track's shape take
+ * around a minute to appear, so skipping forward after a couple of minutes
+ * landed on a scan still in progress -- reported exactly that way.
+ *
+ * So the throttle follows the source's own data rate. Uncompressed bytes per
+ * second of audio is the measure -- an upper bound on what the card actually
+ * has to deliver, since everything but WAV is compressed:
+ *
+ *     24/192 stereo  1.15 MB/s   throttled (the case that underran)
+ *     24/96  stereo   576 KB/s   throttled
+ *     24/48  stereo   288 KB/s   full speed
+ *     16/44.1 stereo  176 KB/s   full speed
+ *
+ * Above ENV_THROTTLE_BPS, sleep a sixth of each chunk's own duration (roughly
+ * six times real time, which held the 24/192 WAV at 390-396 kbps with no
+ * underruns); below it, run flat out. Nothing playing, nothing to protect
+ * either way. Returns 1 with level[] filled, 0 if
  * there is nothing to measure (unreadable, unsupported, empty), -1 if
  * keep_going said stop. */
+/* Where a source stops being cheap to read alongside playback. Between the
+ * 24/48 material that scans clean and the 24/96 that starts to bite. */
+#define ENV_THROTTLE_BPS 500000
 #define ENV_SLICES 1024
 #define ENV_CHUNK  4096
 #define ENV_MAX_CH 8
@@ -1420,6 +1454,9 @@ int audio_envelope(const char *path, uint32_t *level, int n,
     if (d.channels < 1 || d.channels > ENV_MAX_CH || d.rate == 0) goto out;
 
     uint32_t ch = (uint32_t)d.channels;
+    /* See the note above: only the high-data-rate sources are held back. */
+    uint64_t src_bps = (uint64_t)d.rate * ch * (uint64_t)(d.bits > 16 ? 3 : 2);
+    int throttle = src_bps > ENV_THROTTLE_BPS;
     uint32_t slice_len = d.rate / 20;          /* 50 ms to start with */
     if (slice_len == 0) slice_len = 1;
     int cur = 0;
@@ -1429,10 +1466,12 @@ int audio_envelope(const char *path, uint32_t *level, int n,
         if (keep_going && !keep_going(ctx)) { rc = -1; break; }
         uint64_t got = dec_read(&d, buf, ENV_CHUNK);
         if (got == 0) break;
-        pthread_mutex_lock(&g_lock);
-        int busy = g_active && !g_paused;
-        pthread_mutex_unlock(&g_lock);
-        if (busy) usleep((useconds_t)(got * 1000000ull / d.rate / 6));
+        if (throttle) {
+            pthread_mutex_lock(&g_lock);
+            int busy = g_active && !g_paused;
+            pthread_mutex_unlock(&g_lock);
+            if (busy) usleep((useconds_t)(got * 1000000ull / d.rate / 6));
+        }
         const short *q = buf;
         uint32_t left = (uint32_t)got;
         while (left) {
@@ -1629,6 +1668,21 @@ static int    bt_read_fail_count;
  * software-gain use of it; for Bluetooth it is now purely a *display*
  * conversion of bt_vol_raw, never the value actually being stepped. */
 static int bt_vol_raw = -1;      /* -1 = not yet read this connection */
+/* Whether a real reading has been taken from this connection's mixer yet.
+ * Distinct from bt_vol_raw >= 0, which a guessed step also sets. */
+static int bt_vol_synced;
+static int bt_softvol_set;   /* SoftVolume asked for once this connection */
+/* R-btlevel: the level the *user* last chose over Bluetooth, in percent, kept
+ * across connections and tracks (find_bt_mixer() resets everything else per
+ * connection). Reported live: playback starts, then ~3s later the volume
+ * jumps -- SoftVolume was switched on at whatever level bluealsa happened to
+ * hold for that connection (29/127, 94/127, 15/127 in the log, unrelated to
+ * each other or to anything the user set) and the app then *adopted* that
+ * number as truth. Only user actions write this, never a reading, so a
+ * headset's or bluealsa's arbitrary value can't overwrite it. -1 until the
+ * first Bluetooth connection has settled on a level. */
+static int bt_last_pct = -1;
+
 static int bt_vol_max  = 127;    /* AVRCP's own range; re-read per mixer in
                                    * case a future device differs */
 /* How many equal steps a single volume-key press moves across bt_vol_max --
@@ -1654,6 +1708,8 @@ static int bt_pct_to_raw(int pct) {
 static void find_bt_mixer(void) {
     bt_mixer[0] = '\0';
     bt_vol_raw = -1;
+    bt_vol_synced = 0;
+    bt_softvol_set = 0;
     FILE *p = popen("amixer -D bluealsa scontrols 2>/dev/null", "r");
     if (!p) return;
     char line[256];
@@ -1750,6 +1806,11 @@ static int bt_read_raw(int *max_out) {
 static pthread_mutex_t bt_vol_lock = PTHREAD_MUTEX_INITIALIZER;
 static int bt_vol_pending;            /* 1 = a write is waiting to be applied */
 static int bt_vol_pending_raw;
+/* What a press queued before this connection's volume was ever read actually
+ * meant: a direction, in raw units, not the absolute target that was computed
+ * from a guess. See audio_bt_volume_service()'s discovery branch. Accumulates
+ * over several presses, and is cleared the moment a real reading lands. */
+static int bt_vol_pending_rel;
 
 /* USB Transport Mode's volume lock -- see audio_set_vol_locked()'s own
  * comment in audio.h. Deliberately doesn't gate audio_set_volume() itself:
@@ -1776,8 +1837,10 @@ void audio_volume_set(int pct) {
     int raw = bt_pct_to_raw(pct);
     if (raw < 0) raw = 0; if (raw > bt_vol_max) raw = bt_vol_max;
     bt_vol_raw = raw;
+    bt_last_pct = pct;
     pthread_mutex_lock(&bt_vol_lock);
     bt_vol_pending = 1; bt_vol_pending_raw = raw;
+    bt_vol_pending_rel = 0;   /* the slider names a level outright */
     pthread_mutex_unlock(&bt_vol_lock);
     /* The slider asked for this exact percentage -- show it directly
      * rather than round-tripping through bt_raw_to_pct(), which could
@@ -1812,11 +1875,19 @@ void audio_volume_step(int delta) {
     int raw = base + (delta > 0 ? step : delta < 0 ? -step : 0);
     if (raw < 0) raw = 0; if (raw > bt_vol_max) raw = bt_vol_max;
     bt_vol_raw = raw;
+    bt_last_pct = bt_raw_to_pct(raw);
     pthread_mutex_lock(&g_lock);
     g_vol = bt_raw_to_pct(raw);
     pthread_mutex_unlock(&g_lock);
     pthread_mutex_lock(&bt_vol_lock);
     bt_vol_pending = 1; bt_vol_pending_raw = raw;
+    /* Until this connection's volume has actually been read, `raw` above rests
+     * on a guess (g_vol, which still holds the *wired* level -- usually 100%,
+     * which converts straight to the mixer's maximum). Keep what the press
+     * meant as well, so the discovery branch can apply the press to the real
+     * reading instead of writing that guess. */
+    if (bt_vol_synced) bt_vol_pending_rel = 0;
+    else bt_vol_pending_rel += (delta > 0 ? step : delta < 0 ? -step : 0);
     pthread_mutex_unlock(&bt_vol_lock);
     /* BG94: reported as hardware volume buttons lagging several seconds
      * behind a press, sometimes matching the on-screen slider and sometimes
@@ -1854,6 +1925,66 @@ int audio_bt_volume_pending(void) {
  * section's own top comment) -- no percent conversion anywhere in this
  * round trip, so a write this app just made and its own readback are
  * identical by construction, not merely close. */
+/* Make the volume this player's to apply, rather than a request the headset
+ * is free to ignore.
+ *
+ * bluealsa runs with --a2dp-volume, which means it does not touch the audio:
+ * it sends the level to the device over AVRCP and leaves the device to apply
+ * it. A device that accepts those messages and then does nothing with them
+ * leaves volume control apparently dead -- the level tracks every press, and
+ * nothing gets louder. Seen on a SoundCore 2 (its AVRCP value followed presses
+ * from 127 to 23 to 72 with no audible change) and reported on the Jabra Elite
+ * 4 Active too, which is what makes it the default worth having rather than a
+ * quirk of one speaker.
+ *
+ * SoftVolume moves the scaling into bluealsa, before the encoder, so it works
+ * on any sink. The cost is digital attenuation, which the device's own
+ * hardware would do better -- but only on a device that actually does it. At
+ * full volume it is a straight passthrough, so nothing is lost there.
+ *
+ * Per connection, because bluealsa resets the property when the device goes.
+ *
+ * The level has to be rescued as it goes. In AVRCP mode bluealsa's own volume
+ * is only a number it forwards, so a device that reports 0 while connecting
+ * costs nothing -- the audio is untouched and the device ignores the message
+ * anyway. The moment SoftVolume is on, that same 0 is a multiply by zero, and
+ * the track plays silently until the next volume-service tick writes a real
+ * level a second or two later. Reported exactly that way: "two seconds of
+ * playback before I hear anything". So anything at or near zero is lifted to a
+ * sane level here, in the same breath as the switch; a level the user has
+ * genuinely chosen is left alone. */
+#define BT_SOFTVOL_FLOOR_PCT 45
+
+static void bt_enable_softvol(void) {
+    if (bt_softvol_set) return;
+    char path[256];
+    if (!st_bt_pcm_path(path, sizeof(path))) return;
+    bt_softvol_set = 1;
+    char cmd[320];
+    snprintf(cmd, sizeof(cmd), "bluealsa-cli soft-volume '%s' true >/dev/null 2>&1", path);
+    if (system(cmd) == -1) { bt_softvol_set = 0; return; }
+
+    int max = bt_vol_max;
+    int now = bt_read_raw(&max);
+    if (now >= 0) bt_vol_max = max;
+    /* Zero, or so low it is indistinguishable from silence. */
+    if (now >= 0 && now <= bt_vol_max / 20) {
+        int floor_raw = (BT_SOFTVOL_FLOOR_PCT * bt_vol_max + 50) / 100;
+        snprintf(cmd, sizeof(cmd), "amixer -D bluealsa sset '%s' %d >/dev/null 2>&1",
+                 bt_mixer, floor_raw);
+        if (system(cmd) != -1) {
+            bt_vol_raw = floor_raw;
+            pthread_mutex_lock(&g_lock);
+            g_vol = bt_raw_to_pct(floor_raw);
+            pthread_mutex_unlock(&g_lock);
+            alog("[audio] bt: SoftVolume on, level was %d/%d -- raised to %d\n",
+                 now, bt_vol_max, floor_raw);
+            return;
+        }
+    }
+    alog("[audio] bt: SoftVolume on for %s (level %d/%d)\n", path, now, bt_vol_max);
+}
+
 void audio_bt_volume_service(void) {
     if (!audio_using_bt()) {
         bt_mixer_misses = 0; bt_mixer_next_try = 0; bt_read_fail_count = 0;
@@ -1891,6 +2022,9 @@ void audio_bt_volume_service(void) {
             } else {
                 bt_mixer_misses = 0; bt_mixer_next_try = 0;
                 bt_read_fail_count = 0;
+                /* Before the reading below, so the value read back is already
+                 * the one this player will be applying. */
+                bt_enable_softvol();
                 /* R90: reported live as the first volume-down press after
                  * connecting a Jabra Elite 4 Active landing as a dramatic
                  * *increase* instead. This control was just discovered --
@@ -1907,9 +2041,22 @@ void audio_bt_volume_service(void) {
                  * range/current value. */
                 int max = bt_vol_max;
                 int fresh = bt_read_raw(&max);
+                if (fresh >= 0) bt_vol_max = max;
+                if (fresh >= 0 && bt_last_pct >= 0) {
+                    /* R-btlevel: there is a level the user chose -- write
+                     * *that*, don't adopt bluealsa's. The reading above only
+                     * told us the range. */
+                    int want = bt_pct_to_raw(bt_last_pct);
+                    if (want < 0) want = 0; if (want > bt_vol_max) want = bt_vol_max;
+                    char wcmd[224];
+                    snprintf(wcmd, sizeof(wcmd), "amixer -D bluealsa sset '%s' %d >/dev/null 2>&1",
+                             bt_mixer, want);
+                    if (system(wcmd) != -1) fresh = want;
+                }
                 if (fresh >= 0) {
-                    bt_vol_max = max;
                     bt_vol_raw = fresh;
+                    bt_vol_synced = 1;
+                    if (bt_last_pct < 0) bt_last_pct = bt_raw_to_pct(fresh);   /* first ever: adopt */
                     pthread_mutex_lock(&g_lock);
                     g_vol = bt_raw_to_pct(fresh);
                     pthread_mutex_unlock(&g_lock);
@@ -1927,9 +2074,41 @@ void audio_bt_volume_service(void) {
                  * `if (pending)` below actually applies the press the user
                  * asked for instead of silently eating it. */
                 if (pending) {
+                    /* R90 follow-up, reported live again: "turning up volume
+                     * on Bluetooth for the first time after connection goes
+                     * immediately to full volume". raw_val is the absolute
+                     * target computed back in audio_volume_step() from the
+                     * guess described there -- with the wired volume at 100%
+                     * that guess is the mixer's maximum, so re-queuing it
+                     * verbatim wrote full volume however gently the button was
+                     * pressed. The comment above always claimed this was
+                     * re-queued "against bt_vol_raw/g_vol as they now stand";
+                     * now it is. The press is carried as a direction
+                     * (bt_vol_pending_rel) and applied to the reading just
+                     * taken, so one press moves one step from wherever the
+                     * headset actually was. */
+                    int rel;
+                    pthread_mutex_lock(&bt_vol_lock);
+                    rel = bt_vol_pending_rel;
+                    bt_vol_pending_rel = 0;
+                    pthread_mutex_unlock(&bt_vol_lock);
+
+                    int target = raw_val;
+                    if (rel != 0 && fresh >= 0) {
+                        target = bt_vol_raw + rel;
+                        if (target < 0) target = 0;
+                        if (target > bt_vol_max) target = bt_vol_max;
+                        /* Show where it is going, not the reading it passed
+                         * through on the way: otherwise the slider snaps to
+                         * the headset's old level for one tick first. */
+                        bt_vol_raw = target;
+                        pthread_mutex_lock(&g_lock);
+                        g_vol = bt_raw_to_pct(target);
+                        pthread_mutex_unlock(&g_lock);
+                    }
                     pthread_mutex_lock(&bt_vol_lock);
                     bt_vol_pending = 1;
-                    bt_vol_pending_raw = raw_val;
+                    bt_vol_pending_raw = target;
                     pthread_mutex_unlock(&bt_vol_lock);
                 }
                 return;
@@ -1965,6 +2144,7 @@ void audio_bt_volume_service(void) {
     bt_read_fail_count = 0;
     bt_vol_max = max;
     bt_vol_raw = raw;
+    bt_vol_synced = 1;
     pthread_mutex_lock(&g_lock);
     g_vol = bt_raw_to_pct(raw);
     pthread_mutex_unlock(&g_lock);
@@ -2080,6 +2260,17 @@ static void *pcm_open(unsigned rate, int channels, int deep, int want_fmt) {
              fmts[i] == FMT_S32_LE ? "S32_LE" :
              fmts[i] == FMT_S24_LE ? "S24_LE" : "S16_LE",
              g_exact ? " (exact)" : " (converted)");
+        /* A Bluetooth device that has just been opened is a device that has
+         * just appeared, and its AVRCP control appears with it -- so drop
+         * whatever backoff find_bt_mixer() had settled into while there was
+         * nothing to find. BG93's backoff exists to stop an unattended probe
+         * spinning against a headset that simply has no mixer, not to make a
+         * reconnection wait out a minute with no volume control: seen live
+         * after a speaker reconnected, where the last probe had already
+         * stretched to once a minute and the keys had nothing to write to
+         * until it came round again. Cheap and exact, unlike polling
+         * bt_sink_connected(), which forks a subprocess per call. */
+        if (g_out_kind == 2) { bt_mixer_misses = 0; bt_mixer_next_try = 0; }
         x_hwp_free(hw);
         break;
     }
@@ -2477,6 +2668,15 @@ static void *worker(void *arg) {
      * re-push before bluealsa's reset default gets read back and clobbers
      * g_vol. */
     bt_repush_volume();
+    /* R-btlevel: don't wait out the mixer probe's backoff (bt_mixer_next_try,
+     * up to 5s on a fresh connection) to apply the user's level -- until it
+     * runs, audio flows at whatever the sink defaults to, which is the
+     * "starts, then jumps" this fixes. One synchronous pass here, before the
+     * first write. */
+    if (g_out_kind == 2 && !bt_mixer[0]) {
+        bt_mixer_next_try = 0;
+        audio_bt_volume_service();
+    }
 
     /* Two buffers, because the two paths carry different sample sizes. Only
      * the lossless formats above 16 bits use the wide one; MP3 and AAC decode
