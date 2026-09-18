@@ -1,5 +1,6 @@
 #ifndef MUSIC_STATUS_H
 #define MUSIC_STATUS_H
+#include <stddef.h>
 int st_battery_pct(void);    /* 0-100, -1 unknown */
 int st_charging(void);
 int st_headset(void);        /* jack occupied */
@@ -43,6 +44,11 @@ int  bt_scan_devices(bt_found_dev_t *out, int max);   /* returns count found, <=
 void bt_fill_details(bt_found_dev_t *devs, int n);
 int  bt_is_paired(const char *mac);                   /* has a bluez pairing record on disk */
 void bt_pair(const char *mac);
+/* Long-press actions on a paired device. Forget = bluez `remove`, which also
+ * drops the link and the on-disk pairing. mac is always a bluez-formatted
+ * XX:XX:XX:XX:XX:XX (validated here), never free text. */
+void bt_forget(const char *mac);
+void bt_disconnect(const char *mac);
 /* Polls the result bt_pair()'s own backgrounded retry loop writes to
  * /usr/data/bt_pair_status once it finishes with this mac, win or lose --
  * see bt_pair()'s comment. 0 while no result for this mac has landed yet
@@ -55,6 +61,7 @@ int  bt_pair_result(const char *mac);
  * `open` is 1 for a network with no WPA/WEP marker in its flags -- the
  * caller can connect straight away rather than asking for a password. */
 typedef struct { char ssid[64]; int signal; int open; } wifi_found_net_t;
+void wpa_unescape(const char *in, size_t inlen, char *out, size_t outsz);   /* wpa_cli's \xNN escapes */
 void wifi_scan_start(void);
 int  wifi_scan_results(wifi_found_net_t *out, int max);   /* returns count found, <= max, strongest first */
 

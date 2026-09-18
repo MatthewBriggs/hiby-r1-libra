@@ -78,7 +78,7 @@ static void run_cmd(const char *cmd, char *out, unsigned n) {
  * since scan results carry the same escaping in the same shape. `in` need
  * not be NUL-terminated at exactly `inlen`; the caller passes the field's
  * own length from a larger tab/newline-delimited line. */
-static void wpa_unescape(const char *in, size_t inlen, char *out, size_t outsz) {
+void wpa_unescape(const char *in, size_t inlen, char *out, size_t outsz) {
     unsigned o = 0;
     for (size_t i = 0; i < inlen && o + 1 < outsz; ) {
         if (in[i] == '\\' && i + 3 < inlen && in[i + 1] == 'x') {
@@ -536,6 +536,21 @@ void bt_pair(const char *mac) {
         mac);
     if (system(cmd) == -1) return;
 }
+
+static int bt_mac_ok(const char *mac) {
+    if (!mac || strlen(mac) != 17) return 0;
+    for (int i = 0; i < 17; i++)
+        if (i % 3 == 2 ? mac[i] != ':' : !isxdigit((unsigned char)mac[i])) return 0;
+    return 1;
+}
+static void bt_ctl(const char *verb, const char *mac) {
+    if (!bt_mac_ok(mac)) return;
+    char cmd[160];
+    snprintf(cmd, sizeof(cmd), "printf '%s %s\\nquit\\n' | bluetoothctl >/dev/null 2>&1", verb, mac);
+    if (system(cmd) == -1) return;
+}
+void bt_forget(const char *mac)     { bt_ctl("remove", mac); }
+void bt_disconnect(const char *mac) { bt_ctl("disconnect", mac); }
 
 int bt_pair_result(const char *mac) {
     FILE *f = fopen("/usr/data/bt_pair_status", "r");

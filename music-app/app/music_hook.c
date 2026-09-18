@@ -2846,7 +2846,7 @@ static int settings_content_rows(void) {
  * pushed by hand, not by CI against a tagged commit), so this stays a
  * literal that a human edits; the discipline is remembering to, not the
  * mechanism. */
-#define LIBRARY_VERSION "0.55"
+#define LIBRARY_VERSION "0.55.1"
 
 /* A custom-built kernel keeps uname()'s own release string exactly
  * "4.4.94+" on purpose -- that string is also the vermagic every one of the
@@ -3040,6 +3040,17 @@ static const char *const playlist_delete_items[] = { "Delete", "Cancel" };
  * recording -- see recording_guard(). */
 static const char *const rec_confirm_items[] = { "Stop recording and play", "Cancel" };
 #define REC_CONFIRM_N ((int)(sizeof(rec_confirm_items) / sizeof(rec_confirm_items[0])))
+/* sheet_open == 7: a saved Wi-Fi network's long-press menu. The SSID is
+ * held here, not re-read from wifi_nets[], which re-sorts every 2s scan. */
+static char sheet_wifi_ssid[64];
+static int  sheet_wifi_secured;
+static const char *const wifi_menu_items[] = { "Change password", "Forget network", "Cancel" };
+#define WIFI_MENU_ITEM(i) wifi_menu_items[(i) + (sheet_wifi_secured ? 0 : 1)]
+/* sheet_open == 8: a paired Bluetooth device's long-press menu. */
+static char sheet_bt_mac[24];
+static char sheet_bt_name[48];
+static const char *const bt_menu_items[] = { "Disconnect", "Forget device", "Cancel" };
+#define BT_MENU_N ((int)(sizeof(bt_menu_items) / sizeof(bt_menu_items[0])))
 #define SHEET_ROW 72
 
 static pl_t playlists[PL_MAX];
@@ -3539,7 +3550,7 @@ static void hex_decode(const char *in, char *out, size_t outsz) {
  * than folded into music.conf: credentials are a different kind of data
  * (potentially many rows, not a fixed set of singleton keys) and arguably
  * deserve being easy to find/wipe on their own. */
-static void wifi_save_credential(const char *ssid, const char *password) {
+static void wifi_cred_write(const char *ssid, const char *password) {
     char hex_ssid[80]; hex_encode(ssid, hex_ssid, sizeof(hex_ssid));
     char lines[64][256];
     int n = 0;
@@ -3557,9 +3568,73 @@ static void wifi_save_credential(const char *ssid, const char *password) {
     f = fopen(WIFI_CREDS_PATH, "w");
     if (!f) return;
     for (int i = 0; i < n; i++) fputs(lines[i], f);
-    char hex_pw[192]; hex_encode(password, hex_pw, sizeof(hex_pw));
-    fprintf(f, "wifi_cred = %s %s\n", hex_ssid, hex_pw);
+    if (password) {
+        char hex_pw[192]; hex_encode(password, hex_pw, sizeof(hex_pw));
+        fprintf(f, "wifi_cred = %s %s\n", hex_ssid, hex_pw);
+    }
     fclose(f);
+}
+static void wifi_save_credential(const char *ssid, const char *password) {
+    wifi_cred_write(ssid, password);
+}
+
+/* wpa_supplicant's own saved networks (wpa_cli list_networks: "id\tssid\t
+ * bssid\tflags"), parsed here rather than piped through awk so an SSID with
+ * shell metacharacters never touches a shell. */
+#define WIFI_SAVED_MAX 24
+static char wifi_saved[WIFI_SAVED_MAX][64];
+static int  wifi_saved_id[WIFI_SAVED_MAX];
+static int  wifi_saved_n;
+static void wifi_saved_refresh(void) {
+    wifi_saved_n = 0;
+    FILE *p = popen("wpa_cli list_networks 2>/dev/null", "r");
+    if (!p) return;
+    char line[256];
+    while (wifi_saved_n < WIFI_SAVED_MAX && fgets(line, sizeof(line), p)) {
+        char *end;
+        long id = strtol(line, &end, 10);
+        if (end == line || *end != '\t') continue;
+        char *name = end + 1;
+        char *tab = strchr(name, '\t');
+        if (tab) *tab = '\0'; else name[strcspn(name, "\r\n")] = '\0';
+        if (!*name) continue;
+        wpa_unescape(name, strlen(name), wifi_saved[wifi_saved_n], sizeof(wifi_saved[0]));
+        wifi_saved_id[wifi_saved_n++] = (int)id;
+    }
+    pclose(p);
+}
+static int wifi_is_saved(const char *ssid) {
+    for (int i = 0; i < wifi_saved_n; i++)
+        if (!strcmp(wifi_saved[i], ssid)) return 1;
+    return 0;
+}
+static void wifi_remove_saved(const char *ssid) {
+    wifi_saved_refresh();
+    char cmd[64];
+    for (int i = 0; i < wifi_saved_n; i++) {
+        if (strcmp(wifi_saved[i], ssid)) continue;
+        snprintf(cmd, sizeof(cmd), "wpa_cli remove_network %d >/dev/null 2>&1", wifi_saved_id[i]);
+        if (system(cmd) == -1) mlog("[music] wifi: remove_network failed\n");
+    }
+}
+static void wifi_forget(const char *ssid) {
+    wifi_remove_saved(ssid);
+    if (system("wpa_cli save_config >/dev/null 2>&1") == -1) mlog("[music] wifi: save_config failed\n");
+    wifi_cred_write(ssid, NULL);
+    wifi_saved_refresh();
+    mlog("[music] wifi: forgot %s\n", ssid);
+}
+/* Join an already-saved network without asking for its password again.
+ * select_network (runtime only, no save_config) disables the others until
+ * wifi_connect()'s enable_network all puts them back. */
+static void wifi_select_saved(const char *ssid) {
+    char cmd[64];
+    for (int i = 0; i < wifi_saved_n; i++) {
+        if (strcmp(wifi_saved[i], ssid)) continue;
+        snprintf(cmd, sizeof(cmd), "wpa_cli select_network %d >/dev/null 2>&1 &", wifi_saved_id[i]);
+        if (system(cmd) == -1) mlog("[music] wifi: select_network failed\n");
+        return;
+    }
 }
 
 /* Everything wifi_on.sh already relies on: ctrl_interface is set in
@@ -3585,11 +3660,13 @@ static void wifi_connect(const char *ssid, const char *password) {
     shell_safe(ssid, s_ssid, sizeof(s_ssid));
     shell_safe(password, s_pw, sizeof(s_pw));
     char cmd[512];
+    wifi_remove_saved(ssid);
     snprintf(cmd, sizeof(cmd),
         "id=$(wpa_cli add_network | tail -1); "
         "wpa_cli set_network $id ssid '\"%s\"' >/dev/null; "
         "wpa_cli set_network $id psk '\"%s\"' >/dev/null; "
         "wpa_cli enable_network $id >/dev/null; "
+        "wpa_cli enable_network all >/dev/null; "
         "wpa_cli save_config >/dev/null &",
         s_ssid, s_pw);
     if (system(cmd) == -1) mlog("[music] wifi_connect: system() failed\n");
@@ -8242,6 +8319,7 @@ static void draw_screen(uint16_t *fb) {
         time_t now = time(NULL);
         if (now - wifi_nets_refresh_at >= 2) {
             wifi_net_n = wifi_scan_results(wifi_nets, 10);
+            wifi_saved_refresh();
             wifi_nets_refresh_at = now;
         }
         if (wifi_net_n == 0) {
@@ -8253,7 +8331,11 @@ static void draw_screen(uint16_t *fb) {
                 int connecting = wifi_connecting_ssid[0] && !strcmp(wifi_nets[i].ssid, wifi_connecting_ssid);
                 draw_text_clip(fb, 24, ry + 20, wifi_nets[i].ssid,
                               connecting ? COL_ACCENT : COL_TEXT, TEXT_PX_BODY, FB_W - 90, CONTENT_Y, clip_bot);
-                draw_right_clip(fb, ry + 20, connecting ? "Connecting..." : (wifi_nets[i].open ? "open" : "secured"), CONTENT_Y, clip_bot);
+                const char *tag = connecting ? "Connecting..."
+                    : (on && nm[0] && !strcmp(nm, wifi_nets[i].ssid)) ? "connected"
+                    : wifi_is_saved(wifi_nets[i].ssid) ? "saved"
+                    : wifi_nets[i].open ? "open" : "secured";
+                draw_right_clip(fb, ry + 20, tag, CONTENT_Y, clip_bot);
                 ry += ROW_H;
                 fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
             }
@@ -9203,7 +9285,9 @@ static int sheet_rows(void) {
            sheet_open == 3 ? eq_profile_n + 1 :
            sheet_open == 4 ? PLAYLIST_MENU_N :
            sheet_open == 5 ? PLAYLIST_DELETE_N :
-           sheet_open == 6 ? REC_CONFIRM_N : SHEET_N;
+           sheet_open == 6 ? REC_CONFIRM_N :
+           sheet_open == 7 ? (sheet_wifi_secured ? 3 : 2) :
+           sheet_open == 8 ? BT_MENU_N : SHEET_N;
 }
 static int sheet_top(void) { return FB_H - sheet_rows() * SHEET_ROW - SHEET_HEAD; }
 
@@ -9226,6 +9310,8 @@ static void draw_sheet(uint16_t *fb) {
      * whichever list row happened to be there. */
     const char *cap = sheet_open == 3 ? "Choose profile"
                     : sheet_open == 6 ? "Recording in progress"
+                    : sheet_open == 7 ? sheet_wifi_ssid
+                    : sheet_open == 8 ? sheet_bt_name
                     : (sheet_open == 4 || sheet_open == 5)
                     ? (sheet_playlist >= 0 && sheet_playlist < playlist_n ? playlists[sheet_playlist].name : "")
                     : (sheet_track >= 0 && sheet_track < track_n)
@@ -9256,6 +9342,14 @@ static void draw_sheet(uint16_t *fb) {
         } else if (sheet_open == 6) {
             last = (i == REC_CONFIRM_N - 1);
             label = rec_confirm_items[i];
+            is_action = !last;
+        } else if (sheet_open == 7) {
+            last = (i == rows - 1);
+            label = WIFI_MENU_ITEM(i);
+            is_action = !last;
+        } else if (sheet_open == 8) {
+            last = (i == BT_MENU_N - 1);
+            label = bt_menu_items[i];
             is_action = !last;
         } else {
             last = (i == SHEET_N - 1);
@@ -9499,13 +9593,16 @@ static void draw_quick_settings(uint16_t *fb) {
      * own draw code below), same as everything else in this panel already
      * does while being adjusted. */
     if (qs_dragging) {
-        int top = vol_pop_top(), ph = vol_pop_h();
-        fill_round_rect(fb, VOL_POP_X, top, FB_W - 2 * VOL_POP_X, ph, VOL_POP_R,
+        /* The slider stays exactly where it sits in the panel (same
+         * icon/bar geometry), on its own rounded backing -- moving it up to
+         * the floating popup's spot jumped it out from under the finger. */
+        int ph = vol_pop_h();
+        int by = qs_bar_y(), bx = qs_bar_x(), bw = qs_bar_w();
+        int top = by + 4 - ph / 2;
+        fill_round_rect(fb, 6, top, FB_W - 12, ph, VOL_POP_R,
                         themed ? np_col_bg() : COL_HEADER);
-        int icon_x = VOL_POP_X + VOL_POP_PAD, icon_y = top + (ph - VOL_ICON_W) / 2;
-        int by = vol_bar_y(), bx = vol_bar_x(), bw = vol_bar_w();
         uint16_t accent = themed ? np_col_accent() : COL_ACCENT;
-        draw_icon(fb, FB_W, FB_H, icon_x, icon_y, &icon_sun, themed ? np_col_dim() : COL_DIM);
+        draw_icon(fb, FB_W, FB_H, qs_bar_icon_x(), by + 4 - VOL_ICON_W / 2, &icon_sun, themed ? np_col_dim() : COL_DIM);
         int filled = qs_bright_max > 0 ? bw * qs_bright / qs_bright_max : 0;
         fill_pill(fb, bx, by, bw, 8, themed ? np_col_line() : COL_LINE);
         if (filled > 0) fill_pill(fb, bx, by, filled, 8, accent);
@@ -11988,6 +12085,29 @@ int music_entry(void *a0, void *a1) {
                     playlist_n = pl_list(playlists, PL_MAX);
                 }
                 sheet_open = 0;
+            } else if (sheet_open == 8) {
+                sheet_open = 0;
+                if (i == 0) {
+                    bt_disconnect(sheet_bt_mac);
+                    snprintf(sheet_note, sizeof(sheet_note), "Disconnected %.36s", sheet_bt_name);
+                    bt_devs_refresh_at = 0;
+                } else if (i == 1) {
+                    bt_forget(sheet_bt_mac);
+                    if (!strcmp(bt_connecting_mac, sheet_bt_mac)) bt_connecting_mac[0] = '\0';
+                    snprintf(sheet_note, sizeof(sheet_note), "Forgot %.40s", sheet_bt_name);
+                    bt_devs_refresh_at = 0;
+                }
+            } else if (sheet_open == 7) {
+                int k = i + (sheet_wifi_secured ? 0 : 1);
+                sheet_open = 0;
+                if (i >= 0 && k == 0) {
+                    snprintf(kb_wifi_target_ssid, sizeof(kb_wifi_target_ssid), "%s", sheet_wifi_ssid);
+                    kb_open("New password", KB_PURPOSE_WIFI_PASSWORD, "");
+                } else if (i >= 0 && k == 1) {
+                    wifi_forget(sheet_wifi_ssid);
+                    wifi_nets_refresh_at = 0;
+                    snprintf(sheet_note, sizeof(sheet_note), "Forgot %.40s", sheet_wifi_ssid);
+                }
             } else if (sheet_open == 6) {
                 /* Cancel leaves the recording running and plays nothing --
                  * rec_confirm_kind is dropped so a later confirmation can
@@ -12570,7 +12690,11 @@ int music_entry(void *a0, void *a1) {
                      * off-screen has no on-screen y for a touch to land on. */
                     int idx = row - 5;
                     if (idx >= 0 && idx < wifi_net_n) {
-                        if (wifi_nets[idx].open) {
+                        if (wifi_is_saved(wifi_nets[idx].ssid)) {
+                            snprintf(wifi_connecting_ssid, sizeof(wifi_connecting_ssid), "%s", wifi_nets[idx].ssid);
+                            wifi_connecting_since = time(NULL);
+                            wifi_select_saved(wifi_nets[idx].ssid);
+                        } else if (wifi_nets[idx].open) {
                             snprintf(wifi_connecting_ssid, sizeof(wifi_connecting_ssid), "%s", wifi_nets[idx].ssid);
                             wifi_connecting_since = time(NULL);
                             wifi_connect(wifi_nets[idx].ssid, "");
@@ -13368,8 +13492,8 @@ int music_entry(void *a0, void *a1) {
              * (shared with the volume popup, vol_bar_x()/vol_bar_w()), not
              * the full panel's, since that's what's actually on screen once
              * qs_dragging is true. */
-            int bw = vol_bar_w();
-            int v = (live_x - vol_bar_x()) * qs_bright_max / (bw > 0 ? bw : 1);
+            int bw = qs_bar_w();
+            int v = (live_x - qs_bar_x()) * qs_bright_max / (bw > 0 ? bw : 1);
             if (v != qs_bright) {
                 qs_bright = v < 1 ? 1 : (v > qs_bright_max ? qs_bright_max : v);
                 st_brightness_set(qs_bright);
@@ -14153,6 +14277,52 @@ int music_entry(void *a0, void *a1) {
                 if (idx >= 1 && idx - 1 < playlist_n) {
                     sheet_open = 4;
                     sheet_playlist = idx - 1;
+                    dirty = 1; idle = 0;
+                }
+            }
+        }
+
+        /* Press-and-hold on a saved Wi-Fi network: change password / forget.
+         * Same row math as the tap handler. An unsaved network has nothing
+         * to change or forget, so a hold there does nothing. */
+        if (touch_down && !touch_moved && !edge_active && !hold_fired && !sheet_open &&
+            screen == SC_SETTINGS_WIFI && touch_y >= CONTENT_Y) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long held = (now.tv_sec - touch_at.tv_sec) * 1000L +
+                        (now.tv_nsec - touch_at.tv_nsec) / 1000000L;
+            if (held >= HOLD_MS) {
+                int off = scroll * ROW_H + scroll_px;
+                int idx = (touch_y + off - CONTENT_Y) / ROW_H - 5;
+                hold_fired = 1;
+                if (idx >= 0 && idx < wifi_net_n && wifi_is_saved(wifi_nets[idx].ssid)) {
+                    snprintf(sheet_wifi_ssid, sizeof(sheet_wifi_ssid), "%s", wifi_nets[idx].ssid);
+                    sheet_wifi_secured = !wifi_nets[idx].open;
+                    sheet_open = 7;
+                    dirty = 1; idle = 0;
+                }
+            }
+        }
+
+        /* Press-and-hold on a paired Bluetooth device: disconnect / forget.
+         * Row math matches the tap handler; unpaired devices have nothing to
+         * forget, so a hold there does nothing. */
+        if (touch_down && !touch_moved && !edge_active && !hold_fired && !sheet_open &&
+            screen == SC_SETTINGS_BT && touch_y >= CONTENT_Y) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long held = (now.tv_sec - touch_at.tv_sec) * 1000L +
+                        (now.tv_nsec - touch_at.tv_nsec) / 1000000L;
+            if (held >= HOLD_MS) {
+                int off = scroll * ROW_H + scroll_px;
+                int row = (touch_y + off - CONTENT_Y) / ROW_H;
+                int idx = -1;
+                hold_fired = 1;
+                if (row >= 3 && bt_row_kind(row - 3, &idx) == BT_ROW_DEVICE && bt_devs[idx].paired) {
+                    snprintf(sheet_bt_mac, sizeof(sheet_bt_mac), "%s", bt_devs[idx].mac);
+                    snprintf(sheet_bt_name, sizeof(sheet_bt_name), "%s",
+                             bt_devs[idx].name[0] ? bt_devs[idx].name : bt_devs[idx].mac);
+                    sheet_open = 8;
                     dirty = 1; idle = 0;
                 }
             }
