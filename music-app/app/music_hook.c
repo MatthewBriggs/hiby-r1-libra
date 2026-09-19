@@ -2265,7 +2265,7 @@ typedef enum { SC_MENU = 0, SC_MUSIC_MENU, SC_ARTISTS, SC_ALBUMS, SC_TRACKS, SC_
                SC_SETTINGS_TIMEZONE, SC_SETTINGS_THEMEMODE, SC_QUEUE,
                SC_ARTIST_PAGE,
                SC_SETTINGS_WIFI, SC_SETTINGS_BT, SC_SETTINGS_USB, SC_KEYBOARD,
-               SC_RADIO_RECORDINGS } screen_t;
+               SC_RADIO_RECORDINGS, SC_STATS, SC_STATS_BATTERY, SC_STATS_STORAGE, SC_STATS_LISTEN } screen_t;
 
 /* L2: the top-level menu ("Main Menu", EXIT on the right) stays small on
  * purpose rather than listing every library-browsing facet alongside
@@ -2278,6 +2278,7 @@ static const struct { const char *label; } top_menu[] = {
     { "Parametric EQ" },
     { "MSEB" },
     { "Radio" },
+    { "Stats" },
     { "Settings" },
 };
 #define TOP_MUSIC      0
@@ -2286,7 +2287,8 @@ static const struct { const char *label; } top_menu[] = {
 #define TOP_EQ         3
 #define TOP_MSEB       4
 #define TOP_RADIO      5
-#define TOP_SETTINGS   6
+#define TOP_STATS      6
+#define TOP_SETTINGS   7
 #define TOP_N ((int)(sizeof(top_menu) / sizeof(top_menu[0])))
 
 /* Reached via "Music" from the main menu (SC_MUSIC_MENU). Each entry is a
@@ -2846,7 +2848,7 @@ static int settings_content_rows(void) {
  * pushed by hand, not by CI against a tagged commit), so this stays a
  * literal that a human edits; the discipline is remembering to, not the
  * mechanism. */
-#define LIBRARY_VERSION "0.55.1"
+#define LIBRARY_VERSION "0.56"
 
 /* A custom-built kernel keeps uname()'s own release string exactly
  * "4.4.94+" on purpose -- that string is also the vermagic every one of the
@@ -5922,6 +5924,473 @@ static int mini_visible(void) {
  * this chrome can appear over). */
 static int np_chrome_themed(void) { return cover_palette_enabled && !audiobook_mode; }
 
+/* The dropdown and the volume/brightness popups follow the page under them:
+ * the browsed album's palette (np_view_*) on an album page, the playing
+ * track's on Now Playing, and plain on every other screen -- those are the
+ * only two pages painted from cover art. */
+static int qc_on_album_page(void) { return screen == SC_TRACKS && !ab_list && !pod_list; }
+static int qc_popup_themed(void) {
+    return qc_on_album_page() ? (cover_palette_enabled && np_view_palette_valid)
+                              : (np_chrome_themed() && screen == SC_PLAYING);
+}
+static int qc_panel_themed(void) {
+    return qc_on_album_page() ? (cover_palette_enabled && np_view_palette_valid)
+                              : (np_chrome_themed() && screen == SC_PLAYING);
+}
+static uint16_t qc_bg(void)     { return qc_on_album_page() ? np_view_col_bg()     : np_col_bg(); }
+static uint16_t qc_accent(void) { return qc_on_album_page() ? np_view_col_accent() : np_col_accent(); }
+static uint16_t qc_fg(void)     { return qc_on_album_page() ? np_view_col_fg()     : np_col_fg(); }
+static uint16_t qc_dim(void)    { return qc_on_album_page() ? np_view_col_dim()    : np_col_dim(); }
+static uint16_t qc_line(void)   { return qc_on_album_page() ? np_view_col_line()   : np_col_line(); }
+
+static uint16_t mix565(uint16_t a, uint16_t b, int t);
+/* ---- listening time -------------------------------------------------------
+ * Seconds of actual playback (not paused) per category and per local day,
+ * kept as an append-only journal of "YYYYMMDD category seconds" lines in
+ * /usr/data, flushed about once a minute of listening. */
+#define LISTEN_PATH "/usr/data/listen_stats.txt"
+#define LISTEN_DAYS_MAX 1200
+#define LISTEN_FLUSH_S 60
+enum { LC_MUSIC, LC_AUDIOBOOKS, LC_PODCASTS, LC_RADIO, LC_N };
+typedef struct { uint32_t ymd; uint32_t sec[LC_N]; } listen_day_t;
+static listen_day_t listen_days[LISTEN_DAYS_MAX];
+static int listen_n;
+static int listen_loaded;
+static uint32_t listen_first_ymd;
+static uint32_t listen_unflushed[LC_N];
+static uint32_t listen_frac_ms[LC_N];
+static uint32_t listen_cur_ymd;
+static time_t listen_last_flush;
+static struct timespec listen_last_tick;
+static int listen_have_tick;
+
+static uint32_t listen_ymd_of(time_t t) {
+    struct tm tmv;
+    localtime_r(&t, &tmv);
+    return (uint32_t)((tmv.tm_year + 1900) * 10000 + (tmv.tm_mon + 1) * 100 + tmv.tm_mday);
+}
+
+static listen_day_t *listen_day(uint32_t ymd) {
+    if (listen_n && listen_days[listen_n - 1].ymd == ymd) return &listen_days[listen_n - 1];
+    for (int i = listen_n - 2; i >= 0 && i >= listen_n - 8; i--)
+        if (listen_days[i].ymd == ymd) return &listen_days[i];
+    if (listen_n == LISTEN_DAYS_MAX) {
+        /* Fold the oldest day into the next so all-time keeps counting. */
+        for (int c = 0; c < LC_N; c++) listen_days[1].sec[c] += listen_days[0].sec[c];
+        memmove(listen_days, listen_days + 1, (LISTEN_DAYS_MAX - 1) * sizeof(listen_days[0]));
+        listen_n--;
+    }
+    listen_day_t *d = &listen_days[listen_n++];
+    memset(d, 0, sizeof(*d));
+    d->ymd = ymd;
+    return d;
+}
+
+static void listen_load(void) {
+    listen_loaded = 1;
+    FILE *f = fopen(LISTEN_PATH, "r");
+    if (!f) return;
+    unsigned ymd, secs; int c, lines = 0;
+    while (fscanf(f, "%u %d %u", &ymd, &c, &secs) == 3) {
+        lines++;
+        if (c < 0 || c >= LC_N) continue;
+        listen_day(ymd)->sec[c] += secs;
+        if (!listen_first_ymd || ymd < listen_first_ymd) listen_first_ymd = ymd;
+    }
+    fclose(f);
+    if (lines > 4000) {
+        f = fopen(LISTEN_PATH, "w");
+        if (!f) return;
+        for (int i = 0; i < listen_n; i++)
+            for (int k = 0; k < LC_N; k++)
+                if (listen_days[i].sec[k])
+                    fprintf(f, "%u %d %u\n", listen_days[i].ymd, k, listen_days[i].sec[k]);
+        fclose(f);
+    }
+}
+
+static void listen_flush(void) {
+    FILE *f = NULL;
+    for (int c = 0; c < LC_N; c++) {
+        if (!listen_unflushed[c]) continue;
+        if (!f) f = fopen(LISTEN_PATH, "a");
+        if (!f) return;
+        fprintf(f, "%u %d %u\n", listen_cur_ymd, c, listen_unflushed[c]);
+        listen_unflushed[c] = 0;
+    }
+    if (f) fclose(f);
+    listen_last_flush = time(NULL);
+}
+
+static void listen_tick(void) {
+    if (!listen_loaded) listen_load();
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long dt = 0;
+    if (listen_have_tick)
+        dt = (now.tv_sec - listen_last_tick.tv_sec) * 1000L + (now.tv_nsec - listen_last_tick.tv_nsec) / 1000000L;
+    listen_last_tick = now;
+    listen_have_tick = 1;
+    if (dt <= 0) return;
+    if (dt > 1500) dt = 1500;           /* a stalled loop is not listening */
+    if (!audio_is_active() || audio_is_paused()) return;
+    time_t wall = time(NULL);
+    if (wall < 1700000000) return;
+    uint32_t ymd = listen_ymd_of(wall);
+    if (ymd != listen_cur_ymd) {
+        if (listen_cur_ymd) listen_flush();
+        listen_cur_ymd = ymd;
+    }
+    int c = (radio_mode || recording_playback_mode) ? LC_RADIO
+          : audiobook_mode ? LC_AUDIOBOOKS
+          : podcast_mode ? LC_PODCASTS : LC_MUSIC;
+    listen_frac_ms[c] += (uint32_t)dt;
+    while (listen_frac_ms[c] >= 1000) {
+        listen_frac_ms[c] -= 1000;
+        listen_day(ymd)->sec[c]++;
+        listen_unflushed[c]++;
+        if (!listen_first_ymd || ymd < listen_first_ymd) listen_first_ymd = ymd;
+    }
+    if (wall - listen_last_flush >= LISTEN_FLUSH_S) listen_flush();
+}
+
+static long long listen_all_secs(int c) {
+    if (!listen_loaded) listen_load();
+    long long t = 0;
+    for (int i = 0; i < listen_n; i++) t += listen_days[i].sec[c];
+    return t;
+}
+
+/* The last seven local days, today included. */
+static long long listen_week_secs(int c) {
+    if (!listen_loaded) listen_load();
+    time_t now = time(NULL);
+    if (now < 1700000000) return 0;
+    uint32_t cutoff = listen_ymd_of(now - 6 * 86400);
+    long long t = 0;
+    for (int i = 0; i < listen_n; i++)
+        if (listen_days[i].ymd >= cutoff) t += listen_days[i].sec[c];
+    return t;
+}
+
+static void listen_fmt(char *out, size_t n, long long s) {
+    long long h = s / 3600, m = (s % 3600) / 60;
+    if (h > 0)      snprintf(out, n, "%lldh %02lldm", h, m);
+    else if (m > 0) snprintf(out, n, "%lldm", m);
+    else            snprintf(out, n, "0m");
+}
+
+static void draw_listen_stats(uint16_t *fb) {
+    static const char *const names[LC_N + 1] = { "Music", "Audiobooks", "Podcasts", "Radio", "Total" };
+    int colw = 150;
+    int x_all = FB_W - 24, x_wk = x_all - colw;
+    int y = CONTENT_Y;
+    const char *h1 = "Last 7 days", *h2 = "All time";
+    draw_text(fb, x_wk - text_width(h1, TEXT_PX_SMALL), y + 24, h1, COL_DIM, TEXT_PX_SMALL, FB_W);
+    draw_text(fb, x_all - text_width(h2, TEXT_PX_SMALL), y + 24, h2, COL_DIM, TEXT_PX_SMALL, FB_W);
+    y += 60;
+    fill_rect(fb, 0, y - 1, FB_W, 1, COL_LINE);
+    long long wk_tot = 0, all_tot = 0;
+    for (int i = 0; i <= LC_N; i++) {
+        long long wk, al;
+        if (i < LC_N) { wk = listen_week_secs(i); al = listen_all_secs(i); wk_tot += wk; all_tot += al; }
+        else          { wk = wk_tot; al = all_tot; }
+        int total_row = i == LC_N;
+        uint16_t lc = total_row ? COL_ACCENT : COL_TEXT;
+        draw_text(fb, 24, y + 20, names[i], lc, TEXT_PX_BODY, x_wk - 130);
+        char v[24];
+        listen_fmt(v, sizeof(v), wk);
+        draw_text(fb, x_wk - text_width(v, TEXT_PX_BODY), y + 20, v, lc, TEXT_PX_BODY, FB_W);
+        listen_fmt(v, sizeof(v), al);
+        draw_text(fb, x_all - text_width(v, TEXT_PX_BODY), y + 20, v, lc, TEXT_PX_BODY, FB_W);
+        y += ROW_H;
+        fill_rect(fb, 0, y - 1, FB_W, 1, COL_LINE);
+    }
+    if (listen_first_ymd) {
+        char t[48];
+        snprintf(t, sizeof(t), "Counting since %u-%02u-%02u", listen_first_ymd / 10000,
+                 (listen_first_ymd / 100) % 100, listen_first_ymd % 100);
+        draw_text(fb, 24, y + 14, t, COL_DIM, TEXT_PX_SMALL, FB_W - 48);
+    }
+}
+
+/* ---- storage breakdown ----------------------------------------------------
+ * Sizes are summed on a background thread (a few seconds of directory
+ * walking on a big card) and cached for two minutes. Music is every
+ * top-level folder that is not one of the app's own; Other is whatever is
+ * left of the used space. */
+#define STOR_ROOT "/data/mnt/sd_0"
+#define STOR_AUDIOBOOKS STOR_ROOT "/Audiobooks"
+#define STOR_PODCASTS   STOR_ROOT "/Podcasts"
+#define STOR_RECORDINGS STOR_ROOT "/.radio_recordings"
+static volatile int stor_state;          /* 0 none, 1 running, 2 done */
+static long long stor_music, stor_audio, stor_pod, stor_rec;
+static time_t stor_at;
+
+static long long stor_dir_bytes(const char *path, int depth) {
+    DIR *d = opendir(path);
+    if (!d) return 0;
+    long long sum = 0;
+    struct dirent *e;
+    char p[PATH_MAX];
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        snprintf(p, sizeof(p), "%s/%s", path, e->d_name);
+        struct stat st;
+        if (lstat(p, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) { if (depth < 16) sum += stor_dir_bytes(p, depth + 1); }
+        else if (S_ISREG(st.st_mode)) sum += (long long)st.st_size;
+    }
+    closedir(d);
+    return sum;
+}
+
+static void *stor_worker(void *arg) {
+    (void)arg;
+    art_worker_yield_priority("storage");
+    long long music = 0;
+    DIR *d = opendir(STOR_ROOT);
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d))) {
+            const char *n = e->d_name;
+            if (n[0] == '.' || !strcmp(n, "Audiobooks") || !strcmp(n, "Podcasts") ||
+                !strcmp(n, "Playlists") || !strcmp(n, "EQProfiles") ||
+                !strcmp(n, "System Volume Information") || !strcmp(n, "lost+found") ||
+                n[0] == '$') continue;
+            char p[PATH_MAX];
+            snprintf(p, sizeof(p), "%s/%s", STOR_ROOT, n);
+            struct stat st;
+            if (lstat(p, &st) == 0 && S_ISDIR(st.st_mode)) music += stor_dir_bytes(p, 0);
+        }
+        closedir(d);
+    }
+    stor_audio = stor_dir_bytes(STOR_AUDIOBOOKS, 0);
+    stor_pod   = stor_dir_bytes(STOR_PODCASTS, 0);
+    stor_rec   = stor_dir_bytes(STOR_RECORDINGS, 0);
+    stor_music = music;
+    stor_at = time(NULL);
+    __sync_synchronize();
+    stor_state = 2;
+    return NULL;
+}
+
+static void stor_request(void) {
+    if (stor_state == 1) return;
+    if (stor_state == 2 && time(NULL) - stor_at < 120) return;
+    stor_state = 1;
+    pthread_t th;
+    if (pthread_create(&th, NULL, stor_worker, NULL) == 0) pthread_detach(th);
+    else stor_state = stor_at ? 2 : 0;
+}
+
+static void stor_fmt(char *out, size_t n, long long b) {
+    if (b >= 100000000LL)   snprintf(out, n, "%.1f GB", (double)b / 1e9);
+    else if (b >= 1000000LL) snprintf(out, n, "%lld MB", b / 1000000LL);
+    else                     snprintf(out, n, "0 GB");
+}
+
+static void draw_storage_stats(uint16_t *fb) {
+    if (stor_state == 0) stor_request();
+    struct statfs sfs;
+    long long total = 0, freeb = 0;
+    if (statfs(STOR_ROOT, &sfs) == 0) {
+        total = (long long)sfs.f_blocks * (long long)sfs.f_bsize;
+        freeb = (long long)sfs.f_bavail * (long long)sfs.f_bsize;
+    }
+    int done = stor_state == 2;
+    long long used = total - freeb;
+    long long known = stor_music + stor_audio + stor_pod + stor_rec;
+    long long val[6] = { stor_music, stor_audio, stor_pod, stor_rec, used > known ? used - known : 0, freeb };
+    static const char *const names[6] = { "Music", "Audiobooks", "Podcasts", "Radio Recordings", "Other", "Free" };
+
+    int y = CONTENT_Y;
+    for (int i = 0; i < 6; i++) {
+        draw_text(fb, 24, y + 20, names[i], COL_TEXT, TEXT_PX_BODY, FB_W - 200);
+        char v[24];
+        if (i == 5 || done) stor_fmt(v, sizeof(v), val[i]);
+        else snprintf(v, sizeof(v), "...");
+        draw_right(fb, y + 26, v);
+        y += ROW_H;
+        fill_rect(fb, 0, y - 1, FB_W, 1, COL_LINE);
+    }
+    if (total > 0) {
+        char t[40], tt[24];
+        stor_fmt(tt, sizeof(tt), total);
+        snprintf(t, sizeof(t), "Card %s", tt);
+        draw_text(fb, 24, y + 14, t, COL_DIM, TEXT_PX_SMALL, FB_W - 48);
+    }
+}
+
+/* ---- battery history ------------------------------------------------------
+ * A level/charging sample whenever either changes, plus a heartbeat so a long
+ * flat stretch still has anchor points. Kept in /usr/data across restarts so
+ * the Stats graph can reach back to the last full charge. */
+#define BATT_LOG_PATH "/usr/data/battery_log.txt"
+#define BATT_MAX 4096
+#define BATT_HEARTBEAT_S 900
+#define BATT_POLL_S 10
+typedef struct { uint32_t t; uint8_t pct, chg; } batt_sample_t;
+static batt_sample_t batt_log[BATT_MAX];
+static int batt_n;
+static int batt_loaded;
+static time_t batt_last_poll;
+
+static void batt_push(uint32_t t, int pct, int chg) {
+    if (batt_n == BATT_MAX) {
+        memmove(batt_log, batt_log + 1, (BATT_MAX - 1) * sizeof(batt_log[0]));
+        batt_n--;
+    }
+    batt_log[batt_n].t = t;
+    batt_log[batt_n].pct = (uint8_t)pct;
+    batt_log[batt_n].chg = (uint8_t)chg;
+    batt_n++;
+}
+
+static void batt_log_load(void) {
+    batt_loaded = 1;
+    FILE *f = fopen(BATT_LOG_PATH, "r");
+    if (!f) return;
+    unsigned t; int pct, chg, lines = 0;
+    while (fscanf(f, "%u %d %d", &t, &pct, &chg) == 3) {
+        lines++;
+        if (pct < 0 || pct > 100) continue;
+        if (batt_n && t <= batt_log[batt_n - 1].t) continue;
+        batt_push(t, pct, chg != 0);
+    }
+    fclose(f);
+    if (lines > BATT_MAX + BATT_MAX / 2) {
+        f = fopen(BATT_LOG_PATH, "w");
+        if (!f) return;
+        for (int i = 0; i < batt_n; i++)
+            fprintf(f, "%u %d %d\n", batt_log[i].t, batt_log[i].pct, batt_log[i].chg);
+        fclose(f);
+    }
+}
+
+static void batt_log_tick(void) {
+    if (!batt_loaded) batt_log_load();
+    time_t now = time(NULL);
+    if (now - batt_last_poll < BATT_POLL_S) return;
+    batt_last_poll = now;
+    if (now < 1700000000) return;            /* clock not set yet */
+    int pct = st_battery_pct();
+    if (pct < 0) return;
+    if (pct > 100) pct = 100;
+    int chg = st_charging() ? 1 : 0;
+    if (batt_n) {
+        batt_sample_t *l = &batt_log[batt_n - 1];
+        if ((uint32_t)now <= l->t) return;
+        if (l->pct == pct && l->chg == chg && (uint32_t)now - l->t < BATT_HEARTBEAT_S) return;
+    }
+    batt_push((uint32_t)now, pct, chg);
+    FILE *f = fopen(BATT_LOG_PATH, "a");
+    if (f) { fprintf(f, "%u %d %d\n", (unsigned)now, pct, chg); fclose(f); }
+}
+
+static void batt_fmt_dur(char *out, size_t n, long s) {
+    if (s < 0) s = 0;
+    long d = s / 86400, h = (s % 86400) / 3600, m = (s % 3600) / 60;
+    if (d > 0)      snprintf(out, n, "%ldd %ldh", d, h);
+    else if (h > 0) snprintf(out, n, "%ldh %02ldm", h, m);
+    else            snprintf(out, n, "%ldm", m);
+}
+
+/* Battery level against time, from the last full charge to now. */
+static void draw_battery_stats(uint16_t *fb) {
+    int bot = FB_H - (mini_visible() ? MINI_H : 0);
+    int pct = st_battery_pct(), chg = st_charging();
+    time_t now = time(NULL);
+
+    /* The series drawn: from the last full charge (the final 100% sample that
+     * precedes the latest run below 100%; while sitting at 100% on the
+     * charger, the cycle that just finished), plus the live reading. */
+    int start = 0;
+    int last_low = batt_n - 1;
+    while (last_low >= 0 && batt_log[last_low].pct >= 100) last_low--;
+    int have_full = 0;
+    for (int i = last_low; i >= 0; i--)
+        if (batt_log[i].pct >= 100) { start = i; have_full = 1; break; }
+    static batt_sample_t ser[BATT_MAX + 1];
+    int sn = 0;
+    for (int i = start; i < batt_n; i++) ser[sn++] = batt_log[i];
+    if (pct >= 0 && now >= 1700000000 && (sn == 0 || (uint32_t)now > ser[sn - 1].t)) {
+        ser[sn].t = (uint32_t)now; ser[sn].pct = (uint8_t)(pct > 100 ? 100 : pct); ser[sn].chg = (uint8_t)chg;
+        sn++;
+    }
+
+    /* Summary: level and state on one line, history at the right */
+    char big[16] = "--";
+    if (pct >= 0) snprintf(big, sizeof(big), "%d%%", pct);
+    draw_text(fb, 24, CONTENT_Y + 6, big, COL_ACCENT, TEXT_PX_TITLE, FB_W / 2);
+    int bw = text_width(big, TEXT_PX_TITLE);
+    draw_text(fb, 24 + bw + 16, CONTENT_Y + 6 + (TEXT_PX_TITLE - TEXT_PX_BODY) / 2,
+              chg ? "Charging" : (pct >= 100 ? "Full" : "On battery"),
+              COL_DIM, TEXT_PX_BODY, FB_W - 24);
+    if (sn >= 2 && (long)ser[sn - 1].t - (long)ser[0].t >= 600) {
+        char d[24], line[48];
+        batt_fmt_dur(d, sizeof(d), (long)ser[sn - 1].t - (long)ser[0].t);
+        snprintf(line, sizeof(line), have_full ? "%s since full" : "%s history", d);
+        int lw = text_width(line, TEXT_PX_SMALL);
+        draw_text(fb, FB_W - 24 - lw, CONTENT_Y + 6 + (TEXT_PX_TITLE - TEXT_PX_SMALL) / 2, line,
+                  COL_DIM, TEXT_PX_SMALL, FB_W);
+    }
+
+    /* Plot area */
+    int px0 = 64, px1 = FB_W - 20;
+    int py0 = CONTENT_Y + 64, py1 = bot - 40;
+    int pw = px1 - px0, ph = py1 - py0;
+    for (int g = 0; g <= 4; g++) {
+        int gy = py1 - ph * g / 4;
+        fill_rect(fb, px0, gy, pw, 1, COL_LINE);
+        char lb[8];
+        snprintf(lb, sizeof(lb), "%d", g * 25);
+        int lw = text_width(lb, TEXT_PX_SMALL);
+        draw_text(fb, px0 - 10 - lw, gy - TEXT_PX_SMALL / 2 - 2, lb, COL_DIM, TEXT_PX_SMALL, px0);
+    }
+
+    if (sn < 2 || (long)ser[sn - 1].t - (long)ser[0].t < 600) {
+        const char *msg = "Collecting battery history...";
+        draw_text(fb, (FB_W - text_width(msg, TEXT_PX_SMALL)) / 2, py0 + ph / 2 - TEXT_PX_SMALL / 2,
+                  msg, COL_DIM, TEXT_PX_SMALL, FB_W);
+        return;
+    }
+    long t0 = ser[0].t, span = (long)ser[sn - 1].t - t0;
+
+    int j = 0, prev_y = -1;
+    int last_x = px0, last_y = py1;
+    for (int x = 0; x <= pw; x++) {
+        long t = t0 + span * x / (pw > 0 ? pw : 1);
+        while (j < sn - 2 && (long)ser[j + 1].t < t) j++;
+        long ta = ser[j].t, tb = ser[j + 1].t;
+        int la = ser[j].pct, lb2 = ser[j + 1].pct;
+        int lvl100 = tb > ta ? (int)((la * 100L) + (long)(lb2 - la) * 100L * (t - ta) / (tb - ta)) : la * 100;
+        if (lvl100 < 0) lvl100 = 0;
+        if (lvl100 > 10000) lvl100 = 10000;
+        int yv = py1 - (int)((long)ph * lvl100 / 10000);
+        int charging = ser[j].chg;
+        int cx = px0 + x;
+        int fh = py1 - yv;
+        if (fh > 0) fill_rect(fb, cx, yv, 1, fh, mix565(COL_BG, COL_ACCENT, charging ? 110 : 55));
+        if (prev_y >= 0) draw_line(fb, cx - 1, prev_y, cx, yv, COL_ACCENT);
+        prev_y = yv; last_x = cx; last_y = yv;
+    }
+    fill_circle(fb, last_x, last_y, 7, COL_ACCENT);
+    fill_rect(fb, px0, py1, pw, 1, COL_DIM);
+
+    /* Time axis: start, middle, now */
+    for (int k = 0; k < 3; k++) {
+        time_t tt = (time_t)(t0 + span * k / 2);
+        struct tm tmv;
+        localtime_r(&tt, &tmv);
+        char lb[24];
+        strftime(lb, sizeof(lb), span > 20 * 3600 ? "%a %H:%M" : "%H:%M", &tmv);
+        int lw = text_width(lb, TEXT_PX_SMALL);
+        int lx = px0 + pw * k / 2 - (k == 0 ? 0 : k == 1 ? lw / 2 : lw);
+        draw_text(fb, lx, py1 + 14, lb, COL_DIM, TEXT_PX_SMALL, FB_W);
+    }
+}
+
 static void draw_mini(uint16_t *fb) {
     int by = FB_H - MINI_H;
     int themed = np_chrome_themed();
@@ -6470,6 +6939,10 @@ static void draw_screen(uint16_t *fb) {
     else if (screen == SC_SETTINGS_USB)  { title = "USB working mode"; show_back = 1; }
     else if (screen == SC_QUEUE) { title = "Queue"; show_back = 1; }
     else if (screen == SC_MUSIC_MENU)     { title = "Music"; show_back = 1; }
+    else if (screen == SC_STATS)          { title = "Stats"; show_back = 1; }
+    else if (screen == SC_STATS_BATTERY)  { title = "Battery"; show_back = 1; }
+    else if (screen == SC_STATS_STORAGE)  { title = "Storage"; show_back = 1; }
+    else if (screen == SC_STATS_LISTEN)   { title = "Listening time"; show_back = 1; }
 
     /* The player has no title bar. Drawn unconditionally, it sat behind the
      * artwork with the ends of "Music" and "EXIT" poking out either side of
@@ -6568,6 +7041,55 @@ static void draw_screen(uint16_t *fb) {
             draw_text(fb, 24, ty, msg, COL_BG, TEXT_PX_BODY, usb_done_x() - 40);
             draw_text(fb, usb_done_x(), ty, "Done", COL_BG, TEXT_PX_BODY, FB_W - 24);
         }
+        return;
+    }
+
+    if (screen == SC_STATS) {
+        draw_text(fb, 24, y + 20, "Battery", COL_TEXT, TEXT_PX_BODY, FB_W - 140);
+        char bp[16] = "";
+        int p = st_battery_pct();
+        if (p >= 0) snprintf(bp, sizeof(bp), "%d%%", p);
+        draw_right(fb, y + 26, bp);
+        fill_rect(fb, 0, y + ROW_H - 1, FB_W, 1, COL_LINE);
+        y += ROW_H;
+        draw_text(fb, 24, y + 20, "Storage", COL_TEXT, TEXT_PX_BODY, FB_W - 200);
+        struct statfs sfs;
+        if (statfs(STOR_ROOT, &sfs) == 0) {
+            char fr[24];
+            stor_fmt(fr, sizeof(fr), (long long)sfs.f_bavail * (long long)sfs.f_bsize);
+            char fr2[40];
+            snprintf(fr2, sizeof(fr2), "%s free", fr);
+            draw_right(fb, y + 26, fr2);
+        }
+        fill_rect(fb, 0, y + ROW_H - 1, FB_W, 1, COL_LINE);
+        y += ROW_H;
+        draw_text(fb, 24, y + 20, "Listening time", COL_TEXT, TEXT_PX_BODY, FB_W - 200);
+        char wk[40], wd[24];
+        long long wsum = 0;
+        for (int c = 0; c < 4; c++) wsum += listen_week_secs(c);
+        listen_fmt(wd, sizeof(wd), wsum);
+        snprintf(wk, sizeof(wk), "%s this week", wd);
+        draw_right(fb, y + 26, wk);
+        fill_rect(fb, 0, y + ROW_H - 1, FB_W, 1, COL_LINE);
+        if (mini_visible()) draw_mini(fb);
+        return;
+    }
+
+    if (screen == SC_STATS_LISTEN) {
+        draw_listen_stats(fb);
+        if (mini_visible()) draw_mini(fb);
+        return;
+    }
+
+    if (screen == SC_STATS_STORAGE) {
+        draw_storage_stats(fb);
+        if (mini_visible()) draw_mini(fb);
+        return;
+    }
+
+    if (screen == SC_STATS_BATTERY) {
+        draw_battery_stats(fb);
+        if (mini_visible()) draw_mini(fb);
         return;
     }
 
@@ -8976,7 +9498,13 @@ static int go_back(void) {
         case SC_MSEB:
         case SC_SETTINGS:
         case SC_MUSIC_MENU:
+        case SC_STATS:
             screen = SC_MENU; reset_scroll();
+            break;
+        case SC_STATS_BATTERY:
+        case SC_STATS_STORAGE:
+        case SC_STATS_LISTEN:
+            screen = SC_STATS; reset_scroll();
             break;
         case SC_PLAYLISTS:
         case SC_ARTISTS:
@@ -9581,7 +10109,7 @@ static void draw_quick_settings(uint16_t *fb) {
      * which read as a leftover/stuck theme rather than anything to do with
      * the screen underneath it -- unlike the mini-player, this panel has no
      * cover art of its own on screen to justify it. */
-    int themed = np_chrome_themed() && screen == SC_PLAYING;
+    int themed = qc_panel_themed();
 
     /* R-poptheme: while the brightness bar is actually being dragged, the
      * rest of the panel disappears and only a small rounded popup is shown
@@ -9600,20 +10128,20 @@ static void draw_quick_settings(uint16_t *fb) {
         int by = qs_bar_y(), bx = qs_bar_x(), bw = qs_bar_w();
         int top = by + 4 - ph / 2;
         fill_round_rect(fb, 6, top, FB_W - 12, ph, VOL_POP_R,
-                        themed ? np_col_bg() : COL_HEADER);
-        uint16_t accent = themed ? np_col_accent() : COL_ACCENT;
-        draw_icon(fb, FB_W, FB_H, qs_bar_icon_x(), by + 4 - VOL_ICON_W / 2, &icon_sun, themed ? np_col_dim() : COL_DIM);
+                        themed ? qc_bg() : COL_HEADER);
+        uint16_t accent = themed ? qc_accent() : COL_ACCENT;
+        draw_icon(fb, FB_W, FB_H, qs_bar_icon_x(), by + 4 - VOL_ICON_W / 2, &icon_sun, themed ? qc_dim() : COL_DIM);
         int filled = qs_bright_max > 0 ? bw * qs_bright / qs_bright_max : 0;
-        fill_pill(fb, bx, by, bw, 8, themed ? np_col_line() : COL_LINE);
+        fill_pill(fb, bx, by, bw, 8, themed ? qc_line() : COL_LINE);
         if (filled > 0) fill_pill(fb, bx, by, filled, 8, accent);
         fill_circle(fb, bx + filled, by + 4, 13, accent);
         return;
     }
 
-    fill_rect(fb, 0, 0, FB_W, QS_H, themed ? np_col_bg() : COL_HEADER);
-    fill_rect(fb, 0, QS_H - 1, FB_W, 1, themed ? np_col_line() : COL_LINE);
+    fill_rect(fb, 0, 0, FB_W, QS_H, themed ? qc_bg() : COL_HEADER);
+    fill_rect(fb, 0, QS_H - 1, FB_W, 1, themed ? qc_line() : COL_LINE);
 
-    uint16_t dim = themed ? np_col_dim() : COL_DIM;
+    uint16_t dim = themed ? qc_dim() : COL_DIM;
 
     /* R-qsicon: no more "Brightness" label or cog -- explicit request, same
      * icon-left-of-bar, no-text shape the volume popup and the
@@ -9623,9 +10151,9 @@ static void draw_quick_settings(uint16_t *fb) {
     int by = qs_bar_y();
     draw_icon(fb, FB_W, FB_H, qs_bar_icon_x(), by + 4 - VOL_ICON_W / 2, &icon_sun, dim);
     int bx = qs_bar_x(), bw = qs_bar_w();
-    fill_pill(fb, bx, by, bw, 8, themed ? np_col_line() : COL_LINE);
+    fill_pill(fb, bx, by, bw, 8, themed ? qc_line() : COL_LINE);
     int filled = qs_bright_max > 0 ? bw * qs_bright / qs_bright_max : 0;
-    uint16_t bright_accent = themed ? np_col_accent() : COL_ACCENT;
+    uint16_t bright_accent = themed ? qc_accent() : COL_ACCENT;
     if (filled > 0) fill_pill(fb, bx, by, filled, 8, bright_accent);
     fill_circle(fb, bx + filled, by + 4, 13, bright_accent);
 
@@ -9644,9 +10172,9 @@ static void draw_quick_settings(uint16_t *fb) {
                        : vv < 67 ? &icon_vol_mid : &icon_vol_high;
     draw_icon(fb, FB_W, FB_H, qs_bar_icon_x(), vy + 4 - VOL_ICON_W / 2, vic, dim);
     int vbx = qs_bar_x(), vbw = qs_bar_w();
-    fill_pill(fb, vbx, vy, vbw, 8, themed ? np_col_line() : COL_LINE);
+    fill_pill(fb, vbx, vy, vbw, 8, themed ? qc_line() : COL_LINE);
     int vfilled = vbw * vv / 100;
-    uint16_t vol_accent = usb_bypass_active ? dim : (themed ? np_col_accent() : COL_ACCENT);
+    uint16_t vol_accent = usb_bypass_active ? dim : (themed ? qc_accent() : COL_ACCENT);
     if (vfilled > 0) fill_pill(fb, vbx, vy, vfilled, 8, vol_accent);
     fill_circle(fb, vbx + vfilled, vy + 4, 13, vol_accent);
 
@@ -9660,8 +10188,8 @@ static void draw_quick_settings(uint16_t *fb) {
      * qs_col_x(0)/qs_col_x(1) and qs_col_w() (see their own comment) are
      * shared with the touch handler's own column split. */
     char nm[64];
-    uint16_t fg = themed ? np_col_fg() : COL_TEXT;
-    uint16_t accent = themed ? np_col_accent() : COL_ACCENT;
+    uint16_t fg = themed ? qc_fg() : COL_TEXT;
+    uint16_t accent = themed ? qc_accent() : COL_ACCENT;
     int c0 = qs_col_x(0), c1 = qs_col_x(1), cw = qs_col_w();
     int label_dx = QS_LABEL_X - 24;   /* icon-column-to-label offset every row here shares */
 
@@ -9855,14 +10383,14 @@ static void draw_quick_settings(uint16_t *fb) {
     }
 
     /* A grab handle, so it is obvious the panel goes back up. */
-    fill_rect(fb, FB_W / 2 - 26, QS_H - 14, 52, 4, themed ? np_col_line() : COL_LINE);
+    fill_rect(fb, FB_W / 2 - 26, QS_H - 14, 52, 4, themed ? qc_line() : COL_LINE);
 }
 
 static void draw_volume(uint16_t *fb) {
-    int themed = np_chrome_themed();
+    int themed = qc_popup_themed();
     int top = vol_pop_top(), ph = vol_pop_h();
     fill_round_rect(fb, VOL_POP_X, top, FB_W - 2 * VOL_POP_X, ph, VOL_POP_R,
-                    themed ? np_col_bg() : COL_HEADER);
+                    themed ? qc_bg() : COL_HEADER);
 
     int v = vol_dragging && vol_drag_pct >= 0 ? vol_drag_pct : audio_volume();
     int icon_x = VOL_POP_X + VOL_POP_PAD, icon_y = top + (ph - VOL_ICON_W) / 2;
@@ -9877,11 +10405,11 @@ static void draw_volume(uint16_t *fb) {
      * is now the only signal, same as every other disabled control in this
      * app already reads as (COL_DIM). */
     if (usb_bypass_active) {
-        uint16_t dim = themed ? np_col_dim() : COL_DIM;
+        uint16_t dim = themed ? qc_dim() : COL_DIM;
         const icon_t *vic = v <= 0 ? &icon_vol_mute : v < 34 ? &icon_vol_low
                            : v < 67 ? &icon_vol_mid : &icon_vol_high;
         draw_icon(fb, FB_W, FB_H, icon_x, icon_y, vic, dim);
-        fill_rect(fb, bx, by, bw, 8, themed ? np_col_line() : COL_LINE);
+        fill_rect(fb, bx, by, bw, 8, themed ? qc_line() : COL_LINE);
         int filled = bw * v / 100;
         if (filled > 0) fill_rect(fb, bx, by, filled, 8, dim);
         fill_circle(fb, bx + filled, by + 4, 13, dim);
@@ -9893,11 +10421,11 @@ static void draw_volume(uint16_t *fb) {
      * like" mapping, not a second one invented for this popup. */
     const icon_t *vic = v <= 0 ? &icon_vol_mute : v < 34 ? &icon_vol_low
                        : v < 67 ? &icon_vol_mid : &icon_vol_high;
-    draw_icon(fb, FB_W, FB_H, icon_x, icon_y, vic, themed ? np_col_dim() : COL_DIM);
+    draw_icon(fb, FB_W, FB_H, icon_x, icon_y, vic, themed ? qc_dim() : COL_DIM);
 
-    fill_rect(fb, bx, by, bw, 8, themed ? np_col_line() : COL_LINE);
+    fill_rect(fb, bx, by, bw, 8, themed ? qc_line() : COL_LINE);
     int filled = bw * v / 100;
-    uint16_t accent = themed ? np_col_accent() : COL_ACCENT;
+    uint16_t accent = themed ? qc_accent() : COL_ACCENT;
     if (filled > 0) fill_rect(fb, bx, by, filled, 8, accent);
     fill_circle(fb, bx + filled, by + 4, 13, accent);
 }
@@ -12765,6 +13293,11 @@ int music_entry(void *a0, void *a1) {
             } else if (screen == SC_SETTINGS_USB) {
                 int idx = (y - CONTENT_Y) / ROW_H;
                 if (idx >= 0 && idx < 2) set_usb_storage_mode(idx);
+            } else if (screen == SC_STATS) {
+                int idx = (y - CONTENT_Y) / ROW_H;
+                if (idx == 0) { screen = SC_STATS_BATTERY; reset_scroll(); }
+                else if (idx == 1) { screen = SC_STATS_STORAGE; reset_scroll(); stor_request(); }
+                else if (idx == 2) { screen = SC_STATS_LISTEN; reset_scroll(); }
             } else if (screen == SC_TRACKS && !ab_list && !pod_list) {
                 /* R46: tap coordinates are screen-space; the header/track
                  * layout is content-space (see the draw side's own `off`).
@@ -12906,6 +13439,8 @@ int music_entry(void *a0, void *a1) {
                         station_n = radio_load(stations, RADIO_MAX);
                         screen = SC_RADIO; reset_scroll();
                         mlog("[music] %d stations\n", station_n);
+                    } else if (idx == TOP_STATS) {
+                        screen = SC_STATS; reset_scroll();
                     } else if (idx == TOP_SETTINGS) {
                         screen = SC_SETTINGS; reset_scroll();
                     }
@@ -13961,6 +14496,12 @@ int music_entry(void *a0, void *a1) {
                 if (gdx > 10 || gdy > 10) mseb_gesture = (gdx > gdy) ? 1 : 2;
             }
             int mseb_slider_gesture = mseb_grab >= 0 && mseb_gesture != 2;
+            /* Screens whose content runs up under the status strip (album and
+             * artist pages, drag_top == 0) share that strip with the dropdown
+             * pull: a downward drag that starts there belongs to the dropdown,
+             * not the list, or the track list scrolls with the pull. */
+            int qs_pull_ambiguous = drag_top == 0 && touch_y < QS_PULL_ZONE &&
+                                    (qs_pulling || live_y > touch_y);
 
             int was = list_dragging;
             list_dragging = touch_down && scrollable && !index_active &&
@@ -13973,7 +14514,8 @@ int music_entry(void *a0, void *a1) {
                              * under itself while deleting. */
                             !rec_swipe_active && !mseb_slider_gesture &&
                             touch_y >= drag_top && !edge_active && !edge_zone_ambiguous &&
-                            !home_edge_active && !home_edge_zone_ambiguous;
+                            !home_edge_active && !home_edge_zone_ambiguous &&
+                            !qs_pull_ambiguous;
             if (list_dragging && !was) {
                 /* A raw drag on the list itself is free browsing, not bound
                  * by wherever the index last landed — otherwise a stale
@@ -14402,6 +14944,8 @@ int music_entry(void *a0, void *a1) {
             home_hint_was = home_edge_active;
         }
         {
+            batt_log_tick();
+            listen_tick();
             int sec = audio_is_active() ? audio_pos_ms() / 1000 : -1;
             if (sec != last_sec) { last_sec = sec; dirty = 1; }
             int seq = art_seq();
