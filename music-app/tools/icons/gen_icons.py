@@ -61,10 +61,10 @@ SPECS = [
     ("mode", "bars-solid-full.svg.png",             "mode_off",     [(26, 26, "")]),
     ("mode", "repeat-solid-full.svg.png",           "mode_repeat",  [(26, 26, "")]),
     ("mode", "shuffle-solid-full.svg.png",          "mode_shuffle", [(26, 26, "")]),
-    ("vol",  "volume-xmark-solid-full.svg.png",     "vol_mute", [(20, 20, "")]),
-    ("vol",  "volume-low-solid-full.svg.png",       "vol_low",  [(20, 20, "")]),
-    ("vol",  "volume-solid-full.svg.png",           "vol_mid",  [(20, 20, "")]),
-    ("vol",  "volume-high-solid-full.svg.png",      "vol_high", [(20, 20, "")]),
+    ("vol",  "volume-xmark-solid-full.svg.png",     "vol_mute", [(20, 20, ""), (30, 30, "_lg")]),
+    ("vol",  "volume-low-solid-full.svg.png",       "vol_low",  [(20, 20, ""), (30, 30, "_lg")]),
+    ("vol",  "volume-solid-full.svg.png",           "vol_mid",  [(20, 20, ""), (30, 30, "_lg")]),
+    ("vol",  "volume-high-solid-full.svg.png",      "vol_high", [(20, 20, ""), (30, 30, "_lg")]),
     # _qs: quick-settings' own Format row sits the battery glyph next to the
     # disc icon (28x28) on the same row -- explicit request that it read at
     # the same size as every other icon in that panel instead of the small
@@ -72,11 +72,11 @@ SPECS = [
     # inline reading, still used unchanged everywhere else). 20px tall to
     # match icon_gear_qs; width follows from the family's own aspect ratio
     # (~1.86:1), not set independently.
-    ("batt", "battery-empty-solid-full.svg.png",          "batt_0",  [(26, 14, ""), (37, 20, "_qs")]),
-    ("batt", "battery-quarter-solid-full.svg.png",        "batt_25", [(26, 14, ""), (37, 20, "_qs")]),
-    ("batt", "battery-half-solid-full.svg.png",           "batt_50", [(26, 14, ""), (37, 20, "_qs")]),
-    ("batt", "battery-three-quarters-solid-full.svg.png", "batt_75", [(26, 14, ""), (37, 20, "_qs")]),
-    ("batt", "battery-full-solid-full.svg.png",           "batt_100",[(26, 14, ""), (37, 20, "_qs")]),
+    ("batt", "battery-empty-solid-full.svg.png",          "batt_0",  [(26, 14, ""), (37, 20, "_qs"), (39, 21, "_lg")]),
+    ("batt", "battery-quarter-solid-full.svg.png",        "batt_25", [(26, 14, ""), (37, 20, "_qs"), (39, 21, "_lg")]),
+    ("batt", "battery-half-solid-full.svg.png",           "batt_50", [(26, 14, ""), (37, 20, "_qs"), (39, 21, "_lg")]),
+    ("batt", "battery-three-quarters-solid-full.svg.png", "batt_75", [(26, 14, ""), (37, 20, "_qs"), (39, 21, "_lg")]),
+    ("batt", "battery-full-solid-full.svg.png",           "batt_100",[(26, 14, ""), (37, 20, "_qs"), (39, 21, "_lg")]),
     # Brightness glyph for the quick-settings slider, same left-of-bar spot
     # the volume popup's own icon_vol_* sits in. Font Awesome Free has no
     # graduated low/mid/high brightness family the way volume does (no
@@ -92,14 +92,14 @@ SPECS = [
     # Home screen grid (Lucide line icons, the user's own picks). One family:
     # all share Lucide's 24-unit box and 2-unit stroke, and a shared crop keeps
     # the stroke the same weight on every tile.
-    ("home", "home-music.svg.png",      "home_music",      [(88, 88, "")]),
-    ("home", "home-audiobooks.svg.png", "home_audiobooks", [(88, 88, "")]),
-    ("home", "home-podcasts.svg.png",   "home_podcasts",   [(88, 88, "")]),
-    ("home", "home-eq.svg.png",         "home_eq",         [(56, 56, "")]),
-    ("home", "home-mseb.svg.png",       "home_mseb",       [(56, 56, "")]),
-    ("home", "home-radio.svg.png",      "home_radio",      [(88, 88, "")]),
-    ("home", "home-stats.svg.png",      "home_stats",      [(56, 56, "")]),
-    ("home", "home-settings.svg.png",   "home_settings",   [(56, 56, "")]),
+    ("home", "home-music.svg.png",      "home_music",      [(88, 88, ""), (30, 30, "_sb")]),
+    ("home", "home-audiobooks.svg.png", "home_audiobooks", [(88, 88, ""), (30, 30, "_sb")]),
+    ("home", "home-podcasts.svg.png",   "home_podcasts",   [(88, 88, ""), (30, 30, "_sb")]),
+    ("home", "home-eq.svg.png",         "home_eq",         [(88, 88, ""), (30, 30, "_sb")]),
+    ("home", "home-mseb.svg.png",       "home_mseb",       [(88, 88, ""), (30, 30, "_sb")]),
+    ("home", "home-radio.svg.png",      "home_radio",      [(88, 88, ""), (30, 30, "_sb")]),
+    ("home", "home-stats.svg.png",      "home_stats",      [(88, 88, ""), (30, 30, "_sb")]),
+    ("home", "home-settings.svg.png",   "home_settings",   [(88, 88, ""), (30, 30, "_sb")]),
 ]
 
 def load_full(path):

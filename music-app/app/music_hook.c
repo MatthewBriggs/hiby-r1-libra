@@ -463,15 +463,14 @@ static int usb_bypass_saved_vol;
 #define TEXT_PX_BODY  30
 #define TEXT_PX_SMALL 22
 
-/* Was 62 -- widened so the header actions (MSEB's Reset, Podcasts' Sync)
- * have a taller strip to land a tap in, not just a wider one. */
-#define HEADER_H  78
 /* Height of the status strip. Deliberately not STATUS_H-the-include-guard:
  * status.h used that name to guard itself, so whichever came second lost —
  * either this constant was redefined, or the header's contents were skipped
  * entirely. */
-#define STATUS_H  32
-#define CONTENT_Y (STATUS_H + HEADER_H)
+#define STATUS_H  48   /* 32 until 2026-09; raised with its icons and figures scaled to match */
+/* No title bar any more: the status strip carries back and the section's
+ * icon, and content starts straight under it. */
+#define CONTENT_Y STATUS_H
 #define ROW_H     72
 /* R50: the Queue screen's one extra header line (track count + remaining
  * playtime), fixed above the scrolling rows rather than the first row's own
@@ -2625,17 +2624,8 @@ static int eq_row_bands_y(void)   { return eq_curve_y() + 66; }
  * has to land on to scroll the list instead of moving a slider. */
 #define MSEB_SLIDER_GRAB 34
 
-/* R72: kept as the reserved right-margin boundary mseb_reset_x()/pod_sync_x()/
- * queue_clear_x() below still measure themselves against, even though "BACK"
- * itself moved to a leading arrow next to the title and nothing is actually
- * drawn at this position any more -- repositioning those three as well was
- * not asked for, so they keep the exact layout they already had. */
-static int header_back_x(void) {
-    return FB_W - 24 - text_width("BACK", TEXT_PX_SMALL);
-}
-
-/* R72: back moved from top-right "BACK" text to a leading accent arrow next
- * to the title -- the convention this app's transport screens already use
+/* R72: back moved from top-right "BACK" text to a leading accent arrow (now
+ * at the left of the status strip, beside the section's icon) -- the convention this app's transport screens already use
  * for "this is a direction" (BG97's rotate-arrow skip icons), just a plain
  * chevron rather than a rotate-and-seek glyph. g_header_show_back is set
  * once per drawn frame, in draw_screen()'s own title/header block, and read
@@ -2656,35 +2646,9 @@ static void draw_back_arrow(uint16_t *fb, int x, int cy, uint16_t c) {
               x + BACK_ARROW_W, cy + BACK_ARROW_H / 2, c);
 }
 
-/* Left edge of the "Reset" header action, shared between the header's own
- * draw and its tap zone so they cannot drift apart -- the same reason
- * bar_y()/eq_row_*_y() above are functions rather than repeated literals.
- * Positioned left of "BACK" with a 20px gap, both right-aligned inward from
- * the usual 24px margin. */
-static int mseb_reset_x(void) {
-    int reset_w = text_width("Reset", TEXT_PX_SMALL);
-    return header_back_x() - 20 - reset_w;
-}
-
-/* Same idea as mseb_reset_x(), for SC_PODCASTS's "Sync" header action. */
-static int pod_sync_x(void) {
-    int sync_w = text_width("Sync", TEXT_PX_SMALL);
-    return header_back_x() - 20 - sync_w;
-}
-
-/* R52: same idea again, for SC_QUEUE's "Clear" header action. */
-static int queue_clear_x(void) {
-    int clear_w = text_width("Clear", TEXT_PX_SMALL);
-    /* Reported live: wanted further from BACK than mseb_reset_x()/
-     * pod_sync_x()'s shared 20px -- unlike Reset or Sync, this one actually
-     * discards something (the rest of the queue), so a bit more separation
-     * from the tap zone right next to it is worth the extra width. */
-    return header_back_x() - 40 - clear_w;
-}
-
 /* R82: same idea again, for the USB Storage Mode banner's own "Done"
  * action -- not a header row (the banner isn't one), so right-aligned
- * against the screen's own 24px margin rather than header_back_x(). */
+ * against the screen's own 24px margin. */
 static int usb_done_x(void) {
     return FB_W - 24 - text_width("Done", TEXT_PX_BODY);
 }
@@ -2871,7 +2835,7 @@ static int settings_content_rows(void) {
  * pushed by hand, not by CI against a tagged commit), so this stays a
  * literal that a human edits; the discipline is remembering to, not the
  * mechanism. */
-#define LIBRARY_VERSION "0.56"
+#define LIBRARY_VERSION "0.57"
 
 /* A custom-built kernel keeps uname()'s own release string exactly
  * "4.4.94+" on purpose -- that string is also the vermagic every one of the
@@ -4275,24 +4239,19 @@ static char index_letter(int i) { return i == 0 ? '#' : (char)('A' + i - 1); }
 
 #define MINI_H 76
 
-/* Home: Music, Audiobooks, Podcasts and Radio as a 2x2 block of large tiles,
- * the rest three across beneath. Sized to fit above the mini player, so the
- * screen never scrolls and nothing moves when the mini player appears. */
-#define HOME_H      (FB_H - MINI_H - CONTENT_Y)
-#define HOME_BIG_H  (HOME_H * 3 / 10)
-#define HOME_SMALL_H ((HOME_H - 2 * HOME_BIG_H) / 2)
+/* Home: eight equal tiles, two across and four down, from just under the
+ * status strip to the top of the mini player's space -- kept free whether or
+ * not it is showing, so nothing resizes when playback starts -- with no title
+ * bar, so the screen never scrolls. Music, Audiobooks, Podcasts and Radio take
+ * the first two rows. */
+#define HOME_TOP  (STATUS_H + 10)
+#define HOME_ROWS 4
+static int mini_visible(void);
 static void home_tile(int i, int *x, int *y, int *w, int *h) {
-    static const signed char big_slot[] = { 0, 1, 2, -1, -1, 3, -1, -1 };
-    static const signed char small_slot[] = { -1, -1, -1, 0, 1, -1, 2, 3 };
-    if (big_slot[i] >= 0) {
-        int k = big_slot[i];
-        *w = FB_W / 2; *h = HOME_BIG_H;
-        *x = (k % 2) * *w; *y = CONTENT_Y + (k / 2) * *h;
-    } else {
-        int k = small_slot[i];
-        *w = FB_W / 3; *h = HOME_SMALL_H;
-        *x = (k % 3) * *w; *y = CONTENT_Y + 2 * HOME_BIG_H + (k / 3) * *h;
-    }
+    static const signed char slot[] = { 0, 1, 2, 4, 5, 3, 6, 7 };   /* by top_menu[] index */
+    int k = slot[i];
+    *w = FB_W / 2; *h = (FB_H - MINI_H - HOME_TOP) / HOME_ROWS;
+    *x = (k % 2) * *w; *y = HOME_TOP + (k / 2) * *h;
 }
 
 /* Shared between draw_mini() and its tap handler, rather than the two each
@@ -4320,6 +4279,14 @@ static void home_tile(int i, int *x, int *y, int *w, int *h) {
 /* The mini player sits over the bottom of the list, so the list has to give up
  * the rows it covers or the last one is unreachable. */
 static int mini_visible(void);
+/* Podcasts' Sync lives in a bar pinned to the bottom of the feed list, above
+ * the mini player when that is showing. */
+#define POD_SYNC_BAR_H 64
+static int mini_visible(void);
+static int pod_sync_bar_y(void) {
+    return FB_H - (mini_visible() ? MINI_H : 0) - POD_SYNC_BAR_H;
+}
+
 static int vis_rows(void) {
     /* R46: the album-detail screen has no status bar or title bar to leave
      * room for -- its content starts at y=0, not CONTENT_Y, same as Now
@@ -4346,6 +4313,7 @@ static int vis_rows(void) {
                        : plain_album    ? (sheet_note[0] ? 40 : 0)
                        : artist_page    ? 0
                        : 40;
+    if (screen == SC_PODCASTS) bottom_margin = FB_H - pod_sync_bar_y();
     int h = FB_H - top - bottom_margin;
     return h / ROW_H;
 }
@@ -6839,21 +6807,72 @@ static void draw_speaker(uint16_t *fb, int x, int y, uint16_t c) {
  * its feed's cover, so the status strip above it follows. */
 static int g_pod_theme;
 
+/* Which Home section the screen on show belongs to -- its icon rides in the
+ * status strip beside the back arrow. NULL on Home itself. */
+static const icon_t *status_section_icon(void) {
+    switch (screen) {
+        case SC_MENU: return NULL;
+        case SC_AUDIOBOOKS: return &icon_home_audiobooks_sb;
+        case SC_PODCASTS: case SC_POD_SYNC: return &icon_home_podcasts_sb;
+        case SC_RADIO: case SC_RADIO_RECORDINGS: return &icon_home_radio_sb;
+        case SC_EQ: case SC_EQ_BANDS: case SC_EQ_BAND: return &icon_home_eq_sb;
+        case SC_MSEB: return &icon_home_mseb_sb;
+        case SC_STATS: case SC_STATS_BATTERY: case SC_STATS_STORAGE: case SC_STATS_LISTEN:
+            return &icon_home_stats_sb;
+        case SC_SETTINGS: case SC_SETTINGS_THEME: case SC_SETTINGS_ABOUT: case SC_SETTINGS_TIMEZONE:
+        case SC_SETTINGS_THEMEMODE: case SC_SETTINGS_WIFI: case SC_SETTINGS_BT: case SC_SETTINGS_USB:
+            return &icon_home_settings_sb;
+        case SC_TRACKS:
+            return ab_list ? &icon_home_audiobooks_sb : pod_list ? &icon_home_podcasts_sb : &icon_home_music_sb;
+        case SC_QUEUE:
+            return audiobook_mode ? &icon_home_audiobooks_sb : podcast_mode ? &icon_home_podcasts_sb
+                                  : &icon_home_music_sb;
+        default: return &icon_home_music_sb;   /* the music browser's own screens */
+    }
+}
+
+#define STATUS_TEXT_PX 26
+/* Left edge of the battery readout on the right of the strip; a screen's own
+ * action (Reset/Sync/Clear) sits to the left of it. */
+static int status_right_group_x(void) {
+    int pct = st_battery_pct();
+    int bx = FB_W - 20 - icon_batt_100_lg.w;
+    if (pct < 0) return bx;
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%d%%", pct);
+    return bx - 11 - text_width(buf, STATUS_TEXT_PX);
+}
+static int status_action_x(const char *label) {
+    return status_right_group_x() - 28 - text_width(label, STATUS_TEXT_PX);
+}
+
 static void draw_status(uint16_t *fb) {
     char buf[16];
     uint16_t sdim = g_pod_theme ? np_view_col_dim() : COL_DIM;
+    int h = STATUS_H;
+    int px = STATUS_TEXT_PX;
     /* One shared centre line. Everything here is positioned from it rather
      * than from its own top edge, which is what left the speaker sitting
      * above the digits next to it. */
-    const int mid = STATUS_H / 2;
-    const int ty  = mid - TEXT_PX_SMALL / 2;      /* text box is TEXT_PX_SMALL tall */
-    /* Volume and battery only. The headphone and Bluetooth icons both said
-     * what the route already says at the foot of the player. */
+    const int mid = h / 2;
+    const int ty  = mid - px / 2;
+
+    /* Away from Home: back, then the icon of the section being browsed, both
+     * in the accent colour; volume moves right to make room. */
+    int lx = 24;
+    const icon_t *sec = status_section_icon();
+    if (sec) {
+        uint16_t acc = g_pod_theme ? np_view_col_accent() : COL_ACCENT;
+        draw_back_arrow(fb, BACK_ARROW_X, mid, acc);
+        int sx = BACK_ARROW_X + BACK_ARROW_W + 10;
+        draw_icon(fb, FB_W, FB_H, sx, mid - sec->h / 2, sec, acc);
+        lx = sx + sec->w + 22;
+    }
 
     int vol = audio_volume();
-    const icon_t *vic = vol <= 0 ? &icon_vol_mute : vol < 34 ? &icon_vol_low
-                       : vol < 67 ? &icon_vol_mid  : &icon_vol_high;
-    draw_icon(fb, FB_W, FB_H, 24, mid - vic->h / 2, vic, sdim);
+    const icon_t *vic = vol <= 0 ? &icon_vol_mute_lg : vol < 34 ? &icon_vol_low_lg
+                       : vol < 67 ? &icon_vol_mid_lg : &icon_vol_high_lg;
+    draw_icon(fb, FB_W, FB_H, lx, mid - vic->h / 2, vic, sdim);
     /* R95 follow-up: current/total steps for every output -- explicit
      * correction after the first cut only changed this on Bluetooth. */
     {
@@ -6862,18 +6881,22 @@ static void draw_status(uint16_t *fb) {
         if (cur < 0) cur = 0; if (cur > steps) cur = steps;
         snprintf(buf, sizeof(buf), "%d/%d", cur, steps);
     }
-    draw_text(fb, 24 + 26, ty, buf, sdim, TEXT_PX_SMALL, FB_W - 24 - 26);
+    int tx = lx + vic->w + 9;
+    draw_text(fb, tx, ty, buf, sdim, px, FB_W - tx);
 
     int pct = st_battery_pct();
-    int bx = FB_W - 18 - 28;
-    draw_battery(fb, bx, mid - 6, pct, st_charging());
+    const icon_t *bic = pct > 87 ? &icon_batt_100_lg : pct > 62 ? &icon_batt_75_lg
+                      : pct > 37 ? &icon_batt_50_lg : pct > 12 ? &icon_batt_25_lg : &icon_batt_0_lg;
+    int bx = FB_W - 20 - bic->w;
+    uint16_t bc = st_charging() ? COL_ACCENT : (pct >= 0 && pct <= 15 ? RGB(230, 80, 70) : COL_DIM);
+    draw_icon(fb, FB_W, FB_H, bx, mid - bic->h / 2, bic, bc);
     if (pct >= 0) {
         snprintf(buf, sizeof(buf), "%d%%", pct);
-        int tw = text_width(buf, TEXT_PX_SMALL);
-        draw_text(fb, bx - 8 - tw, ty, buf, sdim, TEXT_PX_SMALL, FB_W);
+        int tw = text_width(buf, px);
+        draw_text(fb, bx - 11 - tw, ty, buf, sdim, px, FB_W);
     }
 
-    fill_rect(fb, 0, STATUS_H - 1, FB_W, 1, g_pod_theme ? np_view_col_line() : COL_LINE);
+    fill_rect(fb, 0, h - 1, FB_W, 1, g_pod_theme ? np_view_col_line() : COL_LINE);
 }
 
 /* Word-wrapped, scrollable show notes -- drawn in place of the cover art
@@ -7121,62 +7144,13 @@ static void draw_screen(uint16_t *fb) {
      * edge-to-edge from y=0, and there's no room left for either. Back is
      * the swipe gesture everywhere else already relies on. */
     if (screen != SC_PLAYING && screen != SC_ARTIST_PAGE && !(screen == SC_TRACKS && !ab_list && !pod_list)) {
-        fill_rect(fb, 0, 0, FB_W, CONTENT_Y, pod_th ? np_view_col_bg() : COL_HEADER);
+        fill_rect(fb, 0, 0, FB_W, screen == SC_MENU ? STATUS_H : CONTENT_Y,
+                  pod_th ? np_view_col_bg() : COL_HEADER);
     }
 
-    const char *title = "Home";   /* R80: renamed from "Main Menu" */
-    /* R?? follow-up: Main Menu had no "back" to offer even in the hooked
-     * build (go_back() here just hands control to hiby_player's launcher,
-     * which the edge swipe already does identically), and in standalone it
-     * did nothing but restart the app -- see g_is_standalone's own comment.
-     * A button that either duplicates the swipe or does nothing isn't worth
-     * the screen space in either build. */
-    /* R72: back moved from top-right "BACK" text to a leading accent arrow
-     * next to the title (see the draw site below) -- there is no longer a
-     * generic right-hand header label at all, only the three screen-
-     * specific extra actions (Reset/Sync/Clear) drawn further down, each
-     * already positioned by its own dedicated x-function. */
-    int show_back = 0;
-    if (screen == SC_ARTISTS) { title = cur_facet_label; show_back = 1; }
-    else if (screen == SC_ALBUMS)  {
-        title = recent_mode == RECENT_ADDED ? "Recently added"
-              : recent_mode == RECENT_HEARD ? "Recently heard"
-              : !albums_filtered() ? "Albums"
-              : cur_artist[0] == LIB_UNKNOWN_MARK[0] ? "Unknown" : cur_artist;
-        show_back = 1;
-    }
-    else if (screen == SC_TRACKS)  { title = cur_album;  show_back = 1; }
-    /* The album being played is the queue, so "QUEUE" goes back to the track
-     * list — the same list, with the playing row marked. */
-
-    else if (screen == SC_RADIO)   { title = "Radio"; show_back = 1; }
-    else if (screen == SC_RADIO_RECORDINGS) { title = "Recordings"; show_back = 1; }
-    else if (screen == SC_PLAYLISTS) { title = "Playlists"; show_back = 1; }
-    else if (screen == SC_AUDIOBOOKS) { title = "Audiobooks"; show_back = 1; }
-    else if (screen == SC_PODCASTS)   { title = "Podcasts"; show_back = 1; }
-    else if (screen == SC_POD_SYNC)   { title = "Updating feeds"; show_back = 1; }
-    else if (screen == SC_EQ)         { title = "Parametric EQ"; show_back = 1; }
-    else if (screen == SC_EQ_BANDS)   { title = "Bands"; show_back = 1; }
-    else if (screen == SC_MSEB)       { title = "MSEB"; show_back = 1; }
-    else if (screen == SC_EQ_BAND) {
-        static char band_title[16];   /* draw_screen's own `buf` isn't declared this early */
-        snprintf(band_title, sizeof(band_title), "Band %d", eq_editing_band + 1);
-        title = band_title; show_back = 1;
-    }
-    else if (screen == SC_SETTINGS)       { title = "Settings"; show_back = 1; }
-    else if (screen == SC_SETTINGS_THEME) { title = "Accent colour"; show_back = 1; }
-    else if (screen == SC_SETTINGS_ABOUT) { title = "About"; show_back = 1; }
-    else if (screen == SC_SETTINGS_TIMEZONE) { title = "Timezone"; show_back = 1; }
-    else if (screen == SC_SETTINGS_THEMEMODE) { title = "Theme"; show_back = 1; }
-    else if (screen == SC_SETTINGS_WIFI) { title = "Wi-Fi"; show_back = 1; }
-    else if (screen == SC_SETTINGS_BT)   { title = "Bluetooth"; show_back = 1; }
-    else if (screen == SC_SETTINGS_USB)  { title = "USB working mode"; show_back = 1; }
-    else if (screen == SC_QUEUE) { title = "Queue"; show_back = 1; }
-    else if (screen == SC_MUSIC_MENU)     { title = "Music"; show_back = 1; }
-    else if (screen == SC_STATS)          { title = "Stats"; show_back = 1; }
-    else if (screen == SC_STATS_BATTERY)  { title = "Battery"; show_back = 1; }
-    else if (screen == SC_STATS_STORAGE)  { title = "Storage"; show_back = 1; }
-    else if (screen == SC_STATS_LISTEN)   { title = "Listening time"; show_back = 1; }
+    /* Every screen but Home has somewhere to go back to (the status strip's
+     * arrow; see draw_status()). */
+    int show_back = screen != SC_MENU;
 
     /* The player has no title bar. Drawn unconditionally, it sat behind the
      * artwork with the ends of "Music" and "EXIT" poking out either side of
@@ -7185,40 +7159,30 @@ static void draw_screen(uint16_t *fb) {
      * way Now Playing already does, for the same reason -- the cover runs
      * edge-to-edge from y=0, and there's no room left for either. Back is
      * the swipe gesture everywhere else already relies on. */
-    if (screen != SC_PLAYING && screen != SC_ARTIST_PAGE && !(screen == SC_TRACKS && !ab_list && !pod_list)) {
+    if (screen == SC_MENU) {
+        g_header_show_back = 0;
+        draw_status(fb);          /* Home has the status strip but no title bar */
+    } else if (screen != SC_PLAYING && screen != SC_ARTIST_PAGE && !(screen == SC_TRACKS && !ab_list && !pod_list)) {
+        /* No title bar: the status strip carries back and the section's
+         * icon (draw_status()), plus this screen's one action if it has one,
+         * just left of the battery readout. */
         g_header_show_back = show_back;
-        int title_x = show_back ? BACK_ARROW_X + BACK_ARROW_W + 14 : 18;
-        if (show_back)
-            draw_back_arrow(fb, BACK_ARROW_X, STATUS_H + 14 + TEXT_PX_TITLE / 2, pod_th ? np_view_col_accent() : COL_ACCENT);
-        draw_text(fb, title_x, STATUS_H + 14, title, pod_th ? np_view_col_fg() : COL_TEXT, TEXT_PX_TITLE, FB_W - 40 - (title_x - 18));
+        const int aty = (STATUS_H - STATUS_TEXT_PX) / 2;
         /* MSEB's one extra header action: zero every band back to 0 dB.
          * Doesn't touch Enabled -- "reset" clears the tuning, not the
          * on/off state, which the user didn't ask to lose. */
         if (screen == SC_MSEB)
-            draw_text(fb, mseb_reset_x(), STATUS_H + 20, "Reset", COL_DIM, TEXT_PX_SMALL, FB_W);
-        /* Podcasts' one extra header action: run .podsync/podsync_once.sh
-         * for every feed. Dimmed rather than hidden while it's already
-         * running, same convention a disabled control uses elsewhere in
-         * this app, since tapping it again would just fork a second sync
-         * over the first one's half-written files. */
-        if (screen == SC_PODCASTS) {
-            draw_text(fb, pod_sync_x(), STATUS_H + 20,
-                      pod_update_running() ? "Syncing" : "Sync",
-                      pod_update_running() ? COL_DIM : COL_ACCENT, TEXT_PX_SMALL, FB_W);
-        }
+            draw_text(fb, status_action_x("Reset"), aty, "Reset", COL_ACCENT, STATUS_TEXT_PX, FB_W);
         /* R52: Queue's one extra header action -- drop everything queued
          * after the currently-playing track. Dimmed when there's nothing
-         * past it to clear, same "nothing would happen" convention Sync
-         * uses while already running, rather than a tap that silently does
-         * nothing with no indication why. */
+         * past it to clear. */
         if (screen == SC_QUEUE) {
             int has_more = cur_track >= 0 && cur_track < queue_n &&
                            next_track_index() >= 0 && next_track_index() != cur_track;
-            draw_text(fb, queue_clear_x(), STATUS_H + 20, "Clear",
-                      has_more ? COL_ACCENT : COL_DIM, TEXT_PX_SMALL, FB_W);
+            draw_text(fb, status_action_x("Clear"), aty, "Clear",
+                      has_more ? COL_ACCENT : COL_DIM, STATUS_TEXT_PX, FB_W);
         }
         draw_status(fb);
-        fill_rect(fb, 0, CONTENT_Y - 1, FB_W, 1, pod_th ? np_view_col_line() : COL_LINE);
     }
 
     /* Rows draw at fixed positions and never shift for scroll_px: a page
@@ -7257,8 +7221,8 @@ static void draw_screen(uint16_t *fb) {
          * true; Parametric EQ/MSEB/Radio/Settings don't touch the card the
          * same way and stay live. */
         int usb_storage = st_usb_mode() == 1;
-        /* Square tiles straight under the header, in top_menu[] order: a
-         * Lucide line icon in the accent colour with the name beneath it. */
+        /* A Lucide line icon in the accent colour with the name beneath it,
+         * laid out by home_tile(). */
         static const icon_t *const home_icons[TOP_N] = {
             &icon_home_music, &icon_home_audiobooks, &icon_home_podcasts,
             &icon_home_eq, &icon_home_mseb, &icon_home_radio, &icon_home_stats, &icon_home_settings,
@@ -7270,10 +7234,8 @@ static void draw_screen(uint16_t *fb) {
             if (tx + tw < FB_W) fill_rect(fb, tx + tw - 1, ty, 1, th, COL_LINE);
             fill_rect(fb, tx, ty + th - 1, tw, 1, COL_LINE);
             const icon_t *ic = home_icons[i];
-            int big = tw > FB_W / 3;
-            int px = big ? TEXT_PX_BODY : TEXT_PX_SMALL;
-            int gap = big ? 14 : 8;
-            int iy = ty + (th - (ic->h + gap + px)) / 2 - 4;
+            int px = TEXT_PX_BODY, gap = 14;
+            int iy = ty + (th - (ic->h + gap + px)) / 2 + 4;
             draw_icon(fb, FB_W, FB_H, tx + (tw - ic->w) / 2, iy, ic, disabled ? COL_DIM : COL_ACCENT);
             int lw = text_width(top_menu[i].label, px);
             draw_text(fb, tx + (tw - lw) / 2, iy + ic->h + gap, top_menu[i].label,
@@ -8039,17 +8001,17 @@ static void draw_screen(uint16_t *fb) {
                     fill_circle(fb, 24 + w, wave_cy, 13, np_col_accent());
             }
         }
-        snprintf(buf, sizeof(buf), "%d:%02d", pos / 60000, (pos / 1000) % 60);
+        /* Both clocks in real-world time, not content time: at 1.5x an hour
+         * episode takes 40 minutes, and elapsed plus remaining should add up
+         * to that. The bar itself stays in content time. Music has no speed
+         * control, so this is a no-op there (pod_speed_permille only changes
+         * in podcast_mode). */
+        double spd = podcast_mode ? pod_speed_permille / 1000.0 : 1.0;
+        int shown_pos = (int)(pos / spd);
+        snprintf(buf, sizeof(buf), "%d:%02d", shown_pos / 60000, (shown_pos / 1000) % 60);
         draw_text(fb, 24, clock_y, buf, np_col_dim(), TEXT_PX_SMALL, FB_W);
         int rem = dur - pos; if (rem < 0) rem = 0;
-        /* Real-world time, not content time -- same reasoning as the
-         * audiobook screen's Book/Chapter countdowns: position/duration
-         * stay in content time (unaffected by speed, what the bar fill
-         * above already assumes), but the countdown label should shrink
-         * faster at faster speeds. Music has no speed control, so this is
-         * a no-op there (pod_speed_permille only changes in podcast_mode). */
-        if (podcast_mode)
-            rem = (int)(rem / (pod_speed_permille / 1000.0));
+        rem = (int)(rem / spd);
         snprintf(buf, sizeof(buf), "-%d:%02d", rem / 60000, (rem / 1000) % 60);
         draw_right_col(fb, clock_y, buf, np_col_dim());
 
@@ -9312,6 +9274,7 @@ static void draw_screen(uint16_t *fb) {
         return;
     }
 
+    if (screen == SC_PODCASTS) clip_bot = pod_sync_bar_y();
     for (int i = 0; i < vis_rows(); i++) {
         int absolute = scroll + i;
         lib_row_t *row = row_at(absolute);
@@ -9336,6 +9299,19 @@ static void draw_screen(uint16_t *fb) {
      * branch) had gone without it: clip_bot already reserves MINI_H of
      * space for it via mini_visible() above, so rows correctly stopped
      * short of the bottom, but nothing ever painted into the gap that left. */
+    if (screen == SC_PODCASTS) {
+        /* Sync every feed (.podsync/podsync_once.sh). Dimmed while a sync is
+         * already running, or waiting for Bluetooth playback to pause --
+         * tapping again would only fork a second sync over the first. */
+        int by = pod_sync_bar_y();
+        fill_rect(fb, 0, by, FB_W, POD_SYNC_BAR_H, COL_HEADER);
+        fill_rect(fb, 0, by, FB_W, 1, COL_LINE);
+        int busy = pod_update_running() || pod_sync_deferred;
+        const char *lbl = pod_update_running() ? "Syncing..." : pod_sync_deferred ? "Sync waiting" : "Sync";
+        int lw = text_width(lbl, TEXT_PX_BODY);
+        draw_text(fb, (FB_W - lw) / 2, by + (POD_SYNC_BAR_H - TEXT_PX_BODY) / 2 - 2, lbl,
+                  busy ? COL_DIM : COL_ACCENT, TEXT_PX_BODY, FB_W);
+    }
     if (mini_visible()) draw_mini(fb);
 }
 
@@ -12288,7 +12264,7 @@ static void scan_inputs(void) {
         if (have || kfd_n >= KFD_MAX) continue;
         char path[48];
         snprintf(path, sizeof(path), "/dev/input/%s", node);
-        int fd = open(path, O_RDONLY | O_NONBLOCK);
+        int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);   /* see g_fbfd's open */
         if (fd < 0) continue;
         ioctl(fd, EVIOCGRAB, 1);
         kfd[kfd_n] = fd;
@@ -12319,7 +12295,7 @@ static void scan_inputs(void) {
             if (have || kfd_n >= KFD_MAX) continue;
             char path[48];
             snprintf(path, sizeof(path), "/dev/input/%s", node);
-            int fd = open(path, O_RDONLY | O_NONBLOCK);
+            int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);   /* see g_fbfd's open */
             if (fd < 0) continue;
             ioctl(fd, EVIOCGRAB, 1);
             kfd[kfd_n] = fd;
@@ -12363,7 +12339,12 @@ int music_entry(void *a0, void *a1) {
      * stretch the user would otherwise spend looking at a boot logo. The
      * two are independent -- lib_open() only opens SQLite -- so nothing
      * else cares about the order. */
-    int fbfd = open("/dev/fb0", O_RDWR);
+    /* O_CLOEXEC here and on every input device: each shell command this app
+     * runs (wifi_on.sh, udhcpc, wpa_cli...) would otherwise inherit them, and
+     * wpa_supplicant and udhcpc stay running as daemons after Libra exits --
+     * holding the touchscreen's EVIOCGRAB with it. The next Libra then cannot
+     * grab the touchscreen and never sees a tap. */
+    int fbfd = open("/dev/fb0", O_RDWR | O_CLOEXEC);
     if (fbfd < 0) { mlog("[music] no fb: %s\n", strerror(errno)); return 0; }
     g_fbfd = fbfd;                    /* set_locked needs it to unblank */
 
@@ -12439,7 +12420,7 @@ int music_entry(void *a0, void *a1) {
     char tpath[48];
     snprintf(tpath, sizeof(tpath), "/dev/input/%s", tnode);
     mlog("[music] touch on %s\n", tnode);
-    int tfd = open(tpath, O_RDONLY | O_NONBLOCK);
+    int tfd = open(tpath, O_RDONLY | O_NONBLOCK | O_CLOEXEC);   /* see g_fbfd's open */
     if (tfd >= 0 && ioctl(tfd, EVIOCGRAB, 1) < 0)
         mlog("[music] touch grab failed: %s\n", strerror(errno));
 
@@ -13194,7 +13175,15 @@ int music_entry(void *a0, void *a1) {
                     }
                 }
                 }
-            } else if (y < CONTENT_Y && screen != SC_KEYBOARD) {
+            } else if (screen == SC_PODCASTS && y >= pod_sync_bar_y() &&
+                       y < pod_sync_bar_y() + POD_SYNC_BAR_H) {
+                if (!pod_update_running()) {
+                    pod_sync_log_n = 0;
+                    if (net_held()) pod_sync_deferred = 1;
+                    else            pod_update_start();
+                }
+                screen = SC_POD_SYNC; reset_scroll();
+            } else if (y < CONTENT_Y && screen != SC_KEYBOARD && screen != SC_MENU) {
                 /* BG108: SC_KEYBOARD draws its own header (Cancel top-left,
                  * Done top-right, both at y=20 -- see draw_keyboard()) rather
                  * than the generic title+back-arrow bar every other screen
@@ -13225,18 +13214,11 @@ int music_entry(void *a0, void *a1) {
                  * and quietly left the screen instead of hitting the button.
                  * header_back_x() - 16 is precise: it reaches right up to
                  * where BACK's own zone actually starts. */
-                if (screen == SC_MSEB && x >= mseb_reset_x() - 16 && x < header_back_x() - 16) {
+                if (screen == SC_MSEB && x >= status_action_x("Reset") - 16 && x < status_right_group_x() - 8) {
                     for (int i = 0; i < MSEB_BAND_N; i++) mseb_gain[i] = 0.0f;
                     eq_set_mseb(mseb_on, mseb_gain);
                     mseb_save(mseb_gain, mseb_on);
-                } else if (screen == SC_PODCASTS && x >= pod_sync_x() - 16 && x < header_back_x() - 16) {
-                    if (!pod_update_running()) {
-                        pod_sync_log_n = 0;
-                        if (net_held()) pod_sync_deferred = 1;
-                        else            pod_update_start();
-                    }
-                    screen = SC_POD_SYNC; reset_scroll();
-                } else if (screen == SC_QUEUE && x >= queue_clear_x() - 16 && x < header_back_x() - 16) {
+                } else if (screen == SC_QUEUE && x >= status_action_x("Clear") - 16 && x < status_right_group_x() - 8) {
                     /* R52: drop everything queued after the currently-
                      * playing track -- that one keeps playing undisturbed
                      * to its own end, same as reaching it naturally would,
@@ -14305,6 +14287,7 @@ int music_entry(void *a0, void *a1) {
             int v = (live_x - vol_bar_x()) * 100 / (bw > 0 ? bw : 1);
             if (v < 0) v = 0;
             if (v > 100) v = 100;
+            v = audio_volume_snap(v);
             if (v != vol_drag_pct) { vol_drag_pct = v; dirty = 1; }
             /* Applying this on every frame means a fork and exec of amixer,
              * twice over — set and read back — thirty times a second on
@@ -14423,6 +14406,7 @@ int music_entry(void *a0, void *a1) {
             int v = (live_x - vol_bar_x()) * 100 / (bw > 0 ? bw : 1);
             if (v < 0) v = 0;
             if (v > 100) v = 100;
+            v = audio_volume_snap(v);
             if (v != vol_drag_pct) { vol_drag_pct = v; dirty = 1; }
             if (++vol_apply_tick >= 6) {
                 vol_apply_tick = 0;

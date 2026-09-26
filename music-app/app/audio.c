@@ -1718,6 +1718,24 @@ int audio_bt_vol_max(void) { return bt_vol_max; }
 static int bt_raw_to_pct(int raw) {
     return bt_vol_max > 0 ? (raw * 100 + bt_vol_max / 2) / bt_vol_max : 0;
 }
+/* The Volume steps setting divides the whole range into exactly that many
+ * equal steps, on every output. It used to apply to Bluetooth only (the jack
+ * and USB moved 5% a press, 20 steps, under a status bar counting 16ths), and
+ * even there a fixed raw step of 127/16 = 7 took 19 presses. Levels are now
+ * positions k of n: a key press moves k by one, the slider lands on the
+ * nearest k. A percent output cannot resolve more than 100. */
+static int vol_n(void) {
+    return (!audio_using_bt() && bt_vol_steps > 100) ? 100 : bt_vol_steps;
+}
+static int vol_k_to_pct(int k, int n) { return (k * 100 + n / 2) / n; }
+static int vol_pct_to_k(int pct, int n) { return (pct * n + 50) / 100; }
+int audio_volume_snap(int pct) {
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    int n = vol_n();
+    return vol_k_to_pct(vol_pct_to_k(pct, n), n);
+}
+
 static int bt_pct_to_raw(int pct) {
     return (pct * bt_vol_max + 50) / 100;
 }
@@ -1848,10 +1866,10 @@ void audio_set_screen_locked(int on) { g_screen_locked = on; }
 
 void audio_volume_set(int pct) {
     if (g_vol_locked) return;
-    if (pct < 0) pct = 0;
-    if (pct > 100) pct = 100;
+    pct = audio_volume_snap(pct);
     if (!audio_using_bt()) { audio_set_volume(pct); return; }
-    int raw = bt_pct_to_raw(pct);
+    int n = vol_n();
+    int raw = (vol_pct_to_k(pct, n) * bt_vol_max + n / 2) / n;
     if (raw < 0) raw = 0; if (raw > bt_vol_max) raw = bt_vol_max;
     bt_vol_raw = raw;
     bt_last_pct = pct;
@@ -1870,11 +1888,13 @@ void audio_volume_set(int pct) {
 
 void audio_volume_step(int delta) {
     if (g_vol_locked) return;
+    int n = vol_n();
+    int dir = delta > 0 ? 1 : delta < 0 ? -1 : 0;
     if (!audio_using_bt()) {
-        int v = audio_volume() + delta;
-        if (v < 0) v = 0;
-        if (v > 100) v = 100;
-        audio_set_volume(v);
+        int k = vol_pct_to_k(audio_volume(), n) + dir;
+        if (k < 0) k = 0;
+        if (k > n) k = n;
+        audio_set_volume(vol_k_to_pct(k, n));
         return;
     }
     /* R90: the step size is bt_vol_max/bt_vol_steps raw units -- a user
@@ -1888,13 +1908,16 @@ void audio_volume_step(int delta) {
      * fractional raw step every time it got converted back and forth was
      * exactly the old bug. */
     int base = bt_vol_raw >= 0 ? bt_vol_raw : bt_pct_to_raw(audio_volume());
-    int step = bt_vol_max / bt_vol_steps; if (step < 1) step = 1;
-    int raw = base + (delta > 0 ? step : delta < 0 ? -step : 0);
-    if (raw < 0) raw = 0; if (raw > bt_vol_max) raw = bt_vol_max;
+    int k = (base * n + bt_vol_max / 2) / bt_vol_max + dir;
+    if (k < 0) k = 0;
+    if (k > n) k = n;
+    int raw = (k * bt_vol_max + n / 2) / n;
+    int step = raw - base;
     bt_vol_raw = raw;
-    bt_last_pct = bt_raw_to_pct(raw);
+    int shown = n <= 100 ? vol_k_to_pct(k, n) : bt_raw_to_pct(raw);
+    bt_last_pct = shown;
     pthread_mutex_lock(&g_lock);
-    g_vol = bt_raw_to_pct(raw);
+    g_vol = shown;
     pthread_mutex_unlock(&g_lock);
     pthread_mutex_lock(&bt_vol_lock);
     bt_vol_pending = 1; bt_vol_pending_raw = raw;
@@ -1904,7 +1927,7 @@ void audio_volume_step(int delta) {
      * meant as well, so the discovery branch can apply the press to the real
      * reading instead of writing that guess. */
     if (bt_vol_synced) bt_vol_pending_rel = 0;
-    else bt_vol_pending_rel += (delta > 0 ? step : delta < 0 ? -step : 0);
+    else bt_vol_pending_rel += step;
     pthread_mutex_unlock(&bt_vol_lock);
     /* BG94: reported as hardware volume buttons lagging several seconds
      * behind a press, sometimes matching the on-screen slider and sometimes

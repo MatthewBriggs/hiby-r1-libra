@@ -86,7 +86,8 @@ void audio_volume_set(int pct);      /* absolute, for the slider */
  * wired path's software gain has never used amixer or percent rounding.
  * Default 32 if never set. */
 void audio_set_bt_vol_steps(int n);
-int  audio_bt_vol_steps(void);
+int  audio_bt_vol_steps(void);   /* the Volume steps setting, on every output */
+int  audio_volume_snap(int pct);  /* nearest level on that step grid */
 /* Raw mixer state, for a "current/total steps" display instead of a percent
  * one on Bluetooth -- -1/0 respectively when there's nothing to show yet
  * (no mixer found this connection). */
