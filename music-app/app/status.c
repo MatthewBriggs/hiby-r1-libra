@@ -16,6 +16,11 @@
 #include <stdlib.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <unistd.h>
 
 #include "status.h"
 
@@ -672,13 +677,51 @@ void st_brightness_set(int v) {
 }
 
 /* wifi_off.sh takes the interface down, so operstate is the honest answer. */
+/* Whether Wi-Fi is switched on: the driver is loaded and the interface is
+ * administratively up. This used to read operstate, which is "down" whenever
+ * the interface has no carrier -- i.e. every moment it is on but not joined to
+ * a network. Out of range of home, Wi-Fi read as off, and toggling it "on"
+ * restarted wpa_supplicant underneath whatever it was trying to join. */
 int st_wifi_on(void) {
-    FILE *f = fopen("/sys/class/net/wlan0/operstate", "r");
+    FILE *f = fopen("/sys/class/net/wlan0/flags", "r");
     if (!f) return 0;
-    char s[16] = "";
-    if (!fgets(s, sizeof(s), f)) s[0] = '\0';
+    unsigned flags = 0;
+    int ok = fscanf(f, "%x", &flags) == 1;
     fclose(f);
-    return strncmp(s, "down", 4) != 0;
+    return ok && (flags & IFF_UP);
+}
+
+/* Joined to a network (the radio link, not necessarily an address yet). */
+int st_wifi_carrier(void) {
+    FILE *f = fopen("/sys/class/net/wlan0/carrier", "r");
+    if (!f) return 0;
+    int c = 0;
+    if (fscanf(f, "%d", &c) != 1) c = 0;
+    fclose(f);
+    return c == 1;
+}
+
+int st_wifi_has_ip(void) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return 0;
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "wlan0");
+    ifr.ifr_addr.sa_family = AF_INET;
+    int ok = ioctl(fd, SIOCGIFADDR, &ifr) == 0 &&
+             ((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr.s_addr != 0;
+    close(fd);
+    return ok;
+}
+
+/* Asks for an address on whatever network wlan0 is joined to now. wifi_on.sh
+ * runs udhcpc with -q, which exits after its first lease, so joining a second
+ * network later -- leaving home and picking another one -- got no address at
+ * all. Same command line wifi_on.sh uses, restarted per join. */
+void st_wifi_dhcp(void) {
+    if (system("killall udhcpc >/dev/null 2>&1; "
+               "h=$(cat /usr/resource/hostname 2>/dev/null); "
+               "udhcpc -b -i wlan0 -q -x hostname:${h:-HiBy_Music} >/dev/null 2>&1 &") == -1) return;
 }
 
 /* No sysfs equivalent: rfkill reads unblocked whether the adapter is powered

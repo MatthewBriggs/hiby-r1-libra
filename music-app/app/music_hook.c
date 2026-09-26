@@ -328,6 +328,19 @@ static int bt_autoplay_pending;      /* set under bt_lock, cleared by the main l
 
 static void mlog(const char *fmt, ...);   /* defined below; used by R84's idle check */
 
+/* Wi-Fi and Bluetooth share the 2.4 GHz radio (and on the R1 one antenna), so
+ * network traffic during Bluetooth playback competes with the audio link.
+ * While music, a podcast or a book is playing over Bluetooth, the app starts
+ * no network work of its own: artwork and artist lookups are skipped (tried
+ * again the next time), and a feed sync or episode download waits until
+ * playback pauses. Radio is exempt -- the stream is the playback. Safe to call
+ * from worker threads. */
+static int radio_mode;
+static int net_held(void) {
+    return !radio_mode && audio_is_active() && !audio_is_paused() &&
+           !strcmp(audio_output(), "Bluetooth");
+}
+
 /* R84: turn WiFi off after 15 minutes with no traffic. Off by default, same
  * reasoning as bt_autoplay_enabled just above -- this changes radio state on
  * its own, which must be opted into.
@@ -1446,7 +1459,7 @@ static void *art_worker(void *arg) {
      * is remembered with one sentinel file so a real "no match anywhere"
      * doesn't retry (and re-hit both APIs) every single time the album is
      * opened. */
-    if (!bits && artist[0] && album[0] && st_net_up() &&
+    if (!bits && artist[0] && album[0] && st_net_up() && !net_held() &&
         (lastfm_has_key() || spotify_has_key())) {
         char dir[512], dest[560], nomatch[580];
         album_dir(track, dir, sizeof(dir));
@@ -1651,7 +1664,7 @@ static void *view_art_worker(void *arg) {
     /* Same Last.fm-then-Spotify network fallback art_worker() uses, kept
      * in sync deliberately -- an album can be viewed without ever being
      * played, and it deserves the same chance at a fetched cover. */
-    if (!bits && artist[0] && album[0] && st_net_up() &&
+    if (!bits && artist[0] && album[0] && st_net_up() && !net_held() &&
         (lastfm_has_key() || spotify_has_key())) {
         char dir[512], dest[560], nomatch[580];
         album_dir(track, dir, sizeof(dir));
@@ -1882,7 +1895,7 @@ static void *artist_art_worker(void *arg) {
 
     int need_jpg = !bits;
     int need_bio = !bio[0];
-    if ((need_jpg || need_bio) && artist[0] && st_net_up() &&
+    if ((need_jpg || need_bio) && artist[0] && st_net_up() && !net_held() &&
         (lastfm_has_key() || spotify_has_key())) {
         struct stat nm_st;
         if (stat(nomatch, &nm_st) != 0) {
@@ -3237,6 +3250,14 @@ static void radio_recording_delete(int i) {
 }
 
 static int        pod_list;
+/* A feed sync or episode download asked for while net_held(): started by the
+ * main loop once playback over Bluetooth pauses or stops. The download is
+ * remembered by feed and episode name, not just index, so a different feed
+ * opened in between can never start the wrong episode. */
+static int  pod_sync_deferred;
+static int  pod_dl_deferred_idx = -1;
+static char pod_dl_deferred_feed[POD_NAME_LEN];
+static char pod_dl_deferred_name[LIB_NAME_LEN];
 /* BG47: separate from ab_speed_permille on purpose -- persists across
  * episodes the same way ab_speed_permille persists across books, but a
  * podcast's chosen speed has no reason to leak into or be overwritten by
@@ -3629,8 +3650,10 @@ static void wifi_forget(const char *ssid) {
 /* Join an already-saved network without asking for its password again.
  * select_network (runtime only, no save_config) disables the others until
  * wifi_connect()'s enable_network all puts them back. */
+static int wifi_reenable_pending;
 static void wifi_select_saved(const char *ssid) {
     char cmd[64];
+    wifi_reenable_pending = 1;
     for (int i = 0; i < wifi_saved_n; i++) {
         if (strcmp(wifi_saved[i], ssid)) continue;
         snprintf(cmd, sizeof(cmd), "wpa_cli select_network %d >/dev/null 2>&1 &", wifi_saved_id[i]);
@@ -3674,6 +3697,26 @@ static void wifi_connect(const char *ssid, const char *password) {
     if (system(cmd) == -1) mlog("[music] wifi_connect: system() failed\n");
     wifi_save_credential(ssid, password);
     mlog("[music] wifi: connecting to %s\n", ssid);
+}
+
+/* DHCP for every join, not just the one wifi_on.sh saw: on a fresh join (the
+ * link coming up), or a link with no address that has waited long enough for
+ * the last request. Sysfs reads and one ioctl every two seconds; a fork only
+ * when there is something to ask for. */
+static void wifi_link_tick(void) {
+    static time_t last, last_dhcp;
+    static int was_up = -1;
+    time_t now = time(NULL);
+    if (now - last < 2) return;
+    last = now;
+    int up = st_wifi_on() && st_wifi_carrier();
+    if (was_up < 0) was_up = up;   /* already joined at start: wifi_on.sh has it */
+    if (up && (!was_up || (!st_wifi_has_ip() && now - last_dhcp >= 30))) {
+        st_wifi_dhcp();
+        last_dhcp = now;
+        mlog("[music] wifi: joined, asking for an address\n");
+    }
+    was_up = up;
 }
 
 /* Done was tapped -- hand the finished buffer to whichever purpose opened
@@ -4649,6 +4692,7 @@ static void pod_save_current_pos(void) {
  * an album. Resumes from pod_resume_lookup() when there is a saved position;
  * a POD_FINISHED episode restarts from 0, same as reaching the end of any
  * other track leaves nothing to resume into. */
+static void wave_track_changed(const char *path);
 static void pod_play_episode(int idx) {
     if (idx < 0 || idx >= pod_ep_n || !pod_eps[idx].downloaded) return;
     pod_save_current_pos();
@@ -4694,6 +4738,7 @@ static void pod_play_episode(int idx) {
     if (pod_speed_permille <= 0) pod_speed_permille = 1000;
     audio_set_speed(pod_speed_permille);
     audio_play(pod_eps[idx].path);
+    wave_track_changed(pod_eps[idx].path);
     art_request(pod_eps[idx].path, "", "", "");
     was_active = 1;
     if (resume > 0 && resume != POD_FINISHED) audio_seek_ms(resume);
@@ -4969,12 +5014,96 @@ static void draw_right_col_clip(uint16_t *fb, int y, const char *s, uint16_t col
  * from being dropped on one path and not the others. */
 #define QUEUE_MAX ((int)(sizeof(queue) / sizeof(queue[0])))
 
+/* R47: shuffle/repeat, music only -- audiobooks and podcasts have their own
+ * next/prev logic already (chapter rollover, the fixed +/-30s skip), and
+ * shuffling a book or looping one podcast episode forever isn't what either
+ * mode's own transport is for. */
+#define REPEAT_OFF 0
+#define REPEAT_ALL 1
+#define REPEAT_ONE 2
+static int shuffle_enabled;
+static int repeat_mode;
+static int shuffle_order[QUEUE_MAX];
+static int shuffle_n;    /* == queue_n while shuffle_order[] covers the queue */
+
+/* Fisher-Yates over [0, queue_n), then cur_track's entry is swapped to the
+ * front: toggling shuffle on mid-album must not itself jump to a different
+ * track, only randomize what comes after the one already playing. Called
+ * lazily (shuffle_n != queue_n) rather than at every queue change, so a
+ * shuffle that's off costs nothing. */
+static void shuffle_regenerate(void) {
+    shuffle_n = queue_n;
+    for (int i = 0; i < shuffle_n; i++) shuffle_order[i] = i;
+    for (int i = shuffle_n - 1; i > 0; i--) {
+        int j = rand() % (i + 1);
+        int t = shuffle_order[i]; shuffle_order[i] = shuffle_order[j]; shuffle_order[j] = t;
+    }
+    for (int i = 0; i < shuffle_n; i++) {
+        if (shuffle_order[i] == cur_track) {
+            int t = shuffle_order[0]; shuffle_order[0] = shuffle_order[i]; shuffle_order[i] = t;
+            break;
+        }
+    }
+}
+
+static int shuffle_find_pos(int idx) {
+    for (int i = 0; i < shuffle_n; i++) if (shuffle_order[i] == idx) return i;
+    return -1;
+}
+
+/* Whether the queue actually plays in shuffle_order[]. Playback (next/prev),
+ * the Queue screen and every mutation all ask this one question: the screen
+ * used to shuffle a podcast queue whenever shuffle was on while playback
+ * stepped through it in order. */
+static int queue_shuffled(void) {
+    return shuffle_enabled && !audiobook_mode && !podcast_mode && !radio_mode;
+}
+
+/* Where queue index i sits in what the listener hears. */
+static int queue_play_pos(int i) {
+    if (!queue_shuffled()) return i;
+    if (shuffle_n != queue_n) shuffle_regenerate();
+    return shuffle_find_pos(i);
+}
+
+/* Drops every queue entry whose keep[] is 0, preserving the order of the
+ * rest -- in queue[] and, when it covers the queue, in shuffle_order[], so a
+ * removal never reshuffles what is left. cur_track follows its track; it
+ * becomes -1 if that track was dropped. */
+static void queue_compact(const unsigned char *keep) {
+    int map[QUEUE_MAX];
+    int w = 0;
+    for (int r = 0; r < queue_n; r++) {
+        if (keep[r]) { map[r] = w; if (w != r) queue[w] = queue[r]; w++; }
+        else map[r] = -1;
+    }
+    if (shuffle_n == queue_n) {
+        int sw = 0;
+        for (int i = 0; i < shuffle_n; i++) {
+            int m = map[shuffle_order[i]];
+            if (m >= 0) shuffle_order[sw++] = m;
+        }
+        shuffle_n = sw;
+    } else {
+        shuffle_n = -1;
+    }
+    if (cur_track >= 0 && cur_track < queue_n) cur_track = map[cur_track];
+    queue_n = w;
+}
+
 static void queue_follower(void);
 
-/* Insert a track into the queue. at < 0 appends. If nothing is playing the
+/* Insert a track into the queue: straight after the playing track when
+ * `next`, otherwise at the end of the play order. If nothing is playing the
  * queue is started from this album first, so "add to queue" from a cold start
- * does something sensible rather than nothing. */
-static void queue_insert(int track_idx, int at) {
+ * does something sensible rather than nothing.
+ *
+ * Under shuffle the physical slot is irrelevant to what plays; the entry is
+ * spliced into shuffle_order[] itself (after the playing track, or last).
+ * Inserting used to leave shuffle_order[] a length behind, and the lazy
+ * regenerate then reshuffled the whole queue -- so Play Next did not play
+ * next, and everything already shown in the Queue screen moved. */
+static void queue_insert(int track_idx, int next) {
     if (track_idx < 0 || track_idx >= track_n) return;
     int cold = queue_n == 0;
     if (cold) {
@@ -4983,18 +5112,33 @@ static void queue_insert(int track_idx, int at) {
         q_is_playlist = browsing_is_playlist;
     }
     if (queue_n >= QUEUE_MAX) return;
-    if (at < 0 || at > queue_n) at = queue_n;
+    int has_cur = cur_track >= 0 && cur_track < queue_n;
+    int at = (next && has_cur) ? cur_track + 1 : queue_n;
+    int in_sync = shuffle_n == queue_n;
     memmove(&queue[at + 1], &queue[at],
             sizeof(queue[0]) * (size_t)(queue_n - at));
     queue[at] = tracks[track_idx];
+    if (in_sync) {
+        int spos = shuffle_n;
+        if (next && has_cur) {
+            int p = shuffle_find_pos(cur_track);
+            if (p >= 0) spos = p + 1;
+        }
+        for (int i = 0; i < shuffle_n; i++)
+            if (shuffle_order[i] >= at) shuffle_order[i]++;
+        memmove(&shuffle_order[spos + 1], &shuffle_order[spos],
+                sizeof(shuffle_order[0]) * (size_t)(shuffle_n - spos));
+        shuffle_order[spos] = at;
+        shuffle_n++;
+    }
     queue_n++;
+    if (!in_sync) shuffle_n = -1;
     /* R-qident: both Play Next and Add to queue land here, so this is the one
      * place that records where a queued track came from. Not for a cold
      * start (this track *is* the queue's base album) or a playlist (already
      * an arbitrary mix, nothing to name). */
     if (!cold && !q_is_playlist)
         qid_record(tracks[track_idx].path, cur_artist, cur_album);
-    if (at <= cur_track && queue_n > 1) cur_track++;   /* keep pointing at the same song */
     /* Reported live: "Add to queue" (not just Play Next) from a different
      * album while one was playing had the same wrong-album-page-on-swipe-
      * back problem BG73 fixed for Play Next -- queue_insert() is the one
@@ -5005,7 +5149,7 @@ static void queue_insert(int track_idx, int at) {
      * from the start, adding one more track to it isn't a new state. */
     if (!q_is_playlist) queue_mixed = 1;
     queue_follower();                                  /* what comes next may have changed */
-    mlog("[music] queued %s at %d\n", queue[at].name, at);
+    mlog("[music] queued %s at %d%s\n", queue[at].name, at, next ? " (next)" : "");
 }
 
 /* BG73: "Play next" specifically, as opposed to plain queue_insert()'s
@@ -5024,17 +5168,20 @@ static void queue_insert(int track_idx, int at) {
  * queue_insert() already does for everyone. */
 static void queue_play_next(int track_idx) {
     if (track_idx < 0 || track_idx >= track_n) return;
-    if (queue_n > 0 && !q_is_playlist && cur_track + 1 < queue_n) {
+    if (queue_n > 0 && !q_is_playlist && cur_track >= 0 && cur_track < queue_n) {
         /* Drop the old album's leftovers -- but not anything the user queued
          * themselves. R-qident: this used to be a bare `queue_n = cur_track
          * + 1`, which threw away every track after the current one,
          * including an earlier Play Next / Add to queue: queueing a second
          * track quietly deleted the first. Tracks in the qid registry are
-         * exactly the user's own picks, so those are what survives. */
-        int w = cur_track + 1;
-        for (int r = cur_track + 1; r < queue_n; r++)
-            if (qid_find(queue[r].path) >= 0) queue[w++] = queue[r];
-        queue_n = w;
+         * exactly the user's own picks, so those are what survives.
+         * "Leftover" is judged by play order, not array order: under shuffle
+         * the array tail is not what was about to play. */
+        int cur_pos = queue_play_pos(cur_track);
+        unsigned char keep[QUEUE_MAX];
+        for (int r = 0; r < queue_n; r++)
+            keep[r] = queue_play_pos(r) <= cur_pos || qid_find(queue[r].path) >= 0;
+        queue_compact(keep);
         /* queue_mixed is set below, inside queue_insert() -- true either
          * way once this truncation has happened, so no need to duplicate
          * it here. */
@@ -5049,7 +5196,7 @@ static void queue_play_next(int track_idx) {
     }
     /* BG85's deferred identity is recorded inside queue_insert() now (R-qident)
      * -- Add to queue needed it too. */
-    queue_insert(track_idx, cur_track + 1);
+    queue_insert(track_idx, 1);
 }
 
 /* Whether queueing what's currently being *browsed* into the queue that's
@@ -5262,43 +5409,6 @@ static int play_station(int i) {
     return started;
 }
 
-/* R47: shuffle/repeat, music only -- audiobooks and podcasts have their own
- * next/prev logic already (chapter rollover, the fixed +/-30s skip), and
- * shuffling a book or looping one podcast episode forever isn't what either
- * mode's own transport is for. */
-#define REPEAT_OFF 0
-#define REPEAT_ALL 1
-#define REPEAT_ONE 2
-static int shuffle_enabled;
-static int repeat_mode;
-static int shuffle_order[QUEUE_MAX];
-static int shuffle_n;    /* == queue_n as of the last regenerate() */
-
-/* Fisher-Yates over [0, queue_n), then cur_track's entry is swapped to the
- * front: toggling shuffle on mid-album must not itself jump to a different
- * track, only randomize what comes after the one already playing. Called
- * lazily (shuffle_n != queue_n) rather than at every queue change, so a
- * shuffle that's off costs nothing. */
-static void shuffle_regenerate(void) {
-    shuffle_n = queue_n;
-    for (int i = 0; i < shuffle_n; i++) shuffle_order[i] = i;
-    for (int i = shuffle_n - 1; i > 0; i--) {
-        int j = rand() % (i + 1);
-        int t = shuffle_order[i]; shuffle_order[i] = shuffle_order[j]; shuffle_order[j] = t;
-    }
-    for (int i = 0; i < shuffle_n; i++) {
-        if (shuffle_order[i] == cur_track) {
-            int t = shuffle_order[0]; shuffle_order[0] = shuffle_order[i]; shuffle_order[i] = t;
-            break;
-        }
-    }
-}
-
-static int shuffle_find_pos(int idx) {
-    for (int i = 0; i < shuffle_n; i++) if (shuffle_order[i] == idx) return i;
-    return -1;
-}
-
 /* R70: moves the track at display position `from` to display position `to`,
  * shifting whatever's between them -- shuffle_order[] when shuffle's on
  * (same branch queue_display_index() below uses, so this always reorders
@@ -5310,7 +5420,7 @@ static int shuffle_find_pos(int idx) {
  * plays the wrong track outright rather than just displaying one. */
 static void queue_move_display(int from, int to) {
     if (from == to || from < 0 || to < 0 || from >= queue_n || to >= queue_n) return;
-    if (shuffle_enabled) {
+    if (queue_shuffled()) {
         if (shuffle_n != queue_n) shuffle_regenerate();
         int v = shuffle_order[from];
         if (from < to) for (int i = from; i < to; i++) shuffle_order[i] = shuffle_order[i + 1];
@@ -5358,7 +5468,7 @@ static int next_index_after(int from) {
      * ab_play_chapter's own comment describes). */
     if (!audiobook_mode && !podcast_mode && !radio_mode) {
         if (repeat_mode == REPEAT_ONE) return from;
-        if (shuffle_enabled) {
+        if (queue_shuffled()) {
             if (shuffle_n != queue_n) shuffle_regenerate();
             int pos = shuffle_find_pos(from);
             if (pos < 0) return -1;
@@ -5379,7 +5489,7 @@ static int next_track_index(void) { return next_index_after(cur_track); }
 
 static int prev_track_index(void) {
     if (queue_n == 0) return -1;
-    if (!audiobook_mode && !podcast_mode && !radio_mode && shuffle_enabled) {
+    if (queue_shuffled()) {
         if (shuffle_n != queue_n) shuffle_regenerate();
         int pos = shuffle_find_pos(cur_track);
         if (pos < 0) return -1;
@@ -5403,7 +5513,7 @@ static int prev_track_index(void) {
  * does, so opening the queue view right after toggling shuffle still
  * reflects it correctly. */
 static int queue_display_index(int display_i) {
-    if (shuffle_enabled) {
+    if (queue_shuffled()) {
         if (shuffle_n != queue_n) shuffle_regenerate();
         if (display_i >= 0 && display_i < shuffle_n) return shuffle_order[display_i];
         return -1;
@@ -5440,13 +5550,11 @@ static void queue_remove_display(int display_i) {
     int idx = queue_display_index(display_i);
     if (idx < 0) return;
     int removing_playing = audio_is_active() && idx == cur_track;
-    char keep_path[LIB_PATH_LEN];
-    keep_path[0] = '\0';
-    if (!removing_playing && cur_track >= 0 && cur_track < queue_n)
-        snprintf(keep_path, sizeof(keep_path), "%s", queue[cur_track].path);
-
-    for (int i = idx; i < queue_n - 1; i++) queue[i] = queue[i + 1];
-    queue_n--;
+    int old_cur = cur_track;
+    unsigned char keep[QUEUE_MAX];
+    memset(keep, 1, (size_t)queue_n);
+    keep[idx] = 0;
+    queue_compact(keep);
 
     if (removing_playing) {
         if (queue_n == 0) {
@@ -5458,14 +5566,19 @@ static void queue_remove_display(int display_i) {
             if (new_idx < 0 || new_idx >= queue_n) new_idx = 0;
             play_index(new_idx);
         }
-    } else if (keep_path[0]) {
-        for (int i = 0; i < queue_n; i++)
-            if (!strcmp(queue[i].path, keep_path)) { cur_track = i; break; }
+    } else {
+        if (cur_track < 0 && queue_n > 0)   /* the paused track itself went */
+            cur_track = old_cur < queue_n ? old_cur : queue_n - 1;
+        /* The worker may be holding the removed track as its gapless
+         * follower -- it was, whenever the row removed was the next one --
+         * and would have rolled straight into it at the boundary while the
+         * screen showed the track after. */
+        queue_follower();
     }
 }
 
-/* R29: waveform seek bar, Music only (per its own backlog entry --
- * audiobooks/podcasts explicitly excluded). The shape itself comes from
+/* R29: waveform seek bar, for music and podcast episodes (audiobooks are
+ * excluded). The shape itself comes from
  * waveform.c: a background decode of the file at idle priority, kept in one
  * cache file on the card. It used to be sampled from the live output instead,
  * which meant nothing on a track's first play, nothing after any seek or skip
@@ -5507,7 +5620,7 @@ static void wave_track_changed(const char *path) {
      * wanted. The poll re-arms both as soon as this track's own shape is
      * settled. */
     waveform_prefetch("", "");
-    if (!podcast_mode && path && path[0]) {
+    if (path && path[0]) {
         snprintf(wave_path, sizeof(wave_path), "%s", path);
         wave_loaded = waveform_get(wave_path, wave_buckets);
     } else {
@@ -5577,6 +5690,7 @@ static void play_from_list(int idx) {
     if (idx < 0 || idx >= track_n) return;
     memcpy(queue, tracks, sizeof(queue[0]) * (size_t)track_n);
     queue_n = track_n;
+    shuffle_n = -1;   /* same length as the last queue is not the same queue */
     snprintf(q_artist, sizeof(q_artist), "%s", cur_artist);
     snprintf(q_album,  sizeof(q_album),  "%s", cur_album);
     q_is_playlist = browsing_is_playlist;    /* BG73 */
@@ -5928,7 +6042,7 @@ static int np_chrome_themed(void) { return cover_palette_enabled && !audiobook_m
  * the browsed album's palette (np_view_*) on an album page, the playing
  * track's on Now Playing, and plain on every other screen -- those are the
  * only two pages painted from cover art. */
-static int qc_on_album_page(void) { return screen == SC_TRACKS && !ab_list && !pod_list; }
+static int qc_on_album_page(void) { return screen == SC_TRACKS && !ab_list; }   /* album or podcast page */
 static int qc_popup_themed(void) {
     return qc_on_album_page() ? (cover_palette_enabled && np_view_palette_valid)
                               : (np_chrome_themed() && screen == SC_PLAYING);
@@ -6624,8 +6738,13 @@ static void draw_speaker(uint16_t *fb, int x, int y, uint16_t c) {
 /* Volume on the left, battery on the right — the same split every other
  * screen uses for its own left margin vs. right-aligned action, rather than
  * both clusters crowded together on one side. */
+/* Set per frame by draw_screen(): the podcast episode page is painted from
+ * its feed's cover, so the status strip above it follows. */
+static int g_pod_theme;
+
 static void draw_status(uint16_t *fb) {
     char buf[16];
+    uint16_t sdim = g_pod_theme ? np_view_col_dim() : COL_DIM;
     /* One shared centre line. Everything here is positioned from it rather
      * than from its own top edge, which is what left the speaker sitting
      * above the digits next to it. */
@@ -6637,7 +6756,7 @@ static void draw_status(uint16_t *fb) {
     int vol = audio_volume();
     const icon_t *vic = vol <= 0 ? &icon_vol_mute : vol < 34 ? &icon_vol_low
                        : vol < 67 ? &icon_vol_mid  : &icon_vol_high;
-    draw_icon(fb, FB_W, FB_H, 24, mid - vic->h / 2, vic, COL_DIM);
+    draw_icon(fb, FB_W, FB_H, 24, mid - vic->h / 2, vic, sdim);
     /* R95 follow-up: current/total steps for every output -- explicit
      * correction after the first cut only changed this on Bluetooth. */
     {
@@ -6646,7 +6765,7 @@ static void draw_status(uint16_t *fb) {
         if (cur < 0) cur = 0; if (cur > steps) cur = steps;
         snprintf(buf, sizeof(buf), "%d/%d", cur, steps);
     }
-    draw_text(fb, 24 + 26, ty, buf, COL_DIM, TEXT_PX_SMALL, FB_W - 24 - 26);
+    draw_text(fb, 24 + 26, ty, buf, sdim, TEXT_PX_SMALL, FB_W - 24 - 26);
 
     int pct = st_battery_pct();
     int bx = FB_W - 18 - 28;
@@ -6654,10 +6773,10 @@ static void draw_status(uint16_t *fb) {
     if (pct >= 0) {
         snprintf(buf, sizeof(buf), "%d%%", pct);
         int tw = text_width(buf, TEXT_PX_SMALL);
-        draw_text(fb, bx - 8 - tw, ty, buf, COL_DIM, TEXT_PX_SMALL, FB_W);
+        draw_text(fb, bx - 8 - tw, ty, buf, sdim, TEXT_PX_SMALL, FB_W);
     }
 
-    fill_rect(fb, 0, STATUS_H - 1, FB_W, 1, COL_LINE);
+    fill_rect(fb, 0, STATUS_H - 1, FB_W, 1, g_pod_theme ? np_view_col_line() : COL_LINE);
 }
 
 /* Word-wrapped, scrollable show notes -- drawn in place of the cover art
@@ -6868,11 +6987,29 @@ static void draw_screen(uint16_t *fb) {
      * own comment, which makes view_compute_cover_palette() fall back to
      * plain colours there on its own, no separate exclusion needed here). */
     int np_view_album = screen == SC_TRACKS && !ab_list && !pod_list;
-    if (cover_palette_enabled && np_view_album)
+    /* A podcast's episode page takes its palette from the feed's artwork, via
+     * the same view-art path an album page uses. The cover comes from the
+     * first downloaded episode, the same file art_request() reads for
+     * playback; re-requested only when the feed changes. */
+    static char pod_view_feed[POD_NAME_LEN];
+    int pod_view = screen == SC_TRACKS && pod_list && !ab_list;
+    if (!pod_view) {
+        pod_view_feed[0] = '\0';
+    } else if (cover_palette_enabled && strcmp(pod_view_feed, cur_feed) != 0) {
+        snprintf(pod_view_feed, sizeof(pod_view_feed), "%s", cur_feed);
+        const char *ep = "";
+        for (int i = 0; i < pod_ep_n; i++)
+            if (pod_eps[i].downloaded && pod_eps[i].path[0]) { ep = pod_eps[i].path; break; }
+        if (ep[0]) view_art_request(ep, "", cur_feed);
+        else       view_art_clear();
+    }
+    if (cover_palette_enabled && (np_view_album || pod_view))
         view_compute_cover_palette();
+    int pod_th = pod_view && cover_palette_enabled && np_view_palette_valid;
+    g_pod_theme = pod_th;
     fill_rect(fb, 0, 0, FB_W, FB_H,
               (screen == SC_PLAYING && !audiobook_mode) ? np_col_bg() :
-              np_view_album ? np_view_col_bg() : COL_BG);
+              (np_view_album || pod_th) ? np_view_col_bg() : COL_BG);
     /* The player has no title bar at all: a strip saying "Now playing" over a
      * screen showing the track, the artist and the artwork was telling you
      * what you could already see, and it was 62px that the artwork wanted.
@@ -6887,7 +7024,7 @@ static void draw_screen(uint16_t *fb) {
      * edge-to-edge from y=0, and there's no room left for either. Back is
      * the swipe gesture everywhere else already relies on. */
     if (screen != SC_PLAYING && screen != SC_ARTIST_PAGE && !(screen == SC_TRACKS && !ab_list && !pod_list)) {
-        fill_rect(fb, 0, 0, FB_W, CONTENT_Y, COL_HEADER);
+        fill_rect(fb, 0, 0, FB_W, CONTENT_Y, pod_th ? np_view_col_bg() : COL_HEADER);
     }
 
     const char *title = "Home";   /* R80: renamed from "Main Menu" */
@@ -6955,8 +7092,8 @@ static void draw_screen(uint16_t *fb) {
         g_header_show_back = show_back;
         int title_x = show_back ? BACK_ARROW_X + BACK_ARROW_W + 14 : 18;
         if (show_back)
-            draw_back_arrow(fb, BACK_ARROW_X, STATUS_H + 14 + TEXT_PX_TITLE / 2, COL_ACCENT);
-        draw_text(fb, title_x, STATUS_H + 14, title, COL_TEXT, TEXT_PX_TITLE, FB_W - 40 - (title_x - 18));
+            draw_back_arrow(fb, BACK_ARROW_X, STATUS_H + 14 + TEXT_PX_TITLE / 2, pod_th ? np_view_col_accent() : COL_ACCENT);
+        draw_text(fb, title_x, STATUS_H + 14, title, pod_th ? np_view_col_fg() : COL_TEXT, TEXT_PX_TITLE, FB_W - 40 - (title_x - 18));
         /* MSEB's one extra header action: zero every band back to 0 dB.
          * Doesn't touch Enabled -- "reset" clears the tuning, not the
          * on/off state, which the user didn't ask to lose. */
@@ -6978,12 +7115,13 @@ static void draw_screen(uint16_t *fb) {
          * uses while already running, rather than a tap that silently does
          * nothing with no indication why. */
         if (screen == SC_QUEUE) {
-            int has_more = cur_track >= 0 && cur_track + 1 < queue_n;
+            int has_more = cur_track >= 0 && cur_track < queue_n &&
+                           next_track_index() >= 0 && next_track_index() != cur_track;
             draw_text(fb, queue_clear_x(), STATUS_H + 20, "Clear",
                       has_more ? COL_ACCENT : COL_DIM, TEXT_PX_SMALL, FB_W);
         }
         draw_status(fb);
-        fill_rect(fb, 0, CONTENT_Y - 1, FB_W, 1, COL_LINE);
+        fill_rect(fb, 0, CONTENT_Y - 1, FB_W, 1, pod_th ? np_view_col_line() : COL_LINE);
     }
 
     /* Rows draw at fixed positions and never shift for scroll_px: a page
@@ -8179,6 +8317,12 @@ static void draw_screen(uint16_t *fb) {
     }
 
     if (screen == SC_TRACKS) {
+        uint16_t pc_text = pod_th ? np_view_col_fg()     : COL_TEXT;
+        uint16_t pc_dim  = pod_th ? np_view_col_dim()    : COL_DIM;
+        uint16_t pc_acc  = pod_th ? np_view_col_accent() : COL_ACCENT;
+        uint16_t pc_line = pod_th ? np_view_col_line()   : COL_LINE;
+        uint16_t pc_row  = pod_th ? np_blend(np_view_bg, np_view_fg, 0.12f) : COL_ROW;
+        uint16_t pc_bg   = pod_th ? np_view_col_bg()     : COL_BG;
         /* R36: mark disc boundaries in a multi-disc album -- ab_list/pod_list
          * rows all carry disc == -1 (audiobook.c/podcast.c never set it), so
          * they normalise to the same value and multi_disc is always false
@@ -8217,10 +8361,10 @@ static void draw_screen(uint16_t *fb) {
             int swiping_this = pod_list && pod_swipe_active && idx == pod_swipe_idx;
             int dx0 = swiping_this ? pod_swipe_dx : 0;
             if (swiping_this)
-                fill_rect_clip(fb, 0, y, FB_W, ROW_H, COL_ACCENT, CONTENT_Y, clip_bot);
+                fill_rect_clip(fb, 0, y, FB_W, ROW_H, pc_acc, CONTENT_Y, clip_bot);
             if (playing && !swiping_this) {
-                fill_rect_clip(fb, 0, y, FB_W, ROW_H, COL_ROW, CONTENT_Y, clip_bot);
-                fill_rect_clip(fb, 0, y, 4, ROW_H, COL_ACCENT, CONTENT_Y, clip_bot);
+                fill_rect_clip(fb, 0, y, FB_W, ROW_H, pc_row, CONTENT_Y, clip_bot);
+                fill_rect_clip(fb, 0, y, 4, ROW_H, pc_acc, CONTENT_Y, clip_bot);
             }
             /* The number the file states. Blank rather than a dash when the
              * file does not say, which is rare now it is read from tags. */
@@ -8237,11 +8381,11 @@ static void draw_screen(uint16_t *fb) {
                 snprintf(discbuf, sizeof(discbuf), "%d", disc);
                 /* right_edge is an absolute clip x, not a width -- 40, not
                  * 20, so the disc digit itself has room to draw. */
-                draw_text_clip(fb, 20, y + 22, discbuf, COL_ACCENT, TEXT_PX_SMALL, 40, CONTENT_Y, clip_bot);
+                draw_text_clip(fb, 20, y + 22, discbuf, pc_acc, TEXT_PX_SMALL, 40, CONTENT_Y, clip_bot);
             }
             if (t->track > 0) snprintf(buf, sizeof(buf), "%d", t->track);
             else              buf[0] = '\0';
-            draw_text_clip(fb, track_x, y + 22, buf, COL_DIM, TEXT_PX_SMALL,
+            draw_text_clip(fb, track_x, y + 22, buf, pc_dim, TEXT_PX_SMALL,
                           track_x + 36, CONTENT_Y, clip_bot);
             /* FB_W - 110, matching every other row in this file that reserves
              * space for a short right-aligned figure (album/track counts):
@@ -8255,9 +8399,9 @@ static void draw_screen(uint16_t *fb) {
              * this app, so the list reads at a glance which rows play and
              * which only start a download. */
             draw_text_clip(fb, 68 + dx0, y + 20, t->name,
-                          playing ? COL_ACCENT
-                          : (pod_list && !pod_eps[idx].downloaded) ? COL_DIM
-                          : COL_TEXT,
+                          playing ? pc_acc
+                          : (pod_list && !pod_eps[idx].downloaded) ? pc_dim
+                          : pc_text,
                           TEXT_PX_BODY, FB_W - 110,
                           CONTENT_Y, clip_bot);
             /* pod_list: an episode not yet downloaded has no duration to
@@ -8278,6 +8422,8 @@ static void draw_screen(uint16_t *fb) {
                         snprintf(buf, sizeof(buf), "%ld%%", got * 100 / tot);
                     else
                         snprintf(buf, sizeof(buf), "%ld KB", got / 1024);
+                } else if (pod_dl_deferred_idx == idx && !strcmp(cur_feed, pod_dl_deferred_feed)) {
+                    snprintf(buf, sizeof(buf), "Waiting");
                 } else {
                     snprintf(buf, sizeof(buf), "Download");
                 }
@@ -8287,14 +8433,14 @@ static void draw_screen(uint16_t *fb) {
                 if (dx0) {
                     int bw = text_width(buf, TEXT_PX_SMALL);
                     int right = FB_W - 24 - (index_visible() ? INDEX_W : 0);
-                    draw_text_clip(fb, right - bw + dx0, y + 22, buf, COL_DIM,
+                    draw_text_clip(fb, right - bw + dx0, y + 22, buf, pc_dim,
                                    TEXT_PX_SMALL, FB_W, CONTENT_Y, clip_bot);
                 } else {
                     draw_right_clip(fb, y + 22, buf, CONTENT_Y, clip_bot);
                 }
             }
             if (!swiping_this)
-                fill_rect_clip(fb, 0, y + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
+                fill_rect_clip(fb, 0, y + ROW_H - 1, FB_W, 1, pc_line, CONTENT_Y, clip_bot);
             y += ROW_H;
         }
         /* The `!mini_visible()` gate this used to carry made every action-sheet
@@ -8317,8 +8463,8 @@ static void draw_screen(uint16_t *fb) {
          * a trade worth making. */
         if (sheet_note[0]) {
             int ny = FB_H - 34 - (mini_visible() ? MINI_H : 0);
-            fill_rect(fb, 0, ny - 12, FB_W, 40, COL_BG);
-            draw_text(fb, 24, ny, sheet_note, COL_ACCENT, TEXT_PX_SMALL, FB_W - 48);
+            fill_rect(fb, 0, ny - 12, FB_W, 40, pc_bg);
+            draw_text(fb, 24, ny, sheet_note, pc_acc, TEXT_PX_SMALL, FB_W - 48);
         } else if (track_n > 0 && !mini_visible() && !ab_list && !pod_list) {
             /* Chapters (audiobook_mode) reuses this screen but never the SQL
              * index -- t->format/bits/rate are never populated for them (see
@@ -8327,13 +8473,14 @@ static void draw_screen(uint16_t *fb) {
             lib_track_t *t = &tracks[0];
             snprintf(buf, sizeof(buf), "%s  %d/%g kHz",
                      track_format_name(t), t->bits, t->rate / 1000.0);
-            draw_text(fb, 24, FB_H - 34, buf, COL_ACCENT, TEXT_PX_SMALL, FB_W - 24);
+            draw_text(fb, 24, FB_H - 34, buf, pc_acc, TEXT_PX_SMALL, FB_W - 24);
         }
         return;
     }
 
     if (screen == SC_POD_SYNC) {
-        draw_text(fb, 24, y + 6, pod_update_running() ? "Syncing every feed..."
+        draw_text(fb, 24, y + 6, pod_sync_deferred ? "Waits until Bluetooth playback pauses"
+                                : pod_update_running() ? "Syncing every feed..."
                                 : pod_update_died()    ? "Sync stopped early."
                                                         : "Sync finished.",
                   pod_update_died() ? RGB(230, 80, 70) : COL_DIM, TEXT_PX_BODY, FB_W - 48);
@@ -8344,7 +8491,7 @@ static void draw_screen(uint16_t *fb) {
                            FB_W - 48, CONTENT_Y, clip_bot);
             y += 40;
         }
-        if (pod_sync_log_n == 0)
+        if (pod_sync_log_n == 0 && !pod_sync_deferred)
             draw_text(fb, 24, y + 14, "Starting...", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
         return;
     }
@@ -8808,10 +8955,14 @@ static void draw_screen(uint16_t *fb) {
         ry += ROW_H;
         fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
 
-        char nm[64] = "";
-        if (on) st_wifi_ssid(nm, sizeof(nm));
+        char nm[64] = "", stline[96];
+        if (on && st_wifi_carrier()) st_wifi_ssid(nm, sizeof(nm));
+        if (!on)                   snprintf(stline, sizeof(stline), "off");
+        else if (!nm[0])           snprintf(stline, sizeof(stline), "on, not connected");
+        else if (!st_wifi_has_ip()) snprintf(stline, sizeof(stline), "%s, getting an address", nm);
+        else                       snprintf(stline, sizeof(stline), "%s", nm);
         draw_text_clip(fb, 24, ry + 20, "Status", COL_TEXT, TEXT_PX_BODY, FB_W - 24, CONTENT_Y, clip_bot);
-        draw_text_clip(fb, 24, ry + 46, on ? (nm[0] ? nm : "not connected") : "off",
+        draw_text_clip(fb, 24, ry + 46, stline,
                       COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
         ry += ROW_H;
         fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
@@ -9113,11 +9264,14 @@ static void draw_screen(uint16_t *fb) {
  * the finger as a delete swipe, because each list's own latch only asked "is
  * horizontal travel leading vertical?" -- exactly what the edge swipe is
  * too. Blocked for the whole gesture once edge_active has latched, and from
- * the start for a rightward drag beginning inside EDGE_ZONE (the zone
- * edge_active itself is decided from), so there is no window where the row
- * latches first. Leftward drags from the same zone stay valid row swipes --
- * that's not a back gesture. One definition shared by every list. */
-#define ROW_SWIPE_BLOCKED (edge_active || (touch_x < EDGE_ZONE && live_x > touch_x))
+ * the start for any drag beginning inside EDGE_ZONE (the zone edge_active
+ * itself is decided from). Leftward drags used to stay valid row swipes, but a
+ * back swipe often opens with a small leftward wobble from the bezel; that
+ * latched the row as a leftward swipe, and the rightward travel that followed
+ * then read as a +120px delete. A leftward drag from inside the zone can never
+ * reach the -120px delete distance anyway. One definition shared by every
+ * list. */
+#define ROW_SWIPE_BLOCKED (edge_active || touch_x < EDGE_ZONE)
 #define EDGE_TRAVEL 60
 #define HOLD_MS     550
 /* R80: deliberately much narrower than EDGE_ZONE -- a normal scroll to the
@@ -12323,23 +12477,52 @@ int music_entry(void *a0, void *a1) {
                 }
                 audio_set_next(ab_next_file(cur_track));
             } else if (adv > 0) {
-                /* R47: steps through next_track_index() rather than a bare
-                 * cur_track++, so cur_track ends up wherever queue_follower()
-                 * actually told the worker to roll into -- shuffle order or
-                 * a repeat-all wrap, not just "the next slot." */
+                /* Follow the track the worker actually rolled into, found by
+                 * path -- not re-derived by stepping next_track_index(). The
+                 * step answers from the queue as it is *now*; the worker rolled
+                 * into whatever queue_follower() last handed it. Any queue
+                 * change that missed refreshing it (a removal did, until now)
+                 * made the two disagree, and the screen named one track while
+                 * another played. Prefers the expected step, so a track queued
+                 * twice resolves to the right copy. */
+                char rolled[LIB_PATH_LEN];
+                audio_current_path(rolled, sizeof(rolled));
+                int land = cur_track;
                 for (int i = 0; i < adv; i++) {
-                    int nxt = next_track_index();
+                    int nxt = next_index_after(land);
                     if (nxt < 0) break;
-                    cur_track = nxt;
+                    land = nxt;
+                }
+                int found = -1;
+                if (land >= 0 && land < queue_n && !strcmp(queue[land].path, rolled)) {
+                    found = land;
+                } else {
+                    for (int k = 1; k <= queue_n && found < 0; k++) {
+                        int i = (cur_track + k) % queue_n;
+                        if (i >= 0 && !strcmp(queue[i].path, rolled)) found = i;
+                    }
+                }
+                if (found >= 0) {
+                    if (found != land)
+                        mlog("[music] advance: worker rolled into %s, queue expected index %d\n",
+                             rolled, land);
+                    cur_track = found;
                     queue_apply_pending();   /* BG85 -- before art_request() reads q_album */
                     wave_track_changed(queue[cur_track].path);
                     art_request(queue[cur_track].path,
                                 queue[cur_track].artist[0] ? queue[cur_track].artist : q_artist,
                                 q_album, q_artist);
                     mlog("[music] rolled into %s\n", queue[cur_track].name);
-                    dirty = 1;
+                    queue_follower();
+                } else {
+                    /* Rolled into something no longer in the queue: put the
+                     * audio back in line with what the screen says is next. */
+                    mlog("[music] advance: %s is not in the queue, restarting at the queue's next\n", rolled);
+                    int nxt = next_track_index();
+                    if (nxt >= 0) play_index(nxt);
+                    else audio_stop();
                 }
-                queue_follower();
+                dirty = 1;
             }
             if (ab_follow()) dirty = 1;
         }
@@ -12673,7 +12856,7 @@ int music_entry(void *a0, void *a1) {
                              audiobook_mode ? "An audiobook"
                                             : podcast_mode ? "A podcast" : "Music");
                 } else {
-                    queue_insert(sheet_track, -1);
+                    queue_insert(sheet_track, 0);
                     snprintf(sheet_note, sizeof(sheet_note), "Added to queue");
                 }
                 sheet_open = 0;
@@ -12923,7 +13106,11 @@ int music_entry(void *a0, void *a1) {
                     eq_set_mseb(mseb_on, mseb_gain);
                     mseb_save(mseb_gain, mseb_on);
                 } else if (screen == SC_PODCASTS && x >= pod_sync_x() - 16 && x < header_back_x() - 16) {
-                    if (!pod_update_running()) { pod_update_start(); pod_sync_log_n = 0; }
+                    if (!pod_update_running()) {
+                        pod_sync_log_n = 0;
+                        if (net_held()) pod_sync_deferred = 1;
+                        else            pod_update_start();
+                    }
                     screen = SC_POD_SYNC; reset_scroll();
                 } else if (screen == SC_QUEUE && x >= queue_clear_x() - 16 && x < header_back_x() - 16) {
                     /* R52: drop everything queued after the currently-
@@ -12933,8 +13120,12 @@ int music_entry(void *a0, void *a1) {
                      * does. No confirmation step: unlike deleting a
                      * playlist or a file, nothing here is lost for good --
                      * queuing more is one "Play next"/"Add to queue" away. */
-                    if (cur_track >= 0 && cur_track + 1 < queue_n) {
-                        queue_n = cur_track + 1;
+                    if (cur_track >= 0 && cur_track < queue_n && next_track_index() >= 0 &&
+                        next_track_index() != cur_track) {
+                        int cur_pos = queue_play_pos(cur_track);
+                        unsigned char keep[QUEUE_MAX];
+                        for (int r = 0; r < queue_n; r++) keep[r] = queue_play_pos(r) <= cur_pos;
+                        queue_compact(keep);
                         /* Reported live: swiping back afterward showed a
                          * mangled "album" page -- the real album, but
                          * missing every track Clear had just dropped. Same
@@ -13551,7 +13742,14 @@ int music_entry(void *a0, void *a1) {
                         if (pod_eps[pi].downloaded) {
                             play_request(RECQ_EPISODE, pi);
                         } else if (!pod_download_active()) {
-                            pod_download_start(pi);
+                            if (net_held()) {
+                                pod_dl_deferred_idx = pi;
+                                snprintf(pod_dl_deferred_feed, sizeof(pod_dl_deferred_feed), "%s", cur_feed);
+                                snprintf(pod_dl_deferred_name, sizeof(pod_dl_deferred_name), "%s", pod_eps[pi].name);
+                                snprintf(sheet_note, sizeof(sheet_note), "Downloads when Bluetooth playback pauses");
+                            } else {
+                                pod_download_start(pi);
+                            }
                         }
                     } else if (ab_list) {
                         /* This list is the book's chapters. */
@@ -13868,12 +14066,24 @@ int music_entry(void *a0, void *a1) {
         if (wifi_connecting_ssid[0]) {
             char nm[64] = "";
             if (st_wifi_on()) st_wifi_ssid(nm, sizeof(nm));
-            if ((nm[0] && !strcmp(nm, wifi_connecting_ssid)) ||
-                time(NULL) - wifi_connecting_since > WIFI_CONNECT_TIMEOUT_SEC)
+            int joined = nm[0] && !strcmp(nm, wifi_connecting_ssid);
+            if (joined || time(NULL) - wifi_connecting_since > WIFI_CONNECT_TIMEOUT_SEC) {
                 wifi_connecting_ssid[0] = '\0';
-            else if (screen == SC_SETTINGS_WIFI)
+                /* Straight from one network to another the link may never
+                 * visibly drop, leaving the old network's address in place. */
+                if (joined) st_wifi_dhcp();
+                /* select_network left every other saved network disabled
+                 * for the session, so leaving this one's range would never
+                 * fall back to them. Runtime only -- nothing is saved. */
+                if (wifi_reenable_pending) {
+                    wifi_reenable_pending = 0;
+                    if (system("wpa_cli -i wlan0 enable_network all >/dev/null 2>&1 &") == -1)
+                        mlog("[music] wifi: enable_network all failed\n");
+                }
+            } else if (screen == SC_SETTINGS_WIFI)
                 dirty = 1;
         }
+        wifi_link_tick();
 
         /* Podcast downloads and whole-feed syncs both run as detached child
          * processes (see podcast.c) -- polled and reaped every tick, cheap
@@ -13899,6 +14109,23 @@ int music_entry(void *a0, void *a1) {
          * consumed its own "__DONE__" (and cleared the flag itself) by the
          * time reap looks, leaving reap to flag only a genuine early exit --
          * one that ended without ever writing that line. */
+        if ((pod_sync_deferred || pod_dl_deferred_idx >= 0) && !net_held()) {
+            if (pod_sync_deferred && !pod_update_running()) {
+                pod_sync_deferred = 0;
+                pod_update_start();
+                mlog("[music] starting the feed sync held for Bluetooth playback\n");
+            }
+            if (pod_dl_deferred_idx >= 0 && !pod_download_active()) {
+                int i = pod_dl_deferred_idx;
+                pod_dl_deferred_idx = -1;
+                if (!strcmp(cur_feed, pod_dl_deferred_feed) && i < pod_ep_n &&
+                    !strcmp(pod_eps[i].name, pod_dl_deferred_name) && !pod_eps[i].downloaded) {
+                    pod_download_start(i);
+                    mlog("[music] starting the download held for Bluetooth playback: %s\n", pod_eps[i].name);
+                }
+            }
+            dirty = 1;
+        }
         if (pod_update_running()) {
             pod_sync_log_n = pod_update_tail(pod_sync_log, POD_SYNC_LOG_N);
             if (!pod_update_running() && (screen == SC_PODCASTS || screen == SC_POD_SYNC)) {

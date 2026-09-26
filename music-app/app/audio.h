@@ -1,6 +1,7 @@
 /* audio.h — playback. Decoders are dlopen'd from the device; see audio.c. */
 #ifndef AUDIO_H
 #define AUDIO_H
+#include <stddef.h>
 #include <stdint.h>
 int  audio_play(const char *path);
 /* Same end result as audio_play(), but hands the new track to the running
@@ -49,6 +50,8 @@ int  audio_speed(void);
  * the UI can follow along and queue the one after. */
 void audio_set_next(const char *path);
 int  audio_take_advance(void);
+/* The file the worker is playing now -- after a roll-over, the one it rolled into. */
+void audio_current_path(char *out, size_t n);
 int  audio_is_active(void);
 int  audio_is_paused(void);
 int  audio_pos_ms(void);

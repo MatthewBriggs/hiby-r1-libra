@@ -68,7 +68,10 @@ int  wifi_scan_results(wifi_found_net_t *out, int max);   /* returns count found
 /* Quick settings. The radios are driven through the firmware's own scripts
  * rather than by poking interfaces directly — wifi_on.sh restores the saved
  * network, which hand-rolled ifconfig would not. */
-int  st_wifi_on(void);
+int  st_wifi_on(void);        /* driver loaded and interface up, joined or not */
+int  st_wifi_carrier(void);   /* joined to a network */
+int  st_wifi_has_ip(void);
+void st_wifi_dhcp(void);      /* (re)start DHCP on the network joined now */
 int  st_bt_on(void);
 void st_wifi_set(int on);
 void st_bt_set(int on);

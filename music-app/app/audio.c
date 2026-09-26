@@ -1422,6 +1422,15 @@ static int   g_speed = 1000;        /* permille, WSOLA time-stretch; 1000 = bypa
 /* Where a source stops being cheap to read alongside playback. Between the
  * 24/48 material that scans clean and the 24/96 that starts to bite. */
 #define ENV_THROTTLE_BPS 500000
+/* A second limit, on CPU rather than card reads: a long file (a podcast
+ * episode, a DJ mix) scanned flat out held the one core busy for minutes
+ * beside playback, WSOLA and bluealsa's encoder -- reported live as a 128 kbps
+ * podcast breaking up while its shape was being worked out. A four-minute
+ * track's burst is over in seconds; an hour's is not. Past this length, while
+ * something is playing, the scan sleeps ENV_DUTY_SLEEP times as long as it
+ * worked, holding it to a quarter of the core. */
+#define ENV_LONG_SEC   (15 * 60)
+#define ENV_DUTY_SLEEP 3
 #define ENV_SLICES 1024
 #define ENV_CHUNK  4096
 #define ENV_MAX_CH 8
@@ -1457,6 +1466,7 @@ int audio_envelope(const char *path, uint32_t *level, int n,
     /* See the note above: only the high-data-rate sources are held back. */
     uint64_t src_bps = (uint64_t)d.rate * ch * (uint64_t)(d.bits > 16 ? 3 : 2);
     int throttle = src_bps > ENV_THROTTLE_BPS;
+    int long_file = d.frames == 0 || d.frames > (uint64_t)d.rate * ENV_LONG_SEC;
     uint32_t slice_len = d.rate / 20;          /* 50 ms to start with */
     if (slice_len == 0) slice_len = 1;
     int cur = 0;
@@ -1464,13 +1474,20 @@ int audio_envelope(const char *path, uint32_t *level, int n,
     rc = 1;
     for (;;) {
         if (keep_going && !keep_going(ctx)) { rc = -1; break; }
+        struct timespec w0, w1;
+        clock_gettime(CLOCK_MONOTONIC, &w0);
         uint64_t got = dec_read(&d, buf, ENV_CHUNK);
         if (got == 0) break;
-        if (throttle) {
+        if (throttle || long_file) {
             pthread_mutex_lock(&g_lock);
             int busy = g_active && !g_paused;
             pthread_mutex_unlock(&g_lock);
-            if (busy) usleep((useconds_t)(got * 1000000ull / d.rate / 6));
+            if (busy && throttle) usleep((useconds_t)(got * 1000000ull / d.rate / 6));
+            if (busy && long_file) {
+                clock_gettime(CLOCK_MONOTONIC, &w1);
+                long us = (w1.tv_sec - w0.tv_sec) * 1000000L + (w1.tv_nsec - w0.tv_nsec) / 1000L;
+                if (us > 0) usleep((useconds_t)(us * ENV_DUTY_SLEEP > 200000 ? 200000 : us * ENV_DUTY_SLEEP));
+            }
         }
         const short *q = buf;
         uint32_t left = (uint32_t)got;
@@ -3373,6 +3390,12 @@ void audio_set_volume(int p){ if(p<0)p=0; if(p>100)p=100; pthread_mutex_lock(&g_
 void audio_set_next(const char *path) {
     pthread_mutex_lock(&g_lock);
     snprintf(g_next_path, sizeof(g_next_path), "%s", path ? path : "");
+    pthread_mutex_unlock(&g_lock);
+}
+
+void audio_current_path(char *out, size_t n) {
+    pthread_mutex_lock(&g_lock);
+    snprintf(out, n, "%s", g_path);
     pthread_mutex_unlock(&g_lock);
 }
 
