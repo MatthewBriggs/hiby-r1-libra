@@ -21,8 +21,58 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
 
 #include "status.h"
+#include <signal.h>
+#include <sys/wait.h>
+
+/* Runs `cmd` with /bin/sh in the background, fully detached: double-forked so
+ * it never becomes a zombie, and with every file descriptor above stderr
+ * closed first. Plain system("... &") handed each command every descriptor
+ * this app had open -- the grabbed touchscreen, the database, pipes -- and
+ * the long-lived ones it starts (wpa_supplicant, udhcpc, adbd, a pairing
+ * loop) kept them after Libra itself had gone. */
+static void close_inherited_fds(void) {
+    long max = sysconf(_SC_OPEN_MAX);
+    if (max <= 0 || max > 4096) max = 4096;
+    for (int fd = 3; fd < max; fd++) close(fd);
+}
+int st_spawn(const char *cmd) {
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        if (fork() != 0) _exit(0);
+        setsid();
+        signal(SIGPIPE, SIG_DFL);
+        close_inherited_fds();
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+    int st;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    return 0;
+}
+
+/* The same, for a fixed program and argument list: no shell, so nothing in
+ * the arguments is ever interpreted. Waits for it and returns its exit status
+ * (-1 if it could not be run). For text that did not come from this app --
+ * a Wi-Fi network's name, a typed passphrase. */
+int st_run_argv(char *const argv[]) {
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        int nul = open("/dev/null", O_RDWR);
+        if (nul >= 0) { dup2(nul, 0); dup2(nul, 1); dup2(nul, 2); }
+        close_inherited_fds();
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    int st;
+    while (waitpid(pid, &st, 0) < 0) if (errno != EINTR) return -1;
+    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
 
 static int read_int_file(const char *path, int fallback);
 
@@ -276,8 +326,8 @@ void bt_scan_start(void) {
      * "quit" keeps the pipe's write end open for that whole window instead,
      * holding bluetoothctl's own stdin off EOF (and its scan running) for
      * as long as timeout 8 was meant to. */
-    if (system("(printf 'agent NoInputNoOutput\\ndefault-agent\\nscan on\\n'; "
-               "sleep 8; printf 'quit\\n') | bluetoothctl >/dev/null 2>&1 &") == -1) return;
+    st_spawn("(printf 'agent NoInputNoOutput\\ndefault-agent\\nscan on\\n'; "
+             "sleep 8; printf 'quit\\n') | bluetoothctl >/dev/null 2>&1");
 }
 
 /* Every device bluetoothd currently knows about -- already-paired and
@@ -519,7 +569,17 @@ void bt_fill_details(bt_found_dev_t *devs, int n) {
  * failed") once the loop is done either way, so the Settings screen's tap
  * handler can poll bt_pair_result() and clear its "Connecting..." row
  * without the UI thread blocking on any of this. */
+/* A bluez-formatted XX:XX:XX:XX:XX:XX and nothing else -- these go into a
+ * shell command line. */
+static int bt_mac_ok(const char *mac) {
+    if (!mac || strlen(mac) != 17) return 0;
+    for (int i = 0; i < 17; i++)
+        if (i % 3 == 2 ? mac[i] != ':' : !isxdigit((unsigned char)mac[i])) return 0;
+    return 1;
+}
+
 void bt_pair(const char *mac) {
+    if (!bt_mac_ok(mac)) return;
     char cmd[1024];
     snprintf(cmd, sizeof(cmd),
         "("
@@ -537,17 +597,11 @@ void bt_pair(const char *mac) {
         "sleep $_gap; "
         "done; "
         "echo \"$_mac $([ $_ok = 1 ] && echo ok || echo failed)\" > /usr/data/bt_pair_status"
-        ") >/dev/null 2>&1 &",
+        ") >/dev/null 2>&1",
         mac);
-    if (system(cmd) == -1) return;
+    st_spawn(cmd);
 }
 
-static int bt_mac_ok(const char *mac) {
-    if (!mac || strlen(mac) != 17) return 0;
-    for (int i = 0; i < 17; i++)
-        if (i % 3 == 2 ? mac[i] != ':' : !isxdigit((unsigned char)mac[i])) return 0;
-    return 1;
-}
 static void bt_ctl(const char *verb, const char *mac) {
     if (!bt_mac_ok(mac)) return;
     char cmd[160];
@@ -719,9 +773,9 @@ int st_wifi_has_ip(void) {
  * network later -- leaving home and picking another one -- got no address at
  * all. Same command line wifi_on.sh uses, restarted per join. */
 void st_wifi_dhcp(void) {
-    if (system("killall udhcpc >/dev/null 2>&1; "
-               "h=$(cat /usr/resource/hostname 2>/dev/null); "
-               "udhcpc -b -i wlan0 -q -x hostname:${h:-HiBy_Music} >/dev/null 2>&1 &") == -1) return;
+    st_spawn("killall udhcpc >/dev/null 2>&1; "
+             "h=$(cat /usr/resource/hostname 2>/dev/null); "
+             "udhcpc -b -i wlan0 -q -x hostname:${h:-HiBy_Music} >/dev/null 2>&1");
 }
 
 /* No sysfs equivalent: rfkill reads unblocked whether the adapter is powered
@@ -740,8 +794,7 @@ int st_bt_on(void) {
 /* Backgrounded: wifi_on.sh restarts wpa_supplicant and waits on DHCP, which is
  * seconds. Blocking the UI on that would look like a crash. */
 void st_wifi_set(int on) {
-    if (system(on ? "/usr/bin/wifi_on.sh >/dev/null 2>&1 &"
-                  : "/usr/bin/wifi_off.sh >/dev/null 2>&1 &") == -1) return;
+    st_spawn(on ? "/usr/bin/wifi_on.sh >/dev/null 2>&1" : "/usr/bin/wifi_off.sh >/dev/null 2>&1");
 }
 
 /* R64: /etc/init.d/S80_bt_init backgrounds /usr/bin/bt_init and returns
@@ -768,7 +821,7 @@ void st_wifi_set(int on) {
  * hand-rolled bounded loop rather than wrapping this in one. */
 void st_bt_set(int on) {
     if (!on) {
-        if (system("/usr/bin/bt_disable >/dev/null 2>&1 &") == -1) return;
+        st_spawn("/usr/bin/bt_disable >/dev/null 2>&1");
         return;
     }
     /* 50ms, not 500ms. bt_init_ok lands ~8.4s into boot and this loop is
@@ -779,9 +832,8 @@ void st_bt_set(int on) {
      * waits was actively harmful (spawn costs 4.3ms on this device, so a
      * 10ms tick on "hciconfig | grep" is ~86% of the core, and it cost a
      * boot in ten). Same 20s cap, now 400 iterations rather than 40. */
-    if (system("(i=0; while [ ! -f /tmp/bt_init_ok ] && [ $i -lt 400 ]; do "
-               "usleep 50000; i=$((i+1)); done; /usr/bin/bt_enable) "
-               ">/dev/null 2>&1 &") == -1) return;
+    st_spawn("(i=0; while [ ! -f /tmp/bt_init_ok ] && [ $i -lt 400 ]; do "
+             "usleep 50000; i=$((i+1)); done; /usr/bin/bt_enable) >/dev/null 2>&1");
 }
 
 /* USB working mode, take 2. The first version wrote a byte into
@@ -835,8 +887,7 @@ int st_usb_mode(void) {
  * except the screen). Backgrounded either way: both scripts bring up a
  * new gadget and, for ADB, wait on enumeration -- not instant. */
 void st_usb_mode_set(int mode) {
-    if (system(mode == 1 ? "/usr/bin/adboff >/dev/null 2>&1 &"
-                          : "/usr/bin/adbon >/dev/null 2>&1 &") == -1) return;
+    st_spawn(mode == 1 ? "/usr/bin/adboff >/dev/null 2>&1" : "/usr/bin/adbon >/dev/null 2>&1");
 }
 
 /* Radio needs a route off the device. wlan0 exists whether or not Wi-Fi is

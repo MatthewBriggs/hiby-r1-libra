@@ -14,6 +14,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <unistd.h>
 
 #include "hls.h"
 
@@ -26,20 +31,35 @@ static double now_mono(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
+/* curl into a pipe with no shell in between. Every URL here but the first
+ * comes out of a playlist the server sent, and a playlist line used to be
+ * pasted inside single quotes in a popen() command line -- one containing '
+ * could have run anything. */
 static int fetch(const char *url, unsigned char *buf, int max) {
-    char cmd[HLS_URL_MAX + 256];
-    snprintf(cmd, sizeof(cmd),
-             "%s -sL --max-time 20 --cacert %s '%s' 2>/dev/null",
-             CURL_PATH, CA_BUNDLE, url);
-    FILE *p = popen(cmd, "r");
-    if (!p) return -1;
+    int fds[2];
+    if (pipe(fds) != 0) return -1;
+    pid_t pid = fork();
+    if (pid < 0) { close(fds[0]); close(fds[1]); return -1; }
+    if (pid == 0) {
+        dup2(fds[1], 1);
+        int nul = open("/dev/null", O_WRONLY);
+        if (nul >= 0) dup2(nul, 2);
+        for (int fd = 3; fd < 1024; fd++) close(fd);
+        execl(CURL_PATH, CURL_PATH, "-sL", "--max-time", "20", "--cacert", CA_BUNDLE,
+              url, (char *)NULL);
+        _exit(127);
+    }
+    close(fds[1]);
     int n = 0;
     while (n < max) {
-        size_t got = fread(buf + n, 1, (size_t)(max - n), p);
-        if (got == 0) break;
+        ssize_t got = read(fds[0], buf + n, (size_t)(max - n));
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) break;
         n += (int)got;
     }
-    pclose(p);
+    close(fds[0]);
+    kill(pid, SIGTERM);      /* stopped reading early: do not wait out --max-time */
+    waitpid(pid, NULL, 0);
     return n;
 }
 

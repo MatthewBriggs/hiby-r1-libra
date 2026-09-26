@@ -16,6 +16,8 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <signal.h>
+#include <sys/wait.h>
 
 #include "radio_buffer.h"
 #include "hls.h"
@@ -50,6 +52,11 @@ static long long       g_cur_seq = -1;  /* chunk currently being written */
  * bytes() is already writing into chunk files, guarded by the same g_lock
  * everything else here uses. -1 means not recording. */
 static int g_rec_fd = -1;
+
+/* The curl fetching an MP3 stream, so rb_stop() can end it: a stalled stream
+ * leaves the worker blocked in read() with nothing to wake it, and joining it
+ * then hung whoever asked for the stop -- the UI, on a station change. */
+static pid_t g_curl_pid = -1;
 
 /* Bytes/sec estimate: exponential moving average over ~4s windows of real
  * arrival, not a nominal bitrate the source is not obliged to honour. */
@@ -105,7 +112,10 @@ static void rb_write_bytes(int *fd, double *chunk_started, const unsigned char *
     pthread_mutex_lock(&g_lock);
     g_chunks[g_cur_seq % RB_MAX_CHUNKS].len += (size_t)w;
     g_live_pos += (uint64_t)w;
-    int rec_fd = g_rec_fd;
+    /* A duplicate, not the descriptor itself: rb_recording_stop() can close
+     * g_rec_fd the moment the lock drops, and that number can then be reused
+     * by whatever the app opens next -- the write below would land in it. */
+    int rec_fd = (g_rec_fd >= 0 && w > 0) ? dup(g_rec_fd) : -1;
     pthread_mutex_unlock(&g_lock);
     rb_note_bytes((size_t)w);
 
@@ -114,7 +124,10 @@ static void rb_write_bytes(int *fd, double *chunk_started, const unsigned char *
      * rather than reusing a chunk file after the fact. Written outside the
      * lock (already released above) since this is real file I/O and
      * nothing else here needs to wait on it. */
-    if (rec_fd >= 0 && w > 0) write(rec_fd, data, (size_t)w);
+    if (rec_fd >= 0) {
+        if (write(rec_fd, data, (size_t)w) < 0) { /* the recording loses this chunk */ }
+        close(rec_fd);
+    }
 
     if (now_mono() - *chunk_started >= RB_CHUNK_SECONDS) {
         close(*fd);
@@ -132,30 +145,66 @@ static void rb_write_bytes(int *fd, double *chunk_started, const unsigned char *
  * genuine hiccup without holding a bad URL's failure report open for long. */
 #define RB_CONNECT_RETRIES 3
 
+/* curl straight into a pipe, no shell: the URL comes from a station list and
+ * used to sit inside single quotes in a popen() command line. */
+static FILE *rb_curl_open(pid_t *pid_out) {
+    int fds[2];
+    if (pipe(fds) != 0) return NULL;
+    pid_t pid = fork();
+    if (pid < 0) { close(fds[0]); close(fds[1]); return NULL; }
+    if (pid == 0) {
+        dup2(fds[1], 1);
+        int nul = open("/dev/null", O_WRONLY);
+        if (nul >= 0) dup2(nul, 2);
+        for (int fd = 3; fd < 1024; fd++) close(fd);
+        execl(RB_CURL_PATH, RB_CURL_PATH, "-sL", "--no-buffer", "--cacert", RB_CA_BUNDLE,
+              g_url, (char *)NULL);
+        _exit(127);
+    }
+    close(fds[1]);
+    FILE *p = fdopen(fds[0], "r");
+    if (!p) { close(fds[0]); kill(pid, SIGKILL); waitpid(pid, NULL, 0); return NULL; }
+    *pid_out = pid;
+    return p;
+}
+static void rb_curl_close(FILE *p, pid_t pid) {
+    fclose(p);
+    kill(pid, SIGTERM);
+    waitpid(pid, NULL, 0);
+}
+
 static void *rb_worker_mp3(void *arg) {
     (void)arg;
-    char cmd[1200];
-    snprintf(cmd, sizeof(cmd), "%s -sL --no-buffer --cacert %s '%s' 2>/dev/null",
-             RB_CURL_PATH, RB_CA_BUNDLE, g_url);
-
     FILE *p = NULL;
+    pid_t pid = -1;
     unsigned char probe[1];
     size_t probe_got = 0;
     for (int attempt = 0; g_running && attempt < RB_CONNECT_RETRIES; attempt++) {
-        p = popen(cmd, "r");
+        p = rb_curl_open(&pid);
         if (p) {
+            pthread_mutex_lock(&g_lock);
+            g_curl_pid = pid;
+            pthread_mutex_unlock(&g_lock);
             probe_got = fread(probe, 1, 1, p);
             if (probe_got > 0) break;
-            pclose(p);
+            pthread_mutex_lock(&g_lock);
+            g_curl_pid = -1;
+            pthread_mutex_unlock(&g_lock);
+            rb_curl_close(p, pid);
             p = NULL;
         }
-        if (attempt + 1 < RB_CONNECT_RETRIES) sleep(1);
+        if (attempt + 1 < RB_CONNECT_RETRIES && g_running) sleep(1);
     }
     if (!p) { g_active = 0; return NULL; }
 
     int fd = rb_roll_chunk(0);
     double chunk_started = now_mono();
-    if (fd < 0) { pclose(p); g_active = 0; return NULL; }
+    if (fd < 0) {
+        pthread_mutex_lock(&g_lock); g_curl_pid = -1; pthread_mutex_unlock(&g_lock);
+        rb_curl_close(p, pid);
+        g_active = 0;
+        return NULL;
+    }
     if (probe_got > 0) rb_write_bytes(&fd, &chunk_started, probe, probe_got);
 
     unsigned char buf[8192];
@@ -168,7 +217,10 @@ static void *rb_worker_mp3(void *arg) {
         rb_write_bytes(&fd, &chunk_started, buf, got);
     }
     close(fd);
-    pclose(p);
+    pthread_mutex_lock(&g_lock);
+    g_curl_pid = -1;
+    pthread_mutex_unlock(&g_lock);
+    rb_curl_close(p, pid);
     g_active = 0;
     return NULL;
 }
@@ -242,6 +294,11 @@ void rb_stop(void) {
     rb_recording_stop();   /* switching stations mid-recording should not leak the fd */
     if (!g_running && !g_active) return;
     g_running = 0;
+    /* Unblock a worker stuck reading a stalled stream: ending curl closes its
+     * end of the pipe, and the read returns. */
+    pthread_mutex_lock(&g_lock);
+    if (g_curl_pid > 0) kill(g_curl_pid, SIGTERM);
+    pthread_mutex_unlock(&g_lock);
     pthread_join(g_thread, NULL);
     g_active = 0;
 }

@@ -486,8 +486,8 @@ static int track_no_from_path(const char *path) {
  * `track` is what makes this safe. The number is only dropped when it matches
  * the track's own number, so "99 Problems" as track 3 keeps its title, and a
  * "1999 - ..." that track_no_from_path() already refuses to read as a number
- * is never touched either. With no known track number, only the unambiguous
- * separators are accepted -- a plain space could be part of the title.
+ * is never touched either. With no known track number, only "NN - ", "NN. "
+ * and "NN) " are accepted -- anything tighter could be part of the title.
  *
  * Leaves the name alone rather than emptying it if there is nothing after the
  * number: a file called "01.flac" has its number for a name and nothing else
@@ -514,8 +514,15 @@ static void strip_track_prefix(char *name, int track) {
     if (*t == '-' || *t == '.' || *t == ')') { marked = 1; t++; }
     while (*t == ' ' || *t == '_') t++;
     if (t == d) return;                          /* no separator at all */
-    if (!marked && track != v) return;           /* "99 Problems" keeps its 99 */
-    if (track > 0 && v != track && !marked) return;
+    /* A known track number must match, separator or not: "30-Year War" is not
+     * track 30. And what is left must not start with a digit: "5-8-6" is
+     * track 5 of its album and still a title, not "05 - 8-6". Reported live
+     * as 5-8-6 showing as "8-6". With no track number to check against, only
+     * the unambiguous "NN - Title" / "NN. Title" / "NN) Title" forms. */
+    if (track > 0 && v != track) return;         /* "99 Problems" keeps its 99 */
+    if (isdigit((unsigned char)*t)) return;
+    if (track <= 0 && !(marked && t > d + 1 && t[-1] == ' ')) return;
+    if (!marked && *p != '0') return;            /* "7 Seconds" is a title; "07 Title" a filename */
     if (!*t) return;                             /* nothing left to show */
 
     memmove(name, t, strlen(t) + 1);

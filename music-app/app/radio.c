@@ -163,7 +163,8 @@ static int nrk_best_url_in(const char *from, const char *end, char *out, size_t 
             last_seen[len] = '\0';
         }
         const char *w = strstr(q2, "\"width\"");
-        int width = (w && w < end) ? atoi(strchr(w, ':') + 1) : 0;
+        const char *wc = (w && w < end) ? strchr(w, ':') : NULL;
+        int width = wc ? atoi(wc + 1) : 0;
         if (width >= NRK_ART_MIN_PX && last_seen[0]) {
             snprintf(out, out_n, "%s", last_seen);
             return 0;   /* smallest qualifying one found -- ascending order, stop here */

@@ -1,6 +1,10 @@
 #ifndef MUSIC_STATUS_H
 #define MUSIC_STATUS_H
 #include <stddef.h>
+/* Background a shell command detached from this app, inheriting none of its
+ * open files; and run a program with an argument list, no shell involved. */
+int  st_spawn(const char *cmd);
+int  st_run_argv(char *const argv[]);
 int st_battery_pct(void);    /* 0-100, -1 unknown */
 int st_charging(void);
 int st_headset(void);        /* jack occupied */

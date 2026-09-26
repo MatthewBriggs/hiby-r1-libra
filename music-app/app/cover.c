@@ -979,7 +979,9 @@ int cover_downscale_to(const char *src_path, const char *dst_path, int max_dim) 
 /* ---- PNG -> JPEG: just enough PNG to handle a station/album logo -------- */
 
 #define PNG_MAX_FILE (8 * 1024 * 1024)
-#define PNG_MAX_DIM  4000
+/* 1600, not 4000: a 4000x4000 RGBA decode is a 64 MB buffer on a device with
+ * 56 MB. Station and cover art arrives well under this. */
+#define PNG_MAX_DIM  1600
 
 /* Decodes exactly what's needed here and nothing more: 8-bit depth, color
  * type 2 (RGB) or 6 (RGBA), non-interlaced. Any real photo/logo a host

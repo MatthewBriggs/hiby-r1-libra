@@ -1651,6 +1651,22 @@ int audio_using_usb(void) { return g_out_kind == 1; }
  * re-looked whenever it stops answering — a different headset since last
  * time would otherwise leave the volume keys apparently dead. */
 static char bt_mixer[64];
+/* bt_mixer as one shell word. The control is named after the headset, and the
+ * headset names itself -- "Matt's AirPods" broke every volume command, and a
+ * name built for it could have run anything. Single-quoted, with each ' as
+ * '\''. Refreshed whenever bt_mixer is found. */
+static char bt_mixer_q[64 * 4 + 3];
+static void shell_quote(const char *in, char *out, size_t n) {
+    size_t o = 0;
+    if (n < 3) { if (n) out[0] = '\0'; return; }
+    out[o++] = '\'';
+    for (const char *p = in; *p && o + 6 < n; p++) {
+        if (*p == '\'') { memcpy(out + o, "'\\''", 4); o += 4; }
+        else out[o++] = *p;
+    }
+    out[o++] = '\'';
+    out[o] = '\0';
+}
 /* Backoff state for find_bt_mixer(), reset whenever Bluetooth stops being
  * the output so a different headset next time is probed promptly. See
  * audio_bt_volume_service() for why this is needed at all. */
@@ -1756,6 +1772,7 @@ static void find_bt_mixer(void) {
             if (n >= sizeof(bt_mixer)) n = sizeof(bt_mixer) - 1;
             memcpy(bt_mixer, q1 + 1, n);
             bt_mixer[n] = '\0';
+            shell_quote(bt_mixer, bt_mixer_q, sizeof(bt_mixer_q));
             break;
         }
     }
@@ -1776,8 +1793,8 @@ static void find_bt_mixer(void) {
  * else, and trusting its own stated range costs one more sscanf. */
 static int bt_read_raw(int *max_out) {
     if (!bt_mixer[0]) return -1;
-    char cmd[192];
-    snprintf(cmd, sizeof(cmd), "amixer -D bluealsa sget '%s' 2>/dev/null", bt_mixer);
+    char cmd[384];
+    snprintf(cmd, sizeof(cmd), "amixer -D bluealsa sget %s 2>/dev/null", bt_mixer_q);
     FILE *p = popen(cmd, "r");
     if (!p) return -1;
     char line[256];
@@ -2000,8 +2017,9 @@ static void bt_enable_softvol(void) {
     char path[256];
     if (!st_bt_pcm_path(path, sizeof(path))) return;
     bt_softvol_set = 1;
-    char cmd[320];
-    snprintf(cmd, sizeof(cmd), "bluealsa-cli soft-volume '%s' true >/dev/null 2>&1", path);
+    char cmd[640], qpath[520];
+    shell_quote(path, qpath, sizeof(qpath));
+    snprintf(cmd, sizeof(cmd), "bluealsa-cli soft-volume %s true >/dev/null 2>&1", qpath);
     if (system(cmd) == -1) { bt_softvol_set = 0; return; }
 
     int max = bt_vol_max;
@@ -2010,8 +2028,8 @@ static void bt_enable_softvol(void) {
     /* Zero, or so low it is indistinguishable from silence. */
     if (now >= 0 && now <= bt_vol_max / 20) {
         int floor_raw = (BT_SOFTVOL_FLOOR_PCT * bt_vol_max + 50) / 100;
-        snprintf(cmd, sizeof(cmd), "amixer -D bluealsa sset '%s' %d >/dev/null 2>&1",
-                 bt_mixer, floor_raw);
+        snprintf(cmd, sizeof(cmd), "amixer -D bluealsa sset %s %d >/dev/null 2>&1",
+                 bt_mixer_q, floor_raw);
         if (system(cmd) != -1) {
             bt_vol_raw = floor_raw;
             pthread_mutex_lock(&g_lock);
@@ -2088,9 +2106,9 @@ void audio_bt_volume_service(void) {
                      * told us the range. */
                     int want = bt_pct_to_raw(bt_last_pct);
                     if (want < 0) want = 0; if (want > bt_vol_max) want = bt_vol_max;
-                    char wcmd[224];
-                    snprintf(wcmd, sizeof(wcmd), "amixer -D bluealsa sset '%s' %d >/dev/null 2>&1",
-                             bt_mixer, want);
+                    char wcmd[384];
+                    snprintf(wcmd, sizeof(wcmd), "amixer -D bluealsa sset %s %d >/dev/null 2>&1",
+                             bt_mixer_q, want);
                     if (system(wcmd) != -1) fresh = want;
                 }
                 if (fresh >= 0) {
@@ -2155,17 +2173,26 @@ void audio_bt_volume_service(void) {
             }
         }
     }
-    if (!bt_mixer[0]) return;
+    if (!bt_mixer[0]) {
+        /* No control to write to yet: keep the request rather than drop it,
+         * so the press lands once discovery finds the mixer. */
+        if (pending) {
+            pthread_mutex_lock(&bt_vol_lock);
+            if (!bt_vol_pending) { bt_vol_pending = 1; bt_vol_pending_raw = raw_val; }
+            pthread_mutex_unlock(&bt_vol_lock);
+        }
+        return;
+    }
 
     if (pending) {
-        char cmd[224];
+        char cmd[384];
         /* Always an absolute target, never a relative step -- see
          * audio_volume_step()'s comment for why a batched relative step
          * against the mixer's own current value could disagree with g_vol
          * by tens of percent. Plain integer, not "N%" -- see this
          * section's own top comment for why. */
-        snprintf(cmd, sizeof(cmd), "amixer -D bluealsa sset '%s' %d >/dev/null 2>&1",
-                 bt_mixer, raw_val);
+        snprintf(cmd, sizeof(cmd), "amixer -D bluealsa sset %s %d >/dev/null 2>&1",
+                 bt_mixer_q, raw_val);
         if (system(cmd) == -1) return;
     }
 

@@ -2835,7 +2835,7 @@ static int settings_content_rows(void) {
  * pushed by hand, not by CI against a tagged commit), so this stays a
  * literal that a human edits; the discipline is remembering to, not the
  * mechanism. */
-#define LIBRARY_VERSION "0.57"
+#define LIBRARY_VERSION "0.57.1"
 
 /* A custom-built kernel keeps uname()'s own release string exactly
  * "4.4.94+" on purpose -- that string is also the vermagic every one of the
@@ -3630,8 +3630,8 @@ static void wifi_select_saved(const char *ssid) {
     wifi_reenable_pending = 1;
     for (int i = 0; i < wifi_saved_n; i++) {
         if (strcmp(wifi_saved[i], ssid)) continue;
-        snprintf(cmd, sizeof(cmd), "wpa_cli select_network %d >/dev/null 2>&1 &", wifi_saved_id[i]);
-        if (system(cmd) == -1) mlog("[music] wifi: select_network failed\n");
+        snprintf(cmd, sizeof(cmd), "wpa_cli select_network %d >/dev/null 2>&1", wifi_saved_id[i]);
+        st_spawn(cmd);
         return;
     }
 }
@@ -3641,34 +3641,65 @@ static void wifi_select_saved(const char *ssid) {
  * supplicant that's already running rather than needing one started here.
  * add_network/set_network/enable_network/save_config is the standard
  * wpa_cli sequence for "remember and connect to this network" -- save_config
- * is what makes it survive past this boot, same file wifi_on.sh already
- * reads back on every future Wi-Fi-on. shell-quoted through a fixed-size
- * buffer with embedded quotes stripped rather than escaped: a passphrase
- * containing a literal `"` is vanishingly unlikely on this device's actual
- * use, and getting shell-escaping subtly wrong here is a worse failure mode
- * (arbitrary command injection from a typed password) than refusing the
- * one exotic character. */
-static void shell_safe(const char *in, char *out, size_t outsz) {
-    size_t o = 0;
-    for (const char *p = in; *p && o + 1 < outsz; p++)
-        if (*p != '"' && *p != '\\' && *p != '`' && *p != '$') out[o++] = *p;
-    out[o] = '\0';
+ * is what makes it survive past this boot.
+ *
+ * No shell anywhere near the network's name or the passphrase. The name is
+ * whatever a nearby access point chooses to broadcast, and it used to sit
+ * inside single quotes in a shell command with only " \ ` $ stripped -- so a
+ * name containing ' could run anything, as root, the moment it was tapped.
+ * The name now goes to wpa_supplicant as hex (its unquoted form), the
+ * passphrase as one plain argument, each wpa_cli call run directly. Worked
+ * on a background thread: five round trips to wpa_cli are ~100 ms. */
+typedef struct { char ssid[64]; char pw[128]; } wifi_join_t;
+
+static void *wifi_connect_worker(void *arg) {
+    wifi_join_t *j = arg;
+    char id[16] = "";
+    FILE *p = popen("wpa_cli -i wlan0 add_network 2>/dev/null", "r");
+    if (p) {
+        char line[64];
+        while (fgets(line, sizeof(line), p)) {
+            char *e;
+            long v = strtol(line, &e, 10);
+            if (e != line && (*e == '\n' || *e == '\0')) snprintf(id, sizeof(id), "%ld", v);
+        }
+        pclose(p);
+    }
+    if (!id[0]) { mlog("[music] wifi: add_network failed\n"); free(j); return NULL; }
+    char hex[160];
+    hex_encode(j->ssid, hex, sizeof(hex));
+    char *set_ssid[] = { "wpa_cli", "-i", "wlan0", "set_network", id, "ssid", hex, NULL };
+    st_run_argv(set_ssid);
+    if (j->pw[0]) {
+        char quoted[140];
+        snprintf(quoted, sizeof(quoted), "\"%s\"", j->pw);
+        char *set_psk[] = { "wpa_cli", "-i", "wlan0", "set_network", id, "psk", quoted, NULL };
+        st_run_argv(set_psk);
+    } else {
+        /* An open network: no key management, rather than an empty psk --
+         * which wpa_supplicant rejects, leaving the network expecting WPA. */
+        char *open_net[] = { "wpa_cli", "-i", "wlan0", "set_network", id, "key_mgmt", "NONE", NULL };
+        st_run_argv(open_net);
+    }
+    char *enable[] = { "wpa_cli", "-i", "wlan0", "enable_network", id, NULL };
+    st_run_argv(enable);
+    char *enable_all[] = { "wpa_cli", "-i", "wlan0", "enable_network", "all", NULL };
+    st_run_argv(enable_all);
+    char *save[] = { "wpa_cli", "-i", "wlan0", "save_config", NULL };
+    st_run_argv(save);
+    free(j);
+    return NULL;
 }
+
 static void wifi_connect(const char *ssid, const char *password) {
-    char s_ssid[64], s_pw[128];
-    shell_safe(ssid, s_ssid, sizeof(s_ssid));
-    shell_safe(password, s_pw, sizeof(s_pw));
-    char cmd[512];
     wifi_remove_saved(ssid);
-    snprintf(cmd, sizeof(cmd),
-        "id=$(wpa_cli add_network | tail -1); "
-        "wpa_cli set_network $id ssid '\"%s\"' >/dev/null; "
-        "wpa_cli set_network $id psk '\"%s\"' >/dev/null; "
-        "wpa_cli enable_network $id >/dev/null; "
-        "wpa_cli enable_network all >/dev/null; "
-        "wpa_cli save_config >/dev/null &",
-        s_ssid, s_pw);
-    if (system(cmd) == -1) mlog("[music] wifi_connect: system() failed\n");
+    wifi_join_t *j = calloc(1, sizeof(*j));
+    if (!j) return;
+    snprintf(j->ssid, sizeof(j->ssid), "%s", ssid);
+    snprintf(j->pw, sizeof(j->pw), "%s", password ? password : "");
+    pthread_t t;
+    if (pthread_create(&t, NULL, wifi_connect_worker, j) == 0) pthread_detach(t);
+    else free(j);
     wifi_save_credential(ssid, password);
     mlog("[music] wifi: connecting to %s\n", ssid);
 }
@@ -3733,8 +3764,7 @@ static void wifi_link_tick(void) {
     if (!on) scan_slowed = 0;
     else if (!scan_slowed) {
         scan_slowed = 1;
-        if (system("wpa_cli -i wlan0 scan_interval 30 >/dev/null 2>&1 &") == -1)
-            mlog("[music] wifi: scan_interval failed\n");
+        st_spawn("wpa_cli -i wlan0 scan_interval 30 >/dev/null 2>&1");
     }
 
     /* Parking. Waits 10 s of steady Bluetooth playback before powering down,
@@ -4249,6 +4279,7 @@ static char index_letter(int i) { return i == 0 ? '#' : (char)('A' + i - 1); }
 static int mini_visible(void);
 static void home_tile(int i, int *x, int *y, int *w, int *h) {
     static const signed char slot[] = { 0, 1, 2, 4, 5, 3, 6, 7 };   /* by top_menu[] index */
+    _Static_assert(sizeof(slot) == TOP_N, "home_tile(): one slot per Home item");
     int k = slot[i];
     *w = FB_W / 2; *h = (FB_H - MINI_H - HOME_TOP) / HOME_ROWS;
     *x = (k % 2) * *w; *y = HOME_TOP + (k / 2) * *h;
@@ -5394,11 +5425,18 @@ static void *radio_art_worker(void *arg) {
  * radio_art_worker() recognises, and one isn't already in flight. Safe to
  * call every tick -- radio_art_done gates it exactly the way art_request()
  * gates art_worker() for local tracks. */
+/* A request that arrived while a fetch was still running, taken up by the main
+ * loop once it finishes -- switching stations mid-fetch used to leave the new
+ * station without art until the periodic refresh. */
+static char radio_art_queued[LIB_NAME_LEN];
 static void radio_art_request(const char *station_name) {
     if (strncmp(station_name, "NRK ", 4) != 0 &&
         strncmp(station_name, "Deutschlandfunk", 15) != 0 &&
         strncmp(station_name, "BBC Radio ", 10) != 0) return;
-    if (!radio_art_done) return;
+    if (!radio_art_done) {
+        snprintf(radio_art_queued, sizeof(radio_art_queued), "%s", station_name);
+        return;
+    }
     char *copy = strdup(station_name);
     if (!copy) return;
     radio_art_done = 0;
@@ -6312,7 +6350,12 @@ static long long stor_dir_bytes(const char *path, int depth) {
     long long sum = 0;
     struct dirent *e;
     char p[PATH_MAX];
+    static unsigned n_seen;
     while ((e = readdir(d))) {
+        /* Card reads are not prioritised on this kernel, so a full walk
+         * competes head-on with playback reading its own file. While
+         * something plays, pause briefly every few dozen entries. */
+        if ((++n_seen & 31) == 0 && audio_is_active() && !audio_is_paused()) usleep(3000);
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
         snprintf(p, sizeof(p), "%s/%s", path, e->d_name);
         struct stat st;
@@ -11811,9 +11854,8 @@ static void deep_suspend(void) {
      * The power-on is chained onto it inside the same background shell rather
      * than issued here, because it has to happen *after* bt_resume's ten
      * seconds of stack rebuilding, not racing it. */
-    if (system(bt_was_on
-               ? "( /usr/bin/bt_resume; bt-adapter --set Powered On ) >/dev/null 2>&1 &"
-               : "/usr/bin/bt_resume >/dev/null 2>&1 &") == -1) { }
+    st_spawn(bt_was_on ? "( /usr/bin/bt_resume; bt-adapter --set Powered On ) >/dev/null 2>&1"
+                       : "/usr/bin/bt_resume >/dev/null 2>&1");
 }
 
 static void set_locked(int on) {
@@ -14121,6 +14163,12 @@ int music_entry(void *a0, void *a1) {
          * radio_art_request() itself no-ops for anything neither provider recognises. */
         if (radio_mode) {
             if (++radio_art_tick >= 3600) { radio_art_tick = 0; radio_art_request(radio_name); }
+            if (radio_art_queued[0] && radio_art_done) {
+                char st[LIB_NAME_LEN];
+                snprintf(st, sizeof(st), "%s", radio_art_queued);
+                radio_art_queued[0] = '\0';
+                if (!strcmp(st, radio_name)) radio_art_request(st);
+            }
         } else {
             radio_art_tick = 0;
         }
@@ -14194,8 +14242,7 @@ int music_entry(void *a0, void *a1) {
                  * fall back to them. Runtime only -- nothing is saved. */
                 if (wifi_reenable_pending) {
                     wifi_reenable_pending = 0;
-                    if (system("wpa_cli -i wlan0 enable_network all >/dev/null 2>&1 &") == -1)
-                        mlog("[music] wifi: enable_network all failed\n");
+                    st_spawn("wpa_cli -i wlan0 enable_network all >/dev/null 2>&1");
                 }
             } else if (screen == SC_SETTINGS_WIFI)
                 dirty = 1;
