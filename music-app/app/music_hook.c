@@ -372,6 +372,16 @@ static int net_held(void) {
  * its own; tapping the toggle afterwards calls st_wifi_set(1), which
  * reinserts the driver exactly as a cold boot would. */
 static int wifi_auto_off_enabled;
+/* Power Wi-Fi fully down while playing over Bluetooth (net_held()), and bring
+ * it back once playback pauses or stops. The strongest fix for 2.4 GHz
+ * contention there is: brcmfmac keeps the chip awake and sharing the antenna
+ * even with the interface down, and an unjoined supplicant scans every channel
+ * every few seconds. Runtime only, like the idle auto-off -- wifi_pref is
+ * untouched, so a restart while parked still restores Wi-Fi. On by default. */
+static int wifi_bt_off_enabled = 1;
+static int wifi_bt_parked;     /* we turned it off for playback */
+static int wifi_bt_override;   /* switched back on by hand during this playback */
+static int wifi_pref = 1, bt_pref = 1;
 static time_t wifi_idle_since;
 static unsigned long long wifi_idle_base_bytes = (unsigned long long)-1;   /* -1: no baseline yet */
 
@@ -3699,26 +3709,6 @@ static void wifi_connect(const char *ssid, const char *password) {
     mlog("[music] wifi: connecting to %s\n", ssid);
 }
 
-/* DHCP for every join, not just the one wifi_on.sh saw: on a fresh join (the
- * link coming up), or a link with no address that has waited long enough for
- * the last request. Sysfs reads and one ioctl every two seconds; a fork only
- * when there is something to ask for. */
-static void wifi_link_tick(void) {
-    static time_t last, last_dhcp;
-    static int was_up = -1;
-    time_t now = time(NULL);
-    if (now - last < 2) return;
-    last = now;
-    int up = st_wifi_on() && st_wifi_carrier();
-    if (was_up < 0) was_up = up;   /* already joined at start: wifi_on.sh has it */
-    if (up && (!was_up || (!st_wifi_has_ip() && now - last_dhcp >= 30))) {
-        st_wifi_dhcp();
-        last_dhcp = now;
-        mlog("[music] wifi: joined, asking for an address\n");
-    }
-    was_up = up;
-}
-
 /* Done was tapped -- hand the finished buffer to whichever purpose opened
  * the keyboard, then return to wherever that screen came from. A no-op
  * default case rather than an assert: KB_PURPOSE_NONE only happens if a
@@ -3750,6 +3740,74 @@ static time_t wifi_connecting_since;
 #define BT_CONNECT_TIMEOUT_SEC 150
 static char   bt_connecting_mac[24];
 static time_t bt_connecting_since;
+
+/* DHCP for every join, not just the one wifi_on.sh saw: on a fresh join (the
+ * link coming up), or a link with no address that has waited long enough for
+ * the last request. Sysfs reads and one ioctl every two seconds; a fork only
+ * when there is something to ask for. */
+static void wifi_link_tick(void) {
+    static time_t last, last_dhcp;
+    static int was_up = -1;
+    time_t now = time(NULL);
+    if (now - last < 2) return;
+    last = now;
+    int up = st_wifi_on() && st_wifi_carrier();
+    if (was_up < 0) was_up = up;   /* already joined at start: wifi_on.sh has it */
+    if (up && (!was_up || (!st_wifi_has_ip() && now - last_dhcp >= 30))) {
+        st_wifi_dhcp();
+        last_dhcp = now;
+        mlog("[music] wifi: joined, asking for an address\n");
+    }
+    was_up = up;
+
+    /* An unjoined supplicant scans every channel every 5 s by default, each
+     * scan briefly taking the radio from Bluetooth. Once per start of the
+     * supplicant (wifi_on.sh restarts it): every 30 s instead, which still
+     * finds a saved network within half a minute of arriving. */
+    static int scan_slowed;
+    int on = st_wifi_on();
+    if (!on) scan_slowed = 0;
+    else if (!scan_slowed) {
+        scan_slowed = 1;
+        if (system("wpa_cli -i wlan0 scan_interval 30 >/dev/null 2>&1 &") == -1)
+            mlog("[music] wifi: scan_interval failed\n");
+    }
+
+    /* Parking. Waits 10 s of steady Bluetooth playback before powering down,
+     * and 15 s of pause before powering back up, so skipping about or a short
+     * pause does not bounce the driver. Never mid-download, mid-sync, or while
+     * the Wi-Fi screen or a join is in progress. */
+    static time_t held_since, free_since;
+    int held = net_held();
+    if (!held) { held_since = 0; wifi_bt_override = 0; }
+    if (!wifi_bt_parked) {
+        free_since = 0;
+        if (held && wifi_bt_off_enabled && !wifi_bt_override && wifi_pref && on &&
+            !pod_download_active() && !pod_update_running() &&
+            !wifi_connecting_ssid[0] && screen != SC_SETTINGS_WIFI) {
+            if (!held_since) held_since = now;
+            else if (now - held_since >= 10) {
+                wifi_bt_parked = 1;
+                scan_slowed = 0;
+                st_wifi_set(0);
+                mlog("[music] wifi: off for Bluetooth playback\n");
+            }
+        } else {
+            held_since = 0;
+        }
+    } else if (held) {
+        free_since = 0;
+    } else {
+        if (!free_since) free_since = now;
+        else if (now - free_since >= 15) {
+            wifi_bt_parked = 0;
+            if (wifi_pref && !st_wifi_on()) {
+                st_wifi_set(1);
+                mlog("[music] wifi: back on after Bluetooth playback\n");
+            }
+        }
+    }
+}
 
 static void kb_commit(void) {
     switch (kb_purpose) {
@@ -4217,6 +4275,26 @@ static char index_letter(int i) { return i == 0 ? '#' : (char)('A' + i - 1); }
 
 #define MINI_H 76
 
+/* Home: Music, Audiobooks, Podcasts and Radio as a 2x2 block of large tiles,
+ * the rest three across beneath. Sized to fit above the mini player, so the
+ * screen never scrolls and nothing moves when the mini player appears. */
+#define HOME_H      (FB_H - MINI_H - CONTENT_Y)
+#define HOME_BIG_H  (HOME_H * 3 / 10)
+#define HOME_SMALL_H ((HOME_H - 2 * HOME_BIG_H) / 2)
+static void home_tile(int i, int *x, int *y, int *w, int *h) {
+    static const signed char big_slot[] = { 0, 1, 2, -1, -1, 3, -1, -1 };
+    static const signed char small_slot[] = { -1, -1, -1, 0, 1, -1, 2, 3 };
+    if (big_slot[i] >= 0) {
+        int k = big_slot[i];
+        *w = FB_W / 2; *h = HOME_BIG_H;
+        *x = (k % 2) * *w; *y = CONTENT_Y + (k / 2) * *h;
+    } else {
+        int k = small_slot[i];
+        *w = FB_W / 3; *h = HOME_SMALL_H;
+        *x = (k % 3) * *w; *y = CONTENT_Y + 2 * HOME_BIG_H + (k / 3) * *h;
+    }
+}
+
 /* Shared between draw_mini() and its tap handler, rather than the two each
  * carrying their own copy of these numbers -- BG21 this same session was
  * exactly that drift (a hit zone left pointing at a button's old position
@@ -4410,7 +4488,10 @@ static int bt_partition(bt_found_dev_t *devs, int dev_n, int *order) {
 /* 4 fixed rows (toggle, status, "Scan for networks", "Add network
  * manually") plus however many results are currently cached -- the
  * scroll-limit ternary's own `total` for this screen. */
-static int wifi_row_n(void) { return 5 + wifi_net_n; }   /* R84: +1 for the idle-off toggle */
+/* Rows above the scanned networks: toggle, status, idle-off, off during
+ * Bluetooth playback, scan, add manually. */
+#define WIFI_FIRST_NET_ROW 6
+static int wifi_row_n(void) { return WIFI_FIRST_NET_ROW + wifi_net_n; }
 
 /* Only the two lists long enough to need it -- and not Recent, capped at
  * PAGE_MAX items and sorted by recency rather than alphabetically, where a
@@ -4915,8 +4996,17 @@ static int artist_page_max_px(void) {
     return max_px < 0 ? 0 : max_px;
 }
 
+/* The screens scrolled in true pixels against an exact bottom, rubber-banded
+ * at both ends, rather than in whole rows against a row count. */
+static int px_scrolled_screen(void) {
+    return (screen == SC_TRACKS && !ab_list && !pod_list) || screen == SC_ARTIST_PAGE;
+}
+static int px_max(void) {
+    return screen == SC_ARTIST_PAGE ? artist_page_max_px() : tracks_max_px();
+}
+
 static int scroll_to_px(int total_px) {
-    if ((screen == SC_TRACKS && !ab_list && !pod_list) || screen == SC_ARTIST_PAGE) {
+    if (px_scrolled_screen()) {
         /* R46 follow-up: exact pixel bounds, not the ceil()'d row-count
          * `limit` every other screen below uses -- rounding a fractional
          * last row up to a whole ROW_H let scroll go a full row past the
@@ -4932,7 +5022,7 @@ static int scroll_to_px(int total_px) {
          * copy -- same continuous-scroll mechanics (photo sliding with a
          * list beneath it), just artist_page_max_px() instead of
          * tracks_max_px() for where the bottom actually is. */
-        int max_px = (screen == SC_ARTIST_PAGE) ? artist_page_max_px() : tracks_max_px();
+        int max_px = px_max();
         if (total_px < 0) total_px = total_px / 3;
         else if (total_px > max_px) total_px = max_px + (total_px - max_px) / 3;
         /* Floor division, not C's truncate-toward-zero -- total_px can be
@@ -5391,7 +5481,14 @@ static int play_station(int i) {
         return 0;
     }
     if (!st_net_up()) {
-        snprintf(radio_msg, sizeof(radio_msg), "Wi-Fi is off");
+        if (wifi_bt_parked) {
+            /* Off only for the Bluetooth playback this radio replaces. */
+            wifi_bt_parked = 0;
+            if (wifi_pref) st_wifi_set(1);
+            snprintf(radio_msg, sizeof(radio_msg), "Wi-Fi is reconnecting, try again shortly");
+        } else {
+            snprintf(radio_msg, sizeof(radio_msg), "Wi-Fi is off");
+        }
         return 0;
     }
     radio_mode = 1;
@@ -7160,12 +7257,27 @@ static void draw_screen(uint16_t *fb) {
          * true; Parametric EQ/MSEB/Radio/Settings don't touch the card the
          * same way and stay live. */
         int usb_storage = st_usb_mode() == 1;
+        /* Square tiles straight under the header, in top_menu[] order: a
+         * Lucide line icon in the accent colour with the name beneath it. */
+        static const icon_t *const home_icons[TOP_N] = {
+            &icon_home_music, &icon_home_audiobooks, &icon_home_podcasts,
+            &icon_home_eq, &icon_home_mseb, &icon_home_radio, &icon_home_stats, &icon_home_settings,
+        };
         for (int i = 0; i < TOP_N; i++) {
             int disabled = usb_storage && (i == TOP_MUSIC || i == TOP_AUDIOBOOKS || i == TOP_PODCASTS);
-            draw_text(fb, 24, y + 20, top_menu[i].label,
-                      disabled ? COL_DIM : COL_TEXT, TEXT_PX_BODY, FB_W - 24);
-            fill_rect(fb, 0, y + ROW_H - 1, FB_W, 1, COL_LINE);
-            y += ROW_H;
+            int tx, ty, tw, th;
+            home_tile(i, &tx, &ty, &tw, &th);
+            if (tx + tw < FB_W) fill_rect(fb, tx + tw - 1, ty, 1, th, COL_LINE);
+            fill_rect(fb, tx, ty + th - 1, tw, 1, COL_LINE);
+            const icon_t *ic = home_icons[i];
+            int big = tw > FB_W / 3;
+            int px = big ? TEXT_PX_BODY : TEXT_PX_SMALL;
+            int gap = big ? 14 : 8;
+            int iy = ty + (th - (ic->h + gap + px)) / 2 - 4;
+            draw_icon(fb, FB_W, FB_H, tx + (tw - ic->w) / 2, iy, ic, disabled ? COL_DIM : COL_ACCENT);
+            int lw = text_width(top_menu[i].label, px);
+            draw_text(fb, tx + (tw - lw) / 2, iy + ic->h + gap, top_menu[i].label,
+                      disabled ? COL_DIM : COL_TEXT, px, tx + tw - 4);
         }
         if (usb_storage) {
             int bh = 60;
@@ -8957,7 +9069,8 @@ static void draw_screen(uint16_t *fb) {
 
         char nm[64] = "", stline[96];
         if (on && st_wifi_carrier()) st_wifi_ssid(nm, sizeof(nm));
-        if (!on)                   snprintf(stline, sizeof(stline), "off");
+        if (!on && wifi_bt_parked) snprintf(stline, sizeof(stline), "off while playing over Bluetooth");
+        else if (!on)              snprintf(stline, sizeof(stline), "off");
         else if (!nm[0])           snprintf(stline, sizeof(stline), "on, not connected");
         else if (!st_wifi_has_ip()) snprintf(stline, sizeof(stline), "%s, getting an address", nm);
         else                       snprintf(stline, sizeof(stline), "%s", nm);
@@ -8970,6 +9083,11 @@ static void draw_screen(uint16_t *fb) {
         /* R84 */
         draw_text_clip(fb, 24, ry + 20, "Turn off after 15 min idle", COL_TEXT, TEXT_PX_BODY, FB_W - 140, CONTENT_Y, clip_bot);
         draw_toggle_switch_h_clip(fb, ry, wifi_auto_off_enabled, ROW_H, CONTENT_Y, clip_bot);
+        ry += ROW_H;
+        fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
+
+        draw_text_clip(fb, 24, ry + 20, "Off during Bluetooth playback", COL_TEXT, TEXT_PX_BODY, FB_W - 140, CONTENT_Y, clip_bot);
+        draw_toggle_switch_h_clip(fb, ry, wifi_bt_off_enabled, ROW_H, CONTENT_Y, clip_bot);
         ry += ROW_H;
         fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
 
@@ -10946,8 +11064,7 @@ static int brightness_pref = -1;
  * what was just asked for. Seeded from live state once at startup (see
  * load_conf()) so an unrelated save_conf() call, before either radio has
  * ever been toggled this session, still writes something meaningful instead
- * of a sentinel. */
-static int wifi_pref = 1, bt_pref = 1;
+ * of a sentinel. (Defined up with the Wi-Fi idle state, which reads it.) */
 
 static void load_conf(void) {
     FILE *f = fopen(CONF_PATH, "r");
@@ -10992,6 +11109,9 @@ static void load_conf(void) {
         } else if (sscanf(line, "wifi_auto_off_enabled = %d", &v) == 1 ||
                    sscanf(line, "wifi_auto_off_enabled=%d", &v) == 1) {
             wifi_auto_off_enabled = v != 0;
+        } else if (sscanf(line, "wifi_bt_off_enabled = %d", &v) == 1 ||
+                   sscanf(line, "wifi_bt_off_enabled=%d", &v) == 1) {
+            wifi_bt_off_enabled = v != 0;
         } else if (sscanf(line, "theme_mode = %d", &v) == 1 ||
                    sscanf(line, "theme_mode=%d", &v) == 1) {
             if (v >= 0 && v < THEME_MODE_N) theme_mode = v;
@@ -11134,6 +11254,7 @@ static void save_conf(void) {
                 !conf_line_is(lines[n], "cover_palette_enabled") &&
                 !conf_line_is(lines[n], "bt_autoplay_enabled") &&
                 !conf_line_is(lines[n], "wifi_auto_off_enabled") &&
+                !conf_line_is(lines[n], "wifi_bt_off_enabled") &&
                 !conf_line_is(lines[n], "light_theme") &&
                 !conf_line_is(lines[n], "theme_mode") &&
                 !conf_line_is(lines[n], "tz_index") &&
@@ -11163,6 +11284,7 @@ static void save_conf(void) {
     fprintf(f, "cover_palette_enabled = %d\n", cover_palette_enabled);
     fprintf(f, "bt_autoplay_enabled = %d\n", bt_autoplay_enabled);
     fprintf(f, "wifi_auto_off_enabled = %d\n", wifi_auto_off_enabled);
+    fprintf(f, "wifi_bt_off_enabled = %d\n", wifi_bt_off_enabled);
     fprintf(f, "theme_mode = %d\n", theme_mode);
     fprintf(f, "tz_index = %d\n", tz_idx);
     fprintf(f, "shuffle_enabled = %d\n", shuffle_enabled);
@@ -12628,6 +12750,8 @@ int music_entry(void *a0, void *a1) {
                         qs_wifi = !qs_wifi;
                         st_wifi_set(qs_wifi);
                         wifi_pref = qs_wifi;
+                        wifi_bt_parked = 0;
+                        if (qs_wifi && net_held()) wifi_bt_override = 1;
                         save_conf();          /* R64 */
                     } else {
                         qs_bt = !qs_bt;
@@ -13374,15 +13498,20 @@ int music_entry(void *a0, void *a1) {
                     int on = !st_wifi_on();
                     st_wifi_set(on);
                     wifi_pref = on;
+                    wifi_bt_parked = 0;
+                    if (on && net_held()) wifi_bt_override = 1;   /* on by hand: stays on */
                     save_conf();          /* R64 */
                 } else if (row == 2) {
                     wifi_auto_off_enabled = !wifi_auto_off_enabled;   /* R84 */
                     save_conf();
                 } else if (row == 3) {
-                    wifi_scan_start();
+                    wifi_bt_off_enabled = !wifi_bt_off_enabled;
+                    save_conf();
                 } else if (row == 4) {
+                    wifi_scan_start();
+                } else if (row == 5) {
                     kb_open("Network name (SSID)", KB_PURPOSE_WIFI_SSID_MANUAL, "");
-                } else if (row >= 5) {
+                } else if (row >= WIFI_FIRST_NET_ROW) {
                     /* Resolved against wifi_nets[] -- the very list the draw
                      * loop put on screen -- rather than a fresh
                      * wifi_scan_results() call.
@@ -13407,7 +13536,7 @@ int music_entry(void *a0, void *a1) {
                      * sides can read the same thing (see their own comment).
                      * No separate visibility cap needed (R75) -- a row scrolled
                      * off-screen has no on-screen y for a touch to land on. */
-                    int idx = row - 5;
+                    int idx = row - WIFI_FIRST_NET_ROW;
                     if (idx >= 0 && idx < wifi_net_n) {
                         if (wifi_is_saved(wifi_nets[idx].ssid)) {
                             snprintf(wifi_connecting_ssid, sizeof(wifi_connecting_ssid), "%s", wifi_nets[idx].ssid);
@@ -13587,6 +13716,12 @@ int music_entry(void *a0, void *a1) {
                 int smooth_row = (y - off_row_base + off) / ROW_H;
                 if (screen == SC_QUEUE && y < CONTENT_Y + QUEUE_SUMMARY_H) smooth_row = -1;
                 if (screen == SC_MENU) {
+                    idx = TOP_N;
+                    for (int i = 0; i < TOP_N; i++) {
+                        int tx, ty, tw, th;
+                        home_tile(i, &tx, &ty, &tw, &th);
+                        if (x >= tx && x < tx + tw && y >= ty && y < ty + th) { idx = i; break; }
+                    }
                     /* R81: greyed out on the draw side for exactly the same
                      * condition -- see that comment for why. */
                     int usb_storage = st_usb_mode() == 1;
@@ -14109,7 +14244,8 @@ int music_entry(void *a0, void *a1) {
          * consumed its own "__DONE__" (and cleared the flag itself) by the
          * time reap looks, leaving reap to flag only a genuine early exit --
          * one that ended without ever writing that line. */
-        if ((pod_sync_deferred || pod_dl_deferred_idx >= 0) && !net_held()) {
+        if ((pod_sync_deferred || pod_dl_deferred_idx >= 0) && !net_held() &&
+            !wifi_bt_parked && (st_wifi_has_ip() || !wifi_pref)) {
             if (pod_sync_deferred && !pod_update_running()) {
                 pod_sync_deferred = 0;
                 pod_update_start();
@@ -14775,7 +14911,7 @@ int music_entry(void *a0, void *a1) {
                  * load_page() is only re-checked on a whole-row `changed`,
                  * so forcing continuous redraw there risks a mid-drag frame
                  * reading rows outside the currently loaded page. */
-                int continuous = (screen == SC_TRACKS && !ab_list && !pod_list) || screen == SC_ARTIST_PAGE ||
+                int continuous = px_scrolled_screen() ||
                                   screen == SC_PLAYLISTS || screen == SC_RADIO || screen == SC_QUEUE ||
                                   screen == SC_EQ_BANDS || screen == SC_SETTINGS ||
                                   screen == SC_SETTINGS_WIFI || screen == SC_SETTINGS_BT || screen == SC_SETTINGS_TIMEZONE;
@@ -14797,9 +14933,9 @@ int music_entry(void *a0, void *a1) {
                  * otherwise never spring back -- force the coast tick to
                  * run regardless, so out-of-bounds always resolves rather
                  * than sticking wherever the finger happened to let go. */
-                if (screen == SC_TRACKS && !ab_list && !pod_list) {
+                if (px_scrolled_screen()) {
                     int cur = scroll * ROW_H + scroll_px;
-                    if (cur < 0 || cur > tracks_max_px()) inertia_active = 1;
+                    if (cur < 0 || cur > px_max()) inertia_active = 1;
                 }
                 dirty = 1;
             }
@@ -14809,7 +14945,7 @@ int music_entry(void *a0, void *a1) {
              * true-pixel-bounded screens (tracks_max_px()/artist_page_max_px()
              * are rubber-band bounds, not a row count) -- kept scoped to just
              * those two, unlike the broader continuous-redraw forcing. */
-            int continuous = (screen == SC_TRACKS && !ab_list && !pod_list) || screen == SC_ARTIST_PAGE;
+            int continuous = px_scrolled_screen();
             if (continuous) {
                 /* Spring pull toward whichever bound is exceeded, layered
                  * onto the ordinary fling velocity below -- proportional to
@@ -14822,7 +14958,7 @@ int music_entry(void *a0, void *a1) {
                  * is out of this request's scope) speeds up the pull without
                  * changing its easing shape. */
                 int cur = scroll * ROW_H + scroll_px;
-                int max_px = (screen == SC_ARTIST_PAGE) ? artist_page_max_px() : tracks_max_px();
+                int max_px = px_max();
                 if (cur < 0) list_velocity += (0 - cur) * 0.1875f;
                 else if (cur > max_px) list_velocity += (max_px - cur) * 0.1875f;
             }
@@ -14849,7 +14985,7 @@ int music_entry(void *a0, void *a1) {
                 int still_out = 0;
                 if (continuous) {
                     int cur = scroll * ROW_H + scroll_px;
-                    int max_px = (screen == SC_ARTIST_PAGE) ? artist_page_max_px() : tracks_max_px();
+                    int max_px = px_max();
                     if (cur < 0 && cur > -2) scroll_to_px(0);
                     else if (cur > max_px && cur < max_px + 2) scroll_to_px(max_px);
                     else still_out = cur < 0 || cur > max_px;
@@ -15062,7 +15198,7 @@ int music_entry(void *a0, void *a1) {
                         (now.tv_nsec - touch_at.tv_nsec) / 1000000L;
             if (held >= HOLD_MS) {
                 int off = scroll * ROW_H + scroll_px;
-                int idx = (touch_y + off - CONTENT_Y) / ROW_H - 5;
+                int idx = (touch_y + off - CONTENT_Y) / ROW_H - WIFI_FIRST_NET_ROW;
                 hold_fired = 1;
                 if (idx >= 0 && idx < wifi_net_n && wifi_is_saved(wifi_nets[idx].ssid)) {
                     snprintf(sheet_wifi_ssid, sizeof(sheet_wifi_ssid), "%s", wifi_nets[idx].ssid);

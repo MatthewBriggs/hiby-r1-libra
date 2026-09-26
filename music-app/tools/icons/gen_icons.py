@@ -89,6 +89,17 @@ SPECS = [
     # Bumped 28 -> 38, same reasoning and same live report as USB just
     # above -- sits next to Wi-Fi/Bluetooth-sized glyphs in the same panel.
     ("palette", "palette-solid-full.svg.png", "palette", [(38, 38, "_qs")]),
+    # Home screen grid (Lucide line icons, the user's own picks). One family:
+    # all share Lucide's 24-unit box and 2-unit stroke, and a shared crop keeps
+    # the stroke the same weight on every tile.
+    ("home", "home-music.svg.png",      "home_music",      [(88, 88, "")]),
+    ("home", "home-audiobooks.svg.png", "home_audiobooks", [(88, 88, "")]),
+    ("home", "home-podcasts.svg.png",   "home_podcasts",   [(88, 88, "")]),
+    ("home", "home-eq.svg.png",         "home_eq",         [(56, 56, "")]),
+    ("home", "home-mseb.svg.png",       "home_mseb",       [(56, 56, "")]),
+    ("home", "home-radio.svg.png",      "home_radio",      [(88, 88, "")]),
+    ("home", "home-stats.svg.png",      "home_stats",      [(56, 56, "")]),
+    ("home", "home-settings.svg.png",   "home_settings",   [(56, 56, "")]),
 ]
 
 def load_full(path):
