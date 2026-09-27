@@ -69,6 +69,7 @@ typedef struct {
 #include "podcast.h"
 #include "audio.h"
 #include "waveform.h"
+#include "btplayer.h"
 #include "eq.h"
 #include "eqprofile.h"
 #include "mseb.h"
@@ -472,11 +473,12 @@ static int usb_bypass_saved_vol;
  * icon, and content starts straight under it. */
 #define CONTENT_Y STATUS_H
 #define ROW_H     72
-/* R50: the Queue screen's one extra header line (track count + remaining
- * playtime), fixed above the scrolling rows rather than the first row's own
- * slot -- vis_rows()/scroll_to_px() both need to know the list itself has
- * this much less room on that one screen. */
-#define QUEUE_SUMMARY_H 44
+/* The Queue screen keeps a bar of its own under the status strip -- its name,
+ * the Clear action, and R50's track count and remaining playtime -- fixed
+ * above the scrolling rows rather than in the first row's slot, so
+ * vis_rows()/scroll_to_px() both need to know the list itself has this much
+ * less room on that one screen. The old title bar's height. */
+#define QUEUE_BAR_H 78
 /* How many consecutive ticks since inertia was last active a scrollable
  * list needs before a tap is trusted as a real row selection rather than
  * the tail end of a fling. ~100ms at the ~30/s tick rate this loop runs
@@ -2965,7 +2967,7 @@ static int settings_content_rows(void) {
  * pushed by hand, not by CI against a tagged commit), so this stays a
  * literal that a human edits; the discipline is remembering to, not the
  * mechanism. */
-#define LIBRARY_VERSION "0.57.2"
+#define LIBRARY_VERSION "0.58"
 
 /* A custom-built kernel keeps uname()'s own release string exactly
  * "4.4.94+" on purpose -- that string is also the vermagic every one of the
@@ -4484,7 +4486,7 @@ static int vis_rows(void) {
     /* R50: the Queue screen's one extra header line (track count + playtime)
      * sits above the rows, not in the first row's own slot -- one fewer
      * row's worth of height is actually available to scroll through. */
-    if (screen == SC_QUEUE) top += QUEUE_SUMMARY_H;
+    if (screen == SC_QUEUE) top += QUEUE_BAR_H;
     /* Reported live: the plain-album screen reserved the same 40px bottom
      * margin as every other screen unconditionally, whether or not there
      * was actually a sheet_note toast to show in it -- a track could settle
@@ -6360,11 +6362,11 @@ static int np_chrome_themed(void) {
 static int qc_on_album_page(void) { return screen == SC_TRACKS && !ab_list; }   /* album or podcast page */
 static int qc_popup_themed(void) {
     return qc_on_album_page() ? (cover_palette_enabled && np_view_palette_valid)
-                              : (np_chrome_themed() && screen == SC_PLAYING);
+                              : (np_chrome_themed() && (screen == SC_PLAYING || screen == SC_QUEUE));
 }
 static int qc_panel_themed(void) {
     return qc_on_album_page() ? (cover_palette_enabled && np_view_palette_valid)
-                              : (np_chrome_themed() && screen == SC_PLAYING);
+                              : (np_chrome_themed() && (screen == SC_PLAYING || screen == SC_QUEUE));
 }
 static uint16_t qc_bg(void)     { return qc_on_album_page() ? np_view_col_bg()     : np_col_bg(); }
 static uint16_t qc_accent(void) { return qc_on_album_page() ? np_view_col_accent() : np_col_accent(); }
@@ -7100,6 +7102,9 @@ static void draw_speaker(uint16_t *fb, int x, int y, uint16_t c) {
 /* Set per frame by draw_screen(): the podcast episode page is painted from
  * its feed's cover, so the status strip above it follows. */
 static int g_pod_theme;
+/* The same, for the Queue: the playing track's palette (np_*), not the
+ * browsed page's (np_view_*). */
+static int g_queue_theme;
 
 /* Which Home section the screen on show belongs to -- its icon rides in the
  * status strip beside the back arrow. NULL on Home itself. */
@@ -7142,7 +7147,9 @@ static int status_action_x(const char *label) {
 
 static void draw_status(uint16_t *fb) {
     char buf[16];
-    uint16_t sdim = g_pod_theme ? np_view_col_dim() : COL_DIM;
+    uint16_t sdim  = g_pod_theme ? np_view_col_dim()    : g_queue_theme ? np_col_dim()    : COL_DIM;
+    uint16_t sacc  = g_pod_theme ? np_view_col_accent() : g_queue_theme ? np_col_accent() : COL_ACCENT;
+    uint16_t sline = g_pod_theme ? np_view_col_line()   : g_queue_theme ? np_col_line()   : COL_LINE;
     int h = STATUS_H;
     int px = STATUS_TEXT_PX;
     /* One shared centre line. Everything here is positioned from it rather
@@ -7156,10 +7163,9 @@ static void draw_status(uint16_t *fb) {
     int lx = 24;
     const icon_t *sec = status_section_icon();
     if (sec) {
-        uint16_t acc = g_pod_theme ? np_view_col_accent() : COL_ACCENT;
-        draw_back_arrow(fb, BACK_ARROW_X, mid, acc);
+        draw_back_arrow(fb, BACK_ARROW_X, mid, sacc);
         int sx = BACK_ARROW_X + BACK_ARROW_W + 10;
-        draw_icon(fb, FB_W, FB_H, sx, mid - sec->h / 2, sec, acc);
+        draw_icon(fb, FB_W, FB_H, sx, mid - sec->h / 2, sec, sacc);
         lx = sx + sec->w + 22;
     }
 
@@ -7182,7 +7188,7 @@ static void draw_status(uint16_t *fb) {
     const icon_t *bic = pct > 87 ? &icon_batt_100_lg : pct > 62 ? &icon_batt_75_lg
                       : pct > 37 ? &icon_batt_50_lg : pct > 12 ? &icon_batt_25_lg : &icon_batt_0_lg;
     int bx = FB_W - 20 - bic->w;
-    uint16_t bc = st_charging() ? COL_ACCENT : (pct >= 0 && pct <= 15 ? RGB(230, 80, 70) : COL_DIM);
+    uint16_t bc = st_charging() ? sacc : (pct >= 0 && pct <= 15 ? RGB(230, 80, 70) : sdim);
     draw_icon(fb, FB_W, FB_H, bx, mid - bic->h / 2, bic, bc);
     if (pct >= 0) {
         snprintf(buf, sizeof(buf), "%d%%", pct);
@@ -7190,7 +7196,7 @@ static void draw_status(uint16_t *fb) {
         draw_text(fb, bx - 11 - tw, ty, buf, sdim, px, FB_W);
     }
 
-    fill_rect(fb, 0, h - 1, FB_W, 1, g_pod_theme ? np_view_col_line() : COL_LINE);
+    fill_rect(fb, 0, h - 1, FB_W, 1, sline);
 }
 
 /* Word-wrapped, scrollable show notes -- drawn in place of the cover art
@@ -7358,6 +7364,39 @@ static void draw_keyboard(uint16_t *fb) {
     }
 }
 
+/* "Clear" on the Queue bar: its left edge, for the draw and the tap alike, so
+ * the two cannot drift apart. */
+static int queue_clear_x(void) {
+    return FB_W - 24 - text_width("Clear", TEXT_PX_BODY);
+}
+
+/* Whether there is anything after the playing track for Clear to drop. */
+static int queue_has_more(void) {
+    return cur_track >= 0 && cur_track < queue_n &&
+           next_track_index() >= 0 && next_track_index() != cur_track;
+}
+
+/* R52: drop everything queued after the currently-playing track -- that one
+ * keeps playing undisturbed to its own end, same as reaching it naturally
+ * would, it just has nothing left queued up behind it once it does. No
+ * confirmation step: unlike deleting a playlist or a file, nothing here is
+ * lost for good -- queuing more is one "Play next"/"Add to queue" away. */
+static void queue_clear_rest(void) {
+    if (!queue_has_more()) return;
+    int cur_pos = queue_play_pos(cur_track);
+    unsigned char keep[QUEUE_MAX];
+    for (int r = 0; r < queue_n; r++) keep[r] = queue_play_pos(r) <= cur_pos;
+    queue_compact(keep);
+    /* Reported live: swiping back afterward showed a mangled "album" page --
+     * the real album, but missing every track Clear had just dropped. Same
+     * root cause as the Add-to-Queue/Play-Next case: once queue[] no longer
+     * matches what a fresh browse of q_album would produce, it can't be
+     * presented as that album's own page. Playlists excluded for the same
+     * reason queue_insert() excludes them. */
+    if (!q_is_playlist) queue_mixed = 1;
+    queue_follower();
+}
+
 static void draw_screen(uint16_t *fb) {
     if (screen == SC_KEYBOARD) { draw_keyboard(fb); return; }
     /* R14 flagged skipping this full clear (header/mini-player strips are
@@ -7392,7 +7431,7 @@ static void draw_screen(uint16_t *fb) {
      * excluded regardless of mini_visible() -- unchanged from before, see
      * the R111 comment just below on why. */
     if (cover_palette_enabled && !audiobook_mode && !radio_mode && !recording_playback_mode &&
-        (screen == SC_PLAYING || mini_visible()))
+        (screen == SC_PLAYING || screen == SC_QUEUE || mini_visible()))
         compute_cover_palette();
     /* R-albumtheme: same idea, for the album-detail screen (R46's own
      * "plain_album" condition -- a real album, not an audiobook/podcast
@@ -7421,9 +7460,12 @@ static void draw_screen(uint16_t *fb) {
         view_compute_cover_palette();
     int pod_th = pod_view && cover_palette_enabled && np_view_palette_valid;
     g_pod_theme = pod_th;
+    int q_th = screen == SC_QUEUE && np_chrome_themed() && np_palette_valid;
+    g_queue_theme = q_th;
     fill_rect(fb, 0, 0, FB_W, FB_H,
               (screen == SC_PLAYING && !audiobook_mode) ? np_col_bg() :
-              (np_view_album || pod_th) ? np_view_col_bg() : COL_BG);
+              (np_view_album || pod_th) ? np_view_col_bg() :
+              q_th ? np_col_bg() : COL_BG);
     /* The player has no title bar at all: a strip saying "Now playing" over a
      * screen showing the track, the artist and the artwork was telling you
      * what you could already see, and it was 62px that the artwork wanted.
@@ -7439,7 +7481,7 @@ static void draw_screen(uint16_t *fb) {
      * the swipe gesture everywhere else already relies on. */
     if (screen != SC_PLAYING && screen != SC_ARTIST_PAGE && !(screen == SC_TRACKS && !ab_list && !pod_list)) {
         fill_rect(fb, 0, 0, FB_W, screen == SC_MENU ? STATUS_H : CONTENT_Y,
-                  pod_th ? np_view_col_bg() : COL_HEADER);
+                  pod_th ? np_view_col_bg() : q_th ? np_col_bg() : COL_HEADER);
     }
 
     /* Every screen but Home has somewhere to go back to (the status strip's
@@ -7467,15 +7509,6 @@ static void draw_screen(uint16_t *fb) {
          * on/off state, which the user didn't ask to lose. */
         if (screen == SC_MSEB)
             draw_text(fb, status_action_x("Reset"), aty, "Reset", COL_ACCENT, STATUS_TEXT_PX, FB_W);
-        /* R52: Queue's one extra header action -- drop everything queued
-         * after the currently-playing track. Dimmed when there's nothing
-         * past it to clear. */
-        if (screen == SC_QUEUE) {
-            int has_more = cur_track >= 0 && cur_track < queue_n &&
-                           next_track_index() >= 0 && next_track_index() != cur_track;
-            draw_text(fb, status_action_x("Clear"), aty, "Clear",
-                      has_more ? COL_ACCENT : COL_DIM, STATUS_TEXT_PX, FB_W);
-        }
         draw_status(fb);
     }
 
@@ -7724,6 +7757,20 @@ static void draw_screen(uint16_t *fb) {
     }
 
     if (screen == SC_QUEUE) {
+        /* The playing track's cover colours, as on Now Playing -- this is its
+         * queue (g_queue_theme, set above: cover colours on, a palette to
+         * use, and not an audiobook, which stays plain there too). Secondary
+         * text follows np_col_dim(), which is np_fg itself when themed (R92:
+         * on a dark cover, all text white); what has to read as muted -- a
+         * Clear with nothing to clear, the grips -- blends toward it instead. */
+        int qth = g_queue_theme;
+        uint16_t q_text = qth ? np_col_fg()     : COL_TEXT;
+        uint16_t q_dim  = qth ? np_col_dim()    : COL_DIM;
+        uint16_t q_acc  = qth ? np_col_accent() : COL_ACCENT;
+        uint16_t q_line = qth ? np_col_line()   : COL_LINE;
+        uint16_t q_row  = qth ? np_blend(np_bg, np_fg, 0.12f) : COL_ROW;
+        uint16_t q_bar  = qth ? np_col_bg()     : COL_HEADER;
+        uint16_t q_mute = qth ? np_blend(np_bg, np_fg, 0.45f) : COL_DIM;
         /* R50: track count (the whole queue, matching what the list below
          * actually has rows for) and remaining playtime (summed from the
          * currently-playing track onward, not the whole queue -- "how much
@@ -7742,15 +7789,23 @@ static void draw_screen(uint16_t *fb) {
             snprintf(line, sizeof(line), "%s \xc2\xb7 %s total", cbuf, dbuf);
             /* Fixed, not scrolled -- vis_rows() already excludes this height
              * from the scrollable area (see its own SC_QUEUE case), so this
-             * is a sticky header, not the list's own first row. */
-            draw_text_clip(fb, 24, y + 16, line, COL_DIM, TEXT_PX_SMALL, FB_W - 40, CONTENT_Y, clip_bot);
-            fill_rect_clip(fb, 0, y + QUEUE_SUMMARY_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
+             * is a sticky header, not the list's own first row. The header
+             * colour, continuing the status strip above it, the way the old
+             * title bar did; Clear (dimmed with nothing after the playing
+             * track to drop) on the right, where R52 first put it. */
+            fill_rect(fb, 0, y, FB_W, QUEUE_BAR_H, q_bar);
+            int cx = queue_clear_x();
+            draw_text(fb, 24, y + 8, "Queue", q_text, TEXT_PX_TITLE, cx - 24);
+            draw_text(fb, 24, y + 48, line, q_dim, TEXT_PX_SMALL, cx - 24);
+            draw_text(fb, cx, y + (QUEUE_BAR_H - TEXT_PX_BODY) / 2 - 2, "Clear",
+                      queue_has_more() ? q_acc : q_mute, TEXT_PX_BODY, FB_W);
+            fill_rect(fb, 0, y + QUEUE_BAR_H - 1, FB_W, 1, q_line);
         }
         /* R76: smooth per-pixel scroll for the rows below the fixed summary
          * -- see SC_PLAYLISTS' own comment. list_top (not CONTENT_Y) is
          * both the row loop's base and its own top clip bound, so a
          * scrolled row can never bleed up over the summary line itself. */
-        int list_top = CONTENT_Y + QUEUE_SUMMARY_H;
+        int list_top = CONTENT_Y + QUEUE_BAR_H;
         int off = scroll * ROW_H + scroll_px;
         /* BG71: the actual upcoming play order -- queue_display_index()
          * walks shuffle_order[] when shuffle's on rather than plain array
@@ -7781,15 +7836,15 @@ static void draw_screen(uint16_t *fb) {
             int swiping_this = queue_swipe_active && display_i == queue_swipe_display_i;
             int dx0 = swiping_this ? queue_swipe_dx : 0;
             if (swiping_this)
-                fill_rect_clip(fb, 0, y, FB_W, ROW_H, COL_ACCENT, list_top, clip_bot);
+                fill_rect_clip(fb, 0, y, FB_W, ROW_H, q_acc, list_top, clip_bot);
             if (playing && !swiping_this) {
-                fill_rect_clip(fb, 0, y, FB_W, ROW_H, COL_ROW, list_top, clip_bot);
-                fill_rect_clip(fb, 0, y, 4, ROW_H, COL_ACCENT, list_top, clip_bot);
+                fill_rect_clip(fb, 0, y, FB_W, ROW_H, q_row, list_top, clip_bot);
+                fill_rect_clip(fb, 0, y, 4, ROW_H, q_acc, list_top, clip_bot);
             }
             if (dragging_this) {
-                if (!playing) fill_rect_clip(fb, 0, y, FB_W, ROW_H, COL_ROW, list_top, clip_bot);
-                fill_rect_clip(fb, 0, y, FB_W, 2, COL_ACCENT, list_top, clip_bot);
-                fill_rect_clip(fb, 0, y + ROW_H - 2, FB_W, 2, COL_ACCENT, list_top, clip_bot);
+                if (!playing) fill_rect_clip(fb, 0, y, FB_W, ROW_H, q_row, list_top, clip_bot);
+                fill_rect_clip(fb, 0, y, FB_W, 2, q_acc, list_top, clip_bot);
+                fill_rect_clip(fb, 0, y + ROW_H - 2, FB_W, 2, q_acc, list_top, clip_bot);
             }
             /* R70 step 1: FB_W - 150, not the usual FB_W - 110 every other
              * duration-bearing row uses -- 40px carved out on the right for
@@ -7804,7 +7859,7 @@ static void draw_screen(uint16_t *fb) {
              * completely accent colour"). Shifting both keeps the same
              * window, just moved, so the row's own text reads exactly as it
              * always did throughout the swipe -- only its position changes. */
-            draw_text_clip(fb, 24 + dx0, y + 20, t->name, playing ? COL_ACCENT : COL_TEXT,
+            draw_text_clip(fb, 24 + dx0, y + 20, t->name, playing ? q_acc : q_text,
                           TEXT_PX_BODY, FB_W - 150 + dx0, list_top, clip_bot);
             if (t->dur_ms > 0) {
                 char b[16];
@@ -7813,14 +7868,14 @@ static void draw_screen(uint16_t *fb) {
                 /* Same right margin (24px, minus the index strip) draw_right_clip()
                  * uses, just shifted left by the grip's own reserved column. */
                 int right = FB_W - 24 - (index_visible() ? INDEX_W : 0) - 40;
-                draw_text_clip(fb, right - bw + dx0, y + 22, b, COL_DIM, TEXT_PX_SMALL,
+                draw_text_clip(fb, right - bw + dx0, y + 22, b, q_dim, TEXT_PX_SMALL,
                                FB_W + dx0, list_top, clip_bot);
             }
             /* R70: the drag handle -- accent while this exact row is the one
              * being dragged, same as the rest of dragging_this's highlight. */
             draw_grip_icon_clip(fb, FB_W - 24 - (index_visible() ? INDEX_W : 0) - 16 + dx0,
                                  y + (ROW_H - 24) / 2,
-                                 (playing || dragging_this) ? COL_ACCENT : COL_DIM, list_top, clip_bot);
+                                 (playing || dragging_this) ? q_acc : q_mute, list_top, clip_bot);
             /* BUG fix: this 1px COL_LINE separator used to draw unconditionally,
              * landing right on top of dragging_this's own 2px bottom accent
              * border and painting over its last pixel -- the top border stayed
@@ -7831,7 +7886,7 @@ static void draw_screen(uint16_t *fb) {
              * grey line cutting across a full-row accent reveal would read
              * as a rendering glitch, not a deliberate row boundary. */
             if (!dragging_this && !swiping_this)
-                fill_rect_clip(fb, 0, y + ROW_H - 1, FB_W, 1, COL_LINE, list_top, clip_bot);
+                fill_rect_clip(fb, 0, y + ROW_H - 1, FB_W, 1, q_line, list_top, clip_bot);
         }
         if (mini_visible()) draw_mini(fb);
         return;
@@ -9667,7 +9722,8 @@ static void draw_screen(uint16_t *fb) {
  * then read as a +120px delete. A leftward drag from inside the zone can never
  * reach the -120px delete distance anyway. One definition shared by every
  * list. */
-#define ROW_SWIPE_BLOCKED (edge_active || touch_x < EDGE_ZONE)
+#define ROW_SWIPE_BLOCKED (edge_active || touch_x < EDGE_ZONE || \
+                           qd_edge_active || touch_x >= FB_W - QD_EDGE_ZONE)
 #define EDGE_TRAVEL 60
 #define HOLD_MS     550
 /* R80: deliberately much narrower than EDGE_ZONE -- a normal scroll to the
@@ -9758,6 +9814,112 @@ static int drag_threshold(void) {
     return ms < FAST_TAP_MS ? FAST_DRAG_MIN : DRAG_MIN;
 }
 
+/* ---- the queue drawer ---------------------------------------------------
+ * The Queue slides in from the right edge the way quick settings pulls down
+ * from the top: it follows the finger, opens if let go past a third of the
+ * way, and slides back out on "back" (the arrow, the left-edge swipe, or a
+ * swipe right along its own bar). Fully open it is just the Queue screen,
+ * SC_QUEUE, so every gesture that screen has keeps working; while it moves it
+ * is two images cached for the length of the slide -- the screen underneath
+ * and the queue -- composed at the slide's offset each frame, the same trick
+ * quick settings uses (see draw_ui()). */
+#define QD_EDGE_ZONE 32              /* how near the right edge a pull must start */
+static int qd_active;                /* sliding: `screen` is still the one underneath */
+static int qd_pulling;               /* ...and following the finger */
+static int qd_slide;                 /* 0..FB_W: how much of the queue is on screen */
+static int qd_target;                /* where an unfingered slide is heading: 0 or FB_W */
+static int qd_fresh;                 /* both images rendered for this slide */
+static int qd_edge_active, qd_edge_travel;   /* read_gesture(): a pull from the right edge */
+static int qd_is_drawer;             /* SC_QUEUE opened as the drawer: back slides it away */
+static screen_t qd_under_screen;     /* ...to this, as it was left */
+static int qd_under_scroll, qd_under_scroll_px;
+static int qd_scroll, qd_scroll_px;  /* the queue's own scroll while it is not the screen */
+
+/* Whether a pull from the right edge may open the drawer from here. Not where
+ * something else owns that edge -- the A-Z strip, a playlist's reorder grips
+ * -- or a finger is already busy with a slider; and not with nothing queued,
+ * or on the radio, which has no queue. */
+static int qd_pull_allowed(void) {
+    if (queue_n <= 0 || radio_mode || recording_playback_mode) return 0;
+    if (screen == SC_QUEUE || screen == SC_KEYBOARD) return 0;
+    if (screen == SC_TRACKS && browsing_is_playlist && !ab_list && !pod_list) return 0;
+    if (index_visible()) return 0;
+    if (qs_open || qs_pulling || sheet_open || qd_active) return 0;
+    if (scrub_active || eq_dragging || title_dragging || vol_dragging || mseb_grab >= 0) return 0;
+    return 1;
+}
+
+/* pulled: following a finger (else animating open on its own, as the queue
+ * button does). The queue always opens at its top. */
+static void qd_begin_open(int pulled) {
+    qd_active = 1;
+    qd_pulling = pulled;
+    qd_slide = 0;
+    qd_target = FB_W;
+    qd_fresh = 0;
+    qd_scroll = 0;
+    qd_scroll_px = 0;
+}
+
+/* Fully open: the queue becomes the screen, and what was underneath is kept,
+ * scroll included, to slide back to. */
+static void qd_finish_open(void) {
+    qd_under_screen = screen;
+    qd_under_scroll = scroll;
+    qd_under_scroll_px = scroll_px;
+    screen = SC_QUEUE;
+    scroll = qd_scroll;
+    scroll_px = qd_scroll_px;
+    list_dragging = 0; inertia_active = 0; list_velocity = 0;
+    queue_via_back = 0;
+    qd_is_drawer = 1;
+    qd_active = 0;
+}
+
+/* Back, from the drawer: the screen underneath is restored at once (it is what
+ * the slide reveals) and the queue slides off to the right over it. */
+static void qd_begin_close(void) {
+    qd_scroll = scroll;
+    qd_scroll_px = scroll_px;
+    screen = qd_under_screen;
+    scroll = qd_under_scroll;
+    scroll_px = qd_under_scroll_px;
+    list_dragging = 0; inertia_active = 0; list_velocity = 0;
+    qd_is_drawer = 0;
+    qd_active = 1;
+    qd_pulling = 0;
+    qd_slide = FB_W;
+    qd_target = 0;
+    qd_fresh = 0;
+}
+
+/* The queue as it would be drawn full screen, into `buf`, while `screen` is
+ * really the one underneath -- for the slide's cached image. */
+static void draw_screen(uint16_t *fb);
+static void qd_render_queue(uint16_t *buf) {
+    screen_t s = screen;
+    int sc = scroll, sp = scroll_px;
+    screen = SC_QUEUE;
+    scroll = qd_scroll;
+    scroll_px = qd_scroll_px;
+    draw_screen(buf);
+    screen = s;
+    scroll = sc;
+    scroll_px = sp;
+}
+
+/* Underneath on the left, the queue's own left edge at FB_W - slide, and a
+ * line down that edge so the two do not run together. */
+static void qd_compose(uint16_t *fb, const uint16_t *under, const uint16_t *queue_img, int slide) {
+    int x0 = FB_W - slide;
+    for (int y = 0; y < FB_H; y++) {
+        uint16_t *row = fb + (size_t)y * FB_W;
+        if (x0 > 0) memcpy(row, under + (size_t)y * FB_W, (size_t)x0 * sizeof(uint16_t));
+        if (slide > 0) memcpy(row + x0, queue_img + (size_t)y * FB_W, (size_t)slide * sizeof(uint16_t));
+    }
+    if (slide > 0 && slide < FB_W) fill_rect(fb, x0, 0, 2, FB_H, COL_LINE);
+}
+
 /* A finger that slid sideways and lifted still arrives as a tap, at the
  * release point: read_gesture() calls only vertical travel a drag, and the
  * horizontal controls rely on that -- the scrub bar seeks, the volume popup
@@ -9808,6 +9970,7 @@ static int read_gesture(int fd, int *ox, int *oy) {
             if (ev.value == 1) {
                 down_x = x; down_y = y; moved = 0; have_down = 1;
                 edge_active = 0; edge_travel = 0;
+                qd_edge_active = 0; qd_edge_travel = 0;
                 home_edge_active = 0; home_edge_travel = 0;
                 touch_down = 1; touch_x = x; touch_y = y;
                 touch_moved = 0; hold_fired = 0;
@@ -9824,6 +9987,8 @@ static int read_gesture(int fd, int *ox, int *oy) {
                 edge_active = 0;
                 home_edge_active = 0;
                 touch_down = 0;
+                int qd_pulled = qd_edge_active;
+                qd_edge_active = 0;
                 int dx = x - down_x, dy = y - down_y;
                 /* Not while scrubbing, and not with quick settings open. The
                  * progress bar and the brightness slider both start at x=24,
@@ -9847,6 +10012,8 @@ static int read_gesture(int fd, int *ox, int *oy) {
                            down_y >= 0 && down_y > FB_H - HOME_EDGE_ZONE &&
                            (down_y - y) > HOME_EDGE_TRAVEL && (down_y - y) > abs(dx)) {
                     out = 5;
+                } else if (qd_pulled) {
+                    out = 6;              /* the queue drawer let go -- see its tick */
                 } else if (moved) {
                     out = 2; *oy = dy;
                 } else if (hold_fired) {
@@ -9870,6 +10037,15 @@ static int read_gesture(int fd, int *ox, int *oy) {
                 edge_travel = edx;
                 edge_y = y;
             }
+        }
+        /* The queue drawer: a pull leftward from the right edge, followed
+         * live the same way (the main loop drives the slide from
+         * qd_edge_travel). Latched once started, so the finger drifting
+         * back past its start just closes the slide rather than dropping it. */
+        if (have_down && down_x >= FB_W - QD_EDGE_ZONE && (qd_edge_active || qd_pull_allowed())) {
+            int ldx = down_x - x;
+            if (qd_edge_active) qd_edge_travel = ldx > 0 ? ldx : 0;
+            else if (ldx > 4 && ldx > abs(y - down_y)) { qd_edge_active = 1; qd_edge_travel = ldx; }
         }
         /* R80: same live-preview reasoning as the back gesture just above,
          * for the bottom-edge home swipe. */
@@ -10112,6 +10288,7 @@ static int go_back(void) {
             screen = kb_return_screen;
             break;
         case SC_QUEUE:
+            if (qd_is_drawer) { qd_begin_close(); break; }
             /* Reported live: reached via the queue button, "back" means
              * "close the queue", landing on Now Playing is right. Reached as
              * the swipe-back-from-Now-Playing fallback for a mixed queue
@@ -10329,6 +10506,18 @@ static uint16_t mix565(uint16_t a, uint16_t b, int t /* 0..256 */) {
 #define HINT_MAX_W 8
 #define HINT_H     150
 
+/* The edge-swipe hints, from the page's faint line colour to its accent as
+ * the swipe nears letting go -- the page's own colours, so the same palette
+ * the dropdown and popups follow (qc_popup_themed()): the playing track's
+ * cover on Now Playing and the Queue, the browsed album's on an album or
+ * podcast page, the plain theme everywhere else. Reported live twice: first
+ * on Now Playing (its accent followed the art, this hint did not), then on
+ * the Queue once that took the cover colours too. */
+static uint16_t hint_colour(int t) {
+    int th = qc_popup_themed();
+    return mix565(th ? qc_line() : COL_LINE, th ? qc_accent() : COL_ACCENT, t * t / 256);
+}
+
 static void draw_back_hint(uint16_t *fb) {
     int t = edge_travel * 256 / EDGE_TRAVEL;
     if (t > 256) t = 256;
@@ -10341,15 +10530,9 @@ static void draw_back_hint(uint16_t *fb) {
 
     /* Warm late rather than linearly: for most of the travel this should be
      * barely there, and only clearly accent-coloured once the swipe is far
-     * enough that letting go will actually go back. np_col_accent() on Now
-     * Playing specifically -- reported live: with cover-palette accents on,
-     * every other accent-coloured thing on that screen follows the art
-     * (np_col_accent()), but this hint stayed the plain theme COL_ACCENT
-     * regardless, reading as an off note against art with a very different
-     * accent. Every other screen has no art to derive from, so
-     * np_col_accent() already falls straight back to COL_ACCENT there --
-     * same call, no separate branch needed. */
-    uint16_t c = mix565(COL_LINE, screen == SC_PLAYING ? np_col_accent() : COL_ACCENT, t * t / 256);
+     * enough that letting go will actually go back. In the page's own
+     * colours -- see hint_colour(). */
+    uint16_t c = hint_colour(t);
     /* Tapered ends, so it reads as a soft highlight rather than a bar. */
     for (int i = 0; i < HINT_H; i++) {
         int d = i < HINT_H / 2 ? i : HINT_H - 1 - i;
@@ -10373,9 +10556,7 @@ static void draw_home_hint(uint16_t *fb) {
     if (left < 0) left = 0;
     if (left + HINT_H > FB_W) left = FB_W - HINT_H;
 
-    /* Same np_col_accent()-on-Now-Playing reasoning as draw_back_hint()
-     * just above. */
-    uint16_t c = mix565(COL_LINE, screen == SC_PLAYING ? np_col_accent() : COL_ACCENT, t * t / 256);
+    uint16_t c = hint_colour(t);   /* see draw_back_hint() */
     for (int i = 0; i < HINT_H; i++) {
         int d = i < HINT_H / 2 ? i : HINT_H - 1 - i;
         int hh = d < 24 ? h * d / 24 : h;
@@ -11228,7 +11409,22 @@ static void draw_ui(uint16_t *fb) {
      * is already correct and is simply left alone. */
     static uint16_t *qs_bg_scratch, *qs_slide_scratch;
     static int qs_scratch_fresh;
-    if (qs_slide > 0 && qs_slide < QS_H) {
+    /* The queue drawer mid-slide (see qd_begin_open()): the same two-cache
+     * idea as quick settings just below -- the screen underneath and the
+     * queue each drawn once per slide, then only composed per frame. */
+    static uint16_t *qd_under_img, *qd_queue_img;
+    if (qd_active && !qd_under_img) qd_under_img = malloc((size_t)FB_W * FB_H * sizeof(uint16_t));
+    if (qd_active && !qd_queue_img) qd_queue_img = malloc((size_t)FB_W * FB_H * sizeof(uint16_t));
+    if (qd_active && qd_under_img && qd_queue_img) {
+        if (!qd_fresh) {
+            draw_screen(qd_under_img);
+            if (index_visible()) draw_index(qd_under_img);
+            if (mini_visible()) draw_mini(qd_under_img);
+            qd_render_queue(qd_queue_img);
+            qd_fresh = 1;
+        }
+        qd_compose(fb, qd_under_img, qd_queue_img, qd_slide);
+    } else if (qs_slide > 0 && qs_slide < QS_H) {
         if (!qs_bg_scratch)    qs_bg_scratch    = malloc((size_t)FB_W * QS_H * sizeof(uint16_t));
         if (!qs_slide_scratch) qs_slide_scratch = malloc((size_t)FB_W * FB_H * sizeof(uint16_t));
         if (qs_bg_scratch && qs_slide_scratch) {
@@ -12260,6 +12456,90 @@ static void set_locked(int on) {
  * This unit has no play/pause button of its own; that control is on screen. */
 typedef enum { KEYS_BUTTONS = 0, KEYS_REMOTE } key_src_t;
 
+/* What a headset or remote asked for, by keycode: shared by the AVRCP and
+ * wired-remote input devices (handle_keys()) and by the Bluetooth media player
+ * interface (btplayer.c), whose Play/Pause/Next/Previous arrive as the same
+ * codes. Returns non-zero if anything happened. */
+static int remote_key(int code) {
+    int acted = 0;
+    switch (code) {
+        case KEY_PLAYPAUSE_:  audio_toggle();  acted = 1; break;
+        /* Explicit play and pause, so a headset asking to pause cannot
+         * toggle something already paused back into playing. */
+        case KEY_PLAYCD_:
+        case KEY_PLAY_:
+            if (audio_is_paused()) audio_toggle();
+            acted = 1;
+            break;
+        case KEY_PAUSECD_:
+        case KEY_PAUSE_:
+        case KEY_STOPCD_:
+            if (!audio_is_paused() && audio_is_active()) audio_toggle();
+            acted = 1;
+            break;
+        case KEY_NEXTSONG_:
+            if (audiobook_mode) ab_play_chapter(cur_track + 1);
+            else if (podcast_mode) { audio_seek_ms(audio_pos_ms() + 30000); seek_toast(+30000); }
+            else if (radio_mode) {
+                if (audio_radio_offset_ms() > 0) { audio_radio_seek_relative_ms(+10000); seek_toast(+10000); }
+            }
+            else                play_index(next_track_index());
+            acted = 1;
+            break;
+        case KEY_PREVSONG_:
+            /* Same rule as every other player: part-way in, previous means
+             * back to the start of this track — or of this chapter. A
+             * podcast episode instead gets the same -10s/+30s ad-skip as
+             * its on-screen transport (see the tap handler's comment).
+             * R60: this side used to be -30000, an asymmetric mismatch
+             * against the on-screen -10s arc even though the +30000 side
+             * above already matched it -- fixed to match both ways. */
+            if (audiobook_mode) {
+                const ab_chapter_t *ch =
+                    (cur_track >= 0 && cur_track < ab_book.chap_n)
+                        ? &ab_book.chap[cur_track] : NULL;
+                int64_t into = audio_pos_ms() - (ch ? ch->file_start_ms : 0);
+                if (into > 3000) audio_seek_ms((int)(ch ? ch->file_start_ms : 0));
+                else ab_play_chapter(cur_track - 1);
+            } else if (podcast_mode) {
+                audio_seek_ms(audio_pos_ms() - 10000);
+                seek_toast(-10000);
+            } else if (radio_mode) {
+                if (audio_radio_offset_ms() < audio_radio_max_rewind_ms()) { audio_radio_seek_relative_ms(-10000); seek_toast(-10000); }
+            } else if (audio_pos_ms() > 3000) {
+                audio_seek_ms(0);
+            } else {
+                play_index(prev_track_index());
+            }
+            acted = 1;
+            break;
+        case KEY_FASTFWD_: {
+            /* R60: was a flat +10000 for every mode, including podcast
+             * -- ignored its on-screen transport's own +30s forward
+             * amount (only the on-unit buttons' NEXTSONG_/PREVSONG_
+             * path had ever been taught that asymmetry). Audiobook and
+             * plain music already matched the on-screen amount at
+             * 10000, unchanged. */
+            if (radio_mode) {
+                if (audio_radio_offset_ms() > 0) { audio_radio_seek_relative_ms(+10000); seek_toast(+10000); }
+                acted = 1; break;
+            }
+            int d = podcast_mode ? 30000 : 10000;
+            audio_seek_ms(audio_pos_ms() + d); seek_toast(+d);
+            acted = 1; break;
+        }
+        case KEY_REWIND_:
+            if (radio_mode) {
+                if (audio_radio_offset_ms() < audio_radio_max_rewind_ms()) { audio_radio_seek_relative_ms(-10000); seek_toast(-10000); }
+                acted = 1; break;
+            }
+            audio_seek_ms(audio_pos_ms() - 10000); seek_toast(-10000);
+            acted = 1; break;
+        default: break;
+    }
+    return acted;
+}
+
 /* Returns non-zero if anything happened, so the caller can mark the UI dirty;
  * -1 means the fd itself has died and the caller should close and forget it
  * (see the comment below the loop). */
@@ -12457,81 +12737,7 @@ static int handle_keys(int fd, key_src_t src) {
             continue;
         }
 
-        switch (ev.code) {
-            case KEY_PLAYPAUSE_:  audio_toggle();  acted = 1; break;
-            /* Explicit play and pause, so a headset asking to pause cannot
-             * toggle something already paused back into playing. */
-            case KEY_PLAYCD_:
-            case KEY_PLAY_:
-                if (audio_is_paused()) audio_toggle();
-                acted = 1;
-                break;
-            case KEY_PAUSECD_:
-            case KEY_PAUSE_:
-            case KEY_STOPCD_:
-                if (!audio_is_paused() && audio_is_active()) audio_toggle();
-                acted = 1;
-                break;
-            case KEY_NEXTSONG_:
-                if (audiobook_mode) ab_play_chapter(cur_track + 1);
-                else if (podcast_mode) { audio_seek_ms(audio_pos_ms() + 30000); seek_toast(+30000); }
-                else if (radio_mode) {
-                    if (audio_radio_offset_ms() > 0) { audio_radio_seek_relative_ms(+10000); seek_toast(+10000); }
-                }
-                else                play_index(next_track_index());
-                acted = 1;
-                break;
-            case KEY_PREVSONG_:
-                /* Same rule as every other player: part-way in, previous means
-                 * back to the start of this track — or of this chapter. A
-                 * podcast episode instead gets the same -10s/+30s ad-skip as
-                 * its on-screen transport (see the tap handler's comment).
-                 * R60: this side used to be -30000, an asymmetric mismatch
-                 * against the on-screen -10s arc even though the +30000 side
-                 * above already matched it -- fixed to match both ways. */
-                if (audiobook_mode) {
-                    const ab_chapter_t *ch =
-                        (cur_track >= 0 && cur_track < ab_book.chap_n)
-                            ? &ab_book.chap[cur_track] : NULL;
-                    int64_t into = audio_pos_ms() - (ch ? ch->file_start_ms : 0);
-                    if (into > 3000) audio_seek_ms((int)(ch ? ch->file_start_ms : 0));
-                    else ab_play_chapter(cur_track - 1);
-                } else if (podcast_mode) {
-                    audio_seek_ms(audio_pos_ms() - 10000);
-                    seek_toast(-10000);
-                } else if (radio_mode) {
-                    if (audio_radio_offset_ms() < audio_radio_max_rewind_ms()) { audio_radio_seek_relative_ms(-10000); seek_toast(-10000); }
-                } else if (audio_pos_ms() > 3000) {
-                    audio_seek_ms(0);
-                } else {
-                    play_index(prev_track_index());
-                }
-                acted = 1;
-                break;
-            case KEY_FASTFWD_: {
-                /* R60: was a flat +10000 for every mode, including podcast
-                 * -- ignored its on-screen transport's own +30s forward
-                 * amount (only the on-unit buttons' NEXTSONG_/PREVSONG_
-                 * path had ever been taught that asymmetry). Audiobook and
-                 * plain music already matched the on-screen amount at
-                 * 10000, unchanged. */
-                if (radio_mode) {
-                    if (audio_radio_offset_ms() > 0) { audio_radio_seek_relative_ms(+10000); seek_toast(+10000); }
-                    acted = 1; break;
-                }
-                int d = podcast_mode ? 30000 : 10000;
-                audio_seek_ms(audio_pos_ms() + d); seek_toast(+d);
-                acted = 1; break;
-            }
-            case KEY_REWIND_:
-                if (radio_mode) {
-                    if (audio_radio_offset_ms() < audio_radio_max_rewind_ms()) { audio_radio_seek_relative_ms(-10000); seek_toast(-10000); }
-                    acted = 1; break;
-                }
-                audio_seek_ms(audio_pos_ms() - 10000); seek_toast(-10000);
-                acted = 1; break;
-            default: break;
-        }
+        acted |= remote_key(ev.code);
     }
     /* A short read of 0 is a true EOF, not "no data queued" (that's EAGAIN,
      * expected on nearly every poll of a nonblocking fd and not an error).
@@ -12548,6 +12754,65 @@ static int handle_keys(int fd, key_src_t src) {
     if (fd >= 0 && r == 0) return -1;
     if (fd >= 0 && r < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return -1;
     return acted;
+}
+
+/* What a Bluetooth device asked for through the media player interface
+ * (btplayer.c), as the key a remote would have sent for it -- so the rules are
+ * the same either way, explicit play and pause included. */
+static int bt_command(int cmd) {
+    switch (cmd) {
+        case BTP_CMD_PLAY:      return remote_key(KEY_PLAYCD_);
+        case BTP_CMD_PAUSE:     return remote_key(KEY_PAUSECD_);
+        case BTP_CMD_PLAYPAUSE: return remote_key(KEY_PLAYPAUSE_);
+        case BTP_CMD_STOP:      return remote_key(KEY_STOPCD_);
+        case BTP_CMD_NEXT:      return remote_key(KEY_NEXTSONG_);
+        case BTP_CMD_PREVIOUS:  return remote_key(KEY_PREVSONG_);
+        default:                return 0;
+    }
+}
+
+/* What is playing, for btplayer_update(): play status, and a title, artist
+ * and album for a headset (or car) that shows them. Only fields that stay put
+ * for the length of a track -- a change is sent on as a new track. */
+static void btplayer_tick(void) {
+    int st = !audio_is_active() ? BTP_STOPPED : audio_is_paused() ? BTP_PAUSED : BTP_PLAYING;
+    const char *title = "", *artist = "", *album = "";
+    int64_t len = 0;
+    int trk = 0;
+    char feed[LIB_NAME_LEN] = "";
+    if (radio_mode) {
+        title = radio_name;
+        artist = "Radio";
+    } else if (recording_playback_mode) {
+        title = recording_playback_name;
+        artist = "Radio recording";
+    } else if (cur_track >= 0 && cur_track < queue_n) {
+        const lib_track_t *t = &queue[cur_track];
+        title = t->name;
+        if (audiobook_mode) {
+            album = ab_book_title;
+            if (cur_track < ab_book.chap_n) len = ab_book.chap[cur_track].dur_ms;
+            trk = cur_track + 1;
+        } else if (podcast_mode) {
+            /* The feed is the episode's folder; cur_feed is whatever feed
+             * is being browsed, which need not be the one playing. */
+            const char *e = strrchr(t->path, '/');
+            if (e) {
+                const char *b = e;
+                while (b > t->path && b[-1] != '/') b--;
+                snprintf(feed, sizeof(feed), "%.*s", (int)(e - b), b);
+            }
+            artist = album = feed;
+            len = t->dur_ms;
+        } else {
+            int qi = qid_find(t->path);
+            artist = t->artist[0] ? t->artist : qi >= 0 ? qid[qi].artist : q_artist;
+            album = qi >= 0 ? qid[qi].album : q_album;
+            len = t->dur_ms;
+            trk = t->track > 0 ? t->track : 0;
+        }
+    }
+    btplayer_update(st, title, artist, album, len, trk);
 }
 
 /* Open the fixed nodes plus anything that looks like a media remote. The
@@ -12791,6 +13056,9 @@ int music_entry(void *a0, void *a1) {
 
     bt_poll_run = 1;
     bt_thread_valid = (pthread_create(&bt_thread, NULL, bt_poll, NULL) == 0);
+    /* Standalone only: inside hiby_player (the old hook build) the stock
+     * player is the one BlueZ should be talking to. */
+    if (g_is_standalone) btplayer_start(mlog);
     /* Started while USB mass storage already has the card -- restarted while
      * it was exported: the background card work is held off from the start,
      * the same as entering the mode does, until the Home banner's Done. */
@@ -13343,6 +13611,12 @@ int music_entry(void *a0, void *a1) {
             inertia_active = 0;
             list_velocity = 0;
             dirty = 1;
+        } else if (g == 1 && screen == SC_QUEUE && qd_is_drawer &&
+                   touch_y < CONTENT_Y + QUEUE_BAR_H && x - touch_x > 60) {
+            /* The drawer's bar is its handle: swiped right, it slides away,
+             * the same as back. (Its rows keep their own swipe-to-remove.) */
+            qd_begin_close();
+            dirty = 1; idle = 0;
         } else if (g == 1 && abs(x - touch_x) > SLIDE_NOT_TAP_PX && slide_is_not_a_tap()) {
             /* A sideways slide, lifted -- see slide_is_not_a_tap(). */
         } else if (g == 1) {
@@ -13468,8 +13742,7 @@ int music_entry(void *a0, void *a1) {
                  * queue_insert() another one, so this is never empty of
                  * anything worth seeing even for a podcast. */
                 if (podcast_mode && y > FB_H - 56 && x > FB_W - 76) {
-                    screen = SC_QUEUE; reset_scroll();
-                    queue_via_back = 0;   /* reached deliberately -- back returns to Now Playing */
+                    qd_begin_open(0);     /* slides in; back slides it off to Now Playing */
                 } else if (y > cyy - 48 && y < cyy + 48) {
                     /* BG47 (revised): real hit zones under the drawn arcs/
                      * ring, not blind thirds -- boundaries are the
@@ -13534,8 +13807,7 @@ int music_entry(void *a0, void *a1) {
                         } else if (x < (nextx + queuex) / 2) {
                             play_index(next_track_index());
                         } else {
-                            screen = SC_QUEUE; reset_scroll();
-                            queue_via_back = 0;   /* reached deliberately -- back returns to Now Playing */
+                            qd_begin_open(0);   /* slides in; back slides it off to Now Playing */
                         }
                     }
                 }
@@ -13583,33 +13855,12 @@ int music_entry(void *a0, void *a1) {
                     for (int i = 0; i < MSEB_BAND_N; i++) mseb_gain[i] = 0.0f;
                     eq_set_mseb(mseb_on, mseb_gain);
                     mseb_save(mseb_gain, mseb_on);
-                } else if (screen == SC_QUEUE && x >= status_action_x("Clear") - 16 && x < status_right_group_x() - 8) {
-                    /* R52: drop everything queued after the currently-
-                     * playing track -- that one keeps playing undisturbed
-                     * to its own end, same as reaching it naturally would,
-                     * it just has nothing left queued up behind it once it
-                     * does. No confirmation step: unlike deleting a
-                     * playlist or a file, nothing here is lost for good --
-                     * queuing more is one "Play next"/"Add to queue" away. */
-                    if (cur_track >= 0 && cur_track < queue_n && next_track_index() >= 0 &&
-                        next_track_index() != cur_track) {
-                        int cur_pos = queue_play_pos(cur_track);
-                        unsigned char keep[QUEUE_MAX];
-                        for (int r = 0; r < queue_n; r++) keep[r] = queue_play_pos(r) <= cur_pos;
-                        queue_compact(keep);
-                        /* Reported live: swiping back afterward showed a
-                         * mangled "album" page -- the real album, but
-                         * missing every track Clear had just dropped. Same
-                         * root cause as the Add-to-Queue/Play-Next case
-                         * above: once queue[] no longer matches what a
-                         * fresh browse of q_album would produce, it can't
-                         * be presented as that album's own page. Playlists
-                         * excluded for the same reason queue_insert()
-                         * excludes them. */
-                        if (!q_is_playlist) queue_mixed = 1;
-                        queue_follower();
-                    }
                 } else if (g_header_show_back && x < BACK_ARROW_TAP_W) go_back();
+            } else if (screen == SC_QUEUE && y < CONTENT_Y + QUEUE_BAR_H) {
+                /* The Queue bar: generous to the left of the word and across
+                 * the bar's full height, same reasoning as the other header
+                 * actions' zones; anywhere else on the bar does nothing. */
+                if (x >= queue_clear_x() - 24) queue_clear_rest();
             } else if (index_visible() && x >= FB_W - INDEX_TOUCH_W && y >= CONTENT_Y &&
                        y < index_bottom()) {
                 index_jump(y);
@@ -14047,11 +14298,11 @@ int music_entry(void *a0, void *a1) {
                  * past whatever was actually drawn under the finger, so a
                  * tap opened the row below the one that was visibly tapped. */
                 /* R50: the Queue screen's summary line pushes its rows down
-                 * by QUEUE_SUMMARY_H -- without this, every tap on it would
+                 * by QUEUE_BAR_H -- without this, every tap on it would
                  * resolve one row short of what's actually under the finger,
                  * same class of bug BG2/BG61 already fixed for scroll_px. */
-                int idx = (y - CONTENT_Y - (screen == SC_QUEUE ? QUEUE_SUMMARY_H : 0)) / ROW_H;
-                if (screen == SC_QUEUE && y < CONTENT_Y + QUEUE_SUMMARY_H) idx = -1;
+                int idx = (y - CONTENT_Y - (screen == SC_QUEUE ? QUEUE_BAR_H : 0)) / ROW_H;
+                if (screen == SC_QUEUE && y < CONTENT_Y + QUEUE_BAR_H) idx = -1;
                 /* R76: `idx` above stays exactly as it was -- SC_MENU/
                  * SC_MUSIC_MENU/SC_TRACKS's own ab_list/pod_list flat path
                  * still draw the old paged way and still need it unchanged.
@@ -14063,10 +14314,10 @@ int music_entry(void *a0, void *a1) {
                  * inverts. Already an absolute index, not scroll-relative,
                  * so these screens use it directly rather than `scroll +
                  * idx`. */
-                int off_row_base = CONTENT_Y + (screen == SC_QUEUE ? QUEUE_SUMMARY_H : 0);
+                int off_row_base = CONTENT_Y + (screen == SC_QUEUE ? QUEUE_BAR_H : 0);
                 int off = scroll * ROW_H + scroll_px;
                 int smooth_row = (y - off_row_base + off) / ROW_H;
-                if (screen == SC_QUEUE && y < CONTENT_Y + QUEUE_SUMMARY_H) smooth_row = -1;
+                if (screen == SC_QUEUE && y < CONTENT_Y + QUEUE_BAR_H) smooth_row = -1;
                 if (screen == SC_MENU) {
                     idx = TOP_N;
                     for (int i = 0; i < TOP_N; i++) {
@@ -14431,6 +14682,14 @@ int music_entry(void *a0, void *a1) {
         }
         if (keyed) { dirty = 1; idle = 0; }
 
+        /* Bluetooth media player (btplayer.c): tell a headset what is
+         * playing, and carry out what it asks for -- its play/pause/next/
+         * previous arrive here rather than through handle_keys() whenever
+         * the player is registered. */
+        btplayer_tick();
+        for (int c; (c = btplayer_take_command()) != BTP_CMD_NONE; )
+            if (bt_command(c)) { dirty = 1; idle = 0; }
+
         /* R77: hold-to-power-off, the two halves handle_keys() itself can't
          * finish on its own -- the countdown overlay needs to redraw every
          * tick with no new key event to drive it (the physical button sends
@@ -14696,7 +14955,7 @@ int music_entry(void *a0, void *a1) {
             seek_toast_ticks--;
             if (seek_toast_ticks == 0) dirty = 1;
         }
-        if (vol_ticks > 0 && touch_down && !qs_open && !usb_bypass_active &&
+        if (vol_ticks > 0 && touch_down && !qs_open && !usb_bypass_active && !qd_edge_active &&
             touch_y >= STATUS_H && touch_y < STATUS_H + VOL_H) {
             if (!vol_dragging) { vol_dragging = 1; vol_applied = audio_volume(); }
             int bw = vol_bar_w();
@@ -14741,7 +15000,7 @@ int music_entry(void *a0, void *a1) {
          * tracking -- only to start). Release decides open or cancel below,
          * off the real reveal distance rather than a fixed early threshold. */
         if (!qs_open && touch_down && touch_y < QS_PULL_ZONE &&
-            !(vol_ticks > 0 && touch_y >= STATUS_H) &&
+            !(vol_ticks > 0 && touch_y >= STATUS_H) && !qd_active && !qd_edge_active &&
             (qs_pulling || live_y - touch_y > QS_PULL)) {
             qs_pulling = 1;
             int d = live_y - touch_y;
@@ -14779,6 +15038,39 @@ int music_entry(void *a0, void *a1) {
                 dirty = 1;
             }
         }
+
+        /* The queue drawer (see qd_begin_open()): a pull from the right edge
+         * drives the slide straight off the finger; let go, it eases the rest
+         * of the way to open or back to shut -- the same third-of-the-way rule
+         * and the same easing as quick settings above -- and whichever end it
+         * reaches, finishes. */
+        if (qd_edge_active && touch_down) {
+            if (!qd_active) qd_begin_open(1);
+            int sl = qd_edge_travel > FB_W ? FB_W : qd_edge_travel;
+            if (sl != qd_slide) { qd_slide = sl; dirty = 1; }
+            idle = 0;
+        } else if (g == 6 && qd_active && qd_pulling) {
+            qd_pulling = 0;
+            qd_target = qd_slide >= FB_W / 3 ? FB_W : 0;
+            dirty = 1; idle = 0;
+        }
+        if (qd_active && !qd_pulling) {
+            if (qd_slide != qd_target) {
+                int step = (qd_target - qd_slide) / 3;
+                if (step == 0) step = qd_target > qd_slide ? 1 : -1;
+                qd_slide += step;
+                if ((step > 0 && qd_slide > qd_target) || (step < 0 && qd_slide < qd_target))
+                    qd_slide = qd_target;
+                dirty = 1;
+            } else {
+                if (qd_target == FB_W) qd_finish_open();
+                else qd_active = 0;           /* slid shut: what is underneath is the screen */
+                dirty = 1;
+            }
+        }
+        /* Left some other way -- a row played, Home swiped to -- the drawer
+         * has nothing to slide back to any more. */
+        if (qd_is_drawer && screen != SC_QUEUE && !qd_active) qd_is_drawer = 0;
 
         /* Dragging the brightness bar sets it live rather than on release: it
          * is the one setting where you want to see the result while choosing. */
@@ -14962,7 +15254,7 @@ int music_entry(void *a0, void *a1) {
          * lasts -- no separate "just pressed" transition to track. */
         if (screen == SC_QUEUE) {
             int grip_x0 = FB_W - 24 - (index_visible() ? INDEX_W : 0) - 32;
-            int list_top = CONTENT_Y + QUEUE_SUMMARY_H;
+            int list_top = CONTENT_Y + QUEUE_BAR_H;
             /* R76: off, not a bare `- scroll`, now that the draw side scrolls
              * smoothly (y = list_top + display_i*ROW_H - off) -- this is
              * that same formula solved for display_i, so hit-testing always
@@ -15265,6 +15557,12 @@ int music_entry(void *a0, void *a1) {
              * not the list, or the track list scrolls with the pull. */
             int qs_pull_ambiguous = drag_top == 0 && touch_y < QS_PULL_ZONE &&
                                     (qs_pulling || live_y > touch_y);
+            /* The queue drawer's edge, the same ambiguous window again,
+             * mirrored: a touch from the right edge that could still become a
+             * pull leftward holds the list still until it is one or isn't. */
+            int qd_zone_ambiguous = touch_x >= FB_W - QD_EDGE_ZONE && !qd_edge_active &&
+                                    qd_pull_allowed() &&
+                                    abs(live_x - touch_x) >= abs(live_y - touch_y);
 
             int was = list_dragging;
             list_dragging = touch_down && scrollable && !index_active &&
@@ -15278,7 +15576,7 @@ int music_entry(void *a0, void *a1) {
                             !rec_swipe_active && !mseb_slider_gesture &&
                             touch_y >= drag_top && !edge_active && !edge_zone_ambiguous &&
                             !home_edge_active && !home_edge_zone_ambiguous &&
-                            !qs_pull_ambiguous;
+                            !qs_pull_ambiguous && !qd_edge_active && !qd_active && !qd_zone_ambiguous;
             if (list_dragging && !was) {
                 /* A raw drag on the list itself is free browsing, not bound
                  * by wherever the index last landed — otherwise a stale
@@ -15437,7 +15735,7 @@ int music_entry(void *a0, void *a1) {
         {
             int was = title_dragging;
             title_dragging = touch_down && screen == SC_PLAYING && !radio_mode &&
-                             queue_n > 0 && title_span > 0 &&
+                             queue_n > 0 && title_span > 0 && !qd_edge_active && !qd_active &&
                              touch_y > title_y() - 16 &&
                              touch_y < title_y() + TEXT_PX_TITLE + 16;
             if (title_dragging) {
@@ -15461,7 +15759,7 @@ int music_entry(void *a0, void *a1) {
              * of it -- every other gesture check here (edge-swipe-back,
              * title long-press) already guards on this, this one just didn't. */
             scrub_active = touch_down && screen == SC_PLAYING && !radio_mode &&
-                           !qs_open && queue_n > 0 &&
+                           !qs_open && queue_n > 0 && !qd_edge_active && !qd_active &&
                            touch_y > bar_y() - 26 && touch_y < bar_y() + 26;
             if (scrub_active || was) { dirty = 1; idle = 0; }
         }
