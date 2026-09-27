@@ -535,6 +535,7 @@ static void mlog(const char *fmt, ...) {
     int n = vsnprintf(b, sizeof(b), fmt, ap);
     va_end(ap);
     if (n <= 0) return;
+    if (n >= (int)sizeof(b)) b[sizeof(b) - 2] = '\n';   /* cut short: still end the line */
     /* Timestamped, like the audio log: without one there is no telling a
      * normal run of short tracks from the player racing through them. */
     struct timespec ts;
@@ -543,7 +544,12 @@ static void mlog(const char *fmt, ...) {
     int m = snprintf(line, sizeof(line), "[%6ld.%03ld] %s",
                      (long)ts.tv_sec, ts.tv_nsec / 1000000L, b);
     if (m <= 0) return;
-    if (m > (int)sizeof(line)) m = (int)sizeof(line);
+    /* Cut short: m is what *would* have been written. Keep what fits minus
+     * its NUL, and end on a newline so the next entry starts its own line. */
+    if (m >= (int)sizeof(line)) {
+        m = (int)sizeof(line) - 1;
+        line[m - 1] = '\n';
+    }
     log_roll_if_big(LOG_PATH);
     int fd = open(LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (fd >= 0) { write(fd, line, (size_t)m); close(fd); }
@@ -618,10 +624,11 @@ static void mlog(const char *fmt, ...) {
  * with the cover-colour work (R92/R94): computing a palette per album, and
  * prewarming palettes in the background, turned concurrent art decoding from
  * rare into the normal case. The prewarm pass was given its own path at the
- * time for exactly this reason -- these two just never got the same. */
-#define ART_LOCAL_SCRATCH        "/tmp/.music_art_local.jpg"
-#define ART_VIEW_SCRATCH         "/tmp/.music_art_view.jpg"
-#define ART_VIEW_LOCAL_SCRATCH   "/tmp/.music_art_view_local.jpg"
+ * time for exactly this reason -- these two just never got the same.
+ *
+ * Now per worker *run*, not per worker kind (art_job_t): the UI no longer
+ * waits for one art_worker() to finish before starting the next, so two of
+ * the same kind can be decoding at once. */
 #define COVER_PREWARM_LOCAL_SCRATCH "/tmp/.music_art_prewarm_local.jpg"
 
 /* jpg: whatever art_candidate() just handed back -- either ART_SCRATCH
@@ -863,8 +870,68 @@ static void *bt_poll(void *arg) {
     return NULL;
 }
 
-static pthread_t art_thread;
-static int       art_thread_valid;
+/* Cover workers -- art_worker(), view_art_worker(), artist_art_worker() --
+ * run detached and are never joined from the UI thread. One part-way through
+ * a Last.fm/Spotify lookup on a network that goes nowhere (a captive portal, a
+ * router with no uplink) holds on for as long as curl's timeouts allow, tens
+ * of seconds, and joining it on the next track change froze the whole UI for
+ * that long. A superseded worker just finishes on its own and its result is
+ * dropped by its staleness check. Since they can now overlap, each gets its
+ * own scratch files (the shared-scratch corruption cover_load_capped()'s
+ * comment describes), and art_jobs_live counts the ones still running for
+ * the one place that must wait for all of them: handing the card to USB mass
+ * storage. */
+typedef struct {
+    int  gen;                 /* the request it serves; only the newest may publish/finish it */
+    int  fresh;               /* art_force_fresh, taken when the request was made */
+    char scratch[64];         /* art_candidate()'s scratch, this worker's alone */
+    char local_scratch[64];   /* cover_load_capped()'s, likewise */
+} art_job_t;
+static int art_jobs_live;
+
+static int art_jobs_running(void) {
+    return __atomic_load_n(&art_jobs_live, __ATOMIC_SEQ_CST);
+}
+
+/* job: NULL for a worker that needs no scratch (the artist page's). Returns
+ * 0 once the thread is running; on failure the job is freed. */
+static int art_job_spawn(void *(*fn)(void *), art_job_t *job) {
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    __atomic_add_fetch(&art_jobs_live, 1, __ATOMIC_SEQ_CST);
+    pthread_t t;
+    int rc = pthread_create(&t, &attr, fn, job);
+    pthread_attr_destroy(&attr);
+    if (rc != 0) {
+        __atomic_sub_fetch(&art_jobs_live, 1, __ATOMIC_SEQ_CST);
+        free(job);
+        return -1;
+    }
+    return 0;
+}
+
+static art_job_t *art_job_new(const char *tag, int gen, int fresh) {
+    art_job_t *job = calloc(1, sizeof(*job));
+    if (!job) return NULL;
+    job->gen = gen;
+    job->fresh = fresh;
+    snprintf(job->scratch, sizeof(job->scratch), "/tmp/.music_%s_%d.jpg", tag, gen);
+    snprintf(job->local_scratch, sizeof(job->local_scratch), "/tmp/.music_%s_local_%d.jpg", tag, gen);
+    return job;
+}
+
+/* Last thing a worker does. */
+static void art_job_finish(art_job_t *job) {
+    if (job) {
+        unlink(job->scratch);
+        unlink(job->local_scratch);
+        free(job);
+    }
+    __atomic_sub_fetch(&art_jobs_live, 1, __ATOMIC_SEQ_CST);
+}
+
+static int       art_gen;        /* bumped per art_worker() spawned, under art_lock */
 static int       art_seq_v;      /* bumped when the bitmap changes */
 /* Set when a request is dispatched, cleared when art_worker() finishes --
  * whether that landed a bitmap or gave up. art_seq_v alone can't answer
@@ -1003,8 +1070,11 @@ static void pal_bin_rgb(int bin, int *r, int *g, int *b) {
  * lightness away from the winning background until they actually
  * contrast, rather than trusting whatever the histogram happened to pick
  * (the fix for "the seek bar looked awful"). */
-static void derive_palette_from_bits(const uint16_t *bits, uint16_t *out_bg,
-                                     uint16_t *out_accent, uint16_t *out_fg) {
+/* 0 when it could not run (out of memory) and wrote nothing -- the caller
+ * must then neither use nor cache the outputs, which still hold whatever they
+ * held before. */
+static int derive_palette_from_bits(const uint16_t *bits, uint16_t *out_bg,
+                                    uint16_t *out_accent, uint16_t *out_fg) {
     /* R94 follow-up: reported live as general lag and lockups right after
      * the prewarm pass shipped -- these were `static`, reused between
      * calls to avoid a malloc/free pair, back when this only ever ran on
@@ -1020,7 +1090,7 @@ static void derive_palette_from_bits(const uint16_t *bits, uint16_t *out_bg,
      * without a mutex serializing them against each other. */
     uint32_t *hist_dark  = calloc(PAL_BINS, sizeof(uint32_t));
     uint32_t *hist_light = calloc(PAL_BINS, sizeof(uint32_t));
-    if (!hist_dark || !hist_light) { free(hist_dark); free(hist_light); return; }
+    if (!hist_dark || !hist_light) { free(hist_dark); free(hist_light); return 0; }
 
     int total = ART_PX * ART_PX;
     for (int i = 0; i < total; i += 4) {   /* every 4th pixel: plenty for a histogram */
@@ -1111,6 +1181,7 @@ static void derive_palette_from_bits(const uint16_t *bits, uint16_t *out_bg,
 
     free(hist_dark);
     free(hist_light);
+    return 1;
 }
 
 /* R94: on-disk cache so an album's palette only ever needs deriving once --
@@ -1229,7 +1300,11 @@ static void compute_cover_palette(void) {
     pthread_mutex_unlock(&art_lock);
     if (!bits) { np_palette_valid = 0; return; }   /* nothing cached, art not loaded yet either */
 
-    derive_palette_from_bits(bits, &np_bg, &np_accent, &np_fg);
+    if (!derive_palette_from_bits(bits, &np_bg, &np_accent, &np_fg)) {
+        np_palette_valid = 0;
+        np_palette_seq = -1;     /* try again next frame */
+        return;
+    }
     pal_cache_save(art_want_album_artist, art_want_album, np_bg, np_accent, np_fg);
     np_palette_valid = 1;
 }
@@ -1264,6 +1339,11 @@ static pthread_t cover_prewarm_thread;
  * starts, cleared as the very last thing the worker itself does. */
 static volatile int cover_prewarm_running;
 
+/* Set for as long as USB mass storage has the card (set_usb_storage_mode()).
+ * The background jobs that walk or read it on their own -- the cover prewarm
+ * and the Stats storage walk -- check this between files and stop. */
+static volatile int card_released;
+
 /* Every artwork worker calls this first, and it is the whole reason they can
  * run at all without being heard.
  *
@@ -1295,7 +1375,7 @@ static void art_worker_yield_priority(const char *what) {
 static void *cover_prewarm_worker(void *arg) {
     (void)arg;
     art_worker_yield_priority("cover-prewarm");
-    for (int i = 0; i < cover_prewarm_n; i++) {
+    for (int i = 0; i < cover_prewarm_n && !card_released; i++) {
         cover_prewarm_item_t *it = &cover_prewarm_items[i];
         uint16_t bg, accent, fg;
         if (pal_cache_load(it->artist, it->album, &bg, &accent, &fg))
@@ -1322,8 +1402,8 @@ static void *cover_prewarm_worker(void *arg) {
          * still gets the fetched-cover treatment normally, through
          * art_worker()/compute_cover_palette() same as always. */
         if (bits) {
-            derive_palette_from_bits(bits, &bg, &accent, &fg);
-            pal_cache_save(it->artist, it->album, bg, accent, fg);
+            if (derive_palette_from_bits(bits, &bg, &accent, &fg))
+                pal_cache_save(it->artist, it->album, bg, accent, fg);
             free(bits);
         }
     }
@@ -1343,7 +1423,7 @@ static void *cover_prewarm_worker(void *arg) {
  * the toggle being flipped again, tries again later; nothing is lost by
  * not stacking a second pass on top of one already in flight. */
 static void cover_prewarm_start(void) {
-    if (!cover_palette_enabled || cover_prewarm_running) return;
+    if (!cover_palette_enabled || cover_prewarm_running || card_released) return;
     lib_row_t rows[COVER_PREWARM_N];
     int n = lib_albums_recent_added(rows, COVER_PREWARM_N);
     cover_prewarm_n = 0;
@@ -1421,12 +1501,11 @@ static uint16_t np_col_line(void) {
 }
 
 static void *art_worker(void *arg) {
-    (void)arg;
+    art_job_t *job = arg;
     art_worker_yield_priority("art");
     char track[512], artist[LIB_NAME_LEN], album[LIB_NAME_LEN];
     char album_artist[LIB_NAME_LEN];
-    int fresh = art_force_fresh;
-    art_force_fresh = 0;
+    int fresh = job->fresh;
     pthread_mutex_lock(&art_lock);
     snprintf(track, sizeof(track), "%s", art_want);
     snprintf(artist, sizeof(artist), "%s", art_want_artist);
@@ -1443,10 +1522,10 @@ static void *art_worker(void *arg) {
      * named .jpg simply fails. Any of those used to mean a blank panel even
      * when the track had good embedded art a few candidates further down. */
     for (int n = 0; !bits; n++) {
-        int rc = art_candidate(track, n, jpg, sizeof(jpg), key, sizeof(key), ART_SCRATCH);
+        int rc = art_candidate(track, n, jpg, sizeof(jpg), key, sizeof(key), job->scratch);
         if (rc == -1) break;
         if (rc == ART_SKIP) continue;
-        bits = cover_load_capped(jpg, key, ART_PX, ART_LOCAL_SCRATCH, fresh,
+        bits = cover_load_capped(jpg, key, ART_PX, job->local_scratch, fresh,
                                  1 /* the track playing now */);
     }
 
@@ -1515,8 +1594,12 @@ static void *art_worker(void *arg) {
               : (strcmp(track, art_want) != 0);
     if (stale) { free(bits); }
     else { free(art_bits); art_bits = bits; art_seq_v++; }
+    /* Only the newest request's worker says the art has finished loading: an
+     * older one landing late would otherwise lift the resume splash while
+     * the cover actually asked for is still on its way. */
+    if (job->gen == art_gen) art_done = 1;
     pthread_mutex_unlock(&art_lock);
-    art_done = 1;
+    art_job_finish(job);
     return NULL;
 }
 
@@ -1532,7 +1615,12 @@ static void art_request(const char *track, const char *artist, const char *album
      * would leave the new name starting halfway along. Called from every path
      * that changes what is playing, chapters included. */
     title_reset();
-if (art_thread_valid) { pthread_join(art_thread, NULL); art_thread_valid = 0; }
+    /* Taken here, on the thread that set it, rather than by whichever worker
+     * happened to start next -- workers overlap now, so "the next one" could
+     * as easily have been the album page's. A refresh is a new request even
+     * for the album already showing, so it skips the same-album shortcut. */
+    int fresh = art_force_fresh;
+    art_force_fresh = 0;
     pthread_mutex_lock(&art_lock);
     /* R84: reported live as the cover disappearing and reappearing between
      * tracks of the same album -- not a redraw glitch, this was genuinely
@@ -1563,7 +1651,7 @@ if (art_thread_valid) { pthread_join(art_thread, NULL); art_thread_valid = 0; }
      * it is still the right thing to display and the right thing to search
      * Last.fm/Spotify with (R23's own reasoning for preferring it holds for
      * both of those), just not what decides whether art needs reloading. */
-    int same_album = album_artist && album_artist[0] && album && album[0] &&
+    int same_album = !fresh && album_artist && album_artist[0] && album && album[0] &&
                      !strcmp(album_artist, art_want_album_artist) && !strcmp(album, art_want_album);
     if (!same_album) {
         free(art_bits);
@@ -1575,13 +1663,19 @@ if (art_thread_valid) { pthread_join(art_thread, NULL); art_thread_valid = 0; }
     snprintf(art_want_album, sizeof(art_want_album), "%s", album ? album : "");
     snprintf(art_want_album_artist, sizeof(art_want_album_artist), "%s",
              album_artist ? album_artist : "");
+    int gen = 0;
+    if (!same_album) {
+        gen = ++art_gen;
+        art_done = 0;
+    }
     pthread_mutex_unlock(&art_lock);
     if (same_album) return;
-    art_done = 0;
-    if (pthread_create(&art_thread, NULL, art_worker, NULL) == 0)
-        art_thread_valid = 1;
-    else
-        art_done = 1;   /* never actually started -- nothing to wait for */
+    art_job_t *job = art_job_new("art", gen, fresh);
+    if (!job || art_job_spawn(art_worker, job) != 0) {
+        pthread_mutex_lock(&art_lock);
+        if (gen == art_gen) art_done = 1;   /* never actually started -- nothing to wait for */
+        pthread_mutex_unlock(&art_lock);
+    }
 }
 
 /* BG70: a completely separate bitmap from art_bits above, not a save/
@@ -1598,8 +1692,7 @@ static uint16_t *view_art_bits;
 static char      view_art_want[512];
 static char      view_art_want_artist[LIB_NAME_LEN];
 static char      view_art_want_album[LIB_NAME_LEN];
-static pthread_t view_art_thread;
-static int       view_art_thread_valid;
+static int       view_art_gen;       /* bumped per request or clear, under view_art_lock */
 static int       view_art_seq_v;
 /* R63: set once view_art_worker() has exhausted every candidate (local, and
  * network if it got that far) for the *current* request -- lets the album
@@ -1650,11 +1743,10 @@ static int view_art_gone(void) {
 static int g_view_art_gone_frame;
 
 static void *view_art_worker(void *arg) {
-    (void)arg;
+    art_job_t *job = arg;
     art_worker_yield_priority("view-art");
     char track[512], artist[LIB_NAME_LEN], album[LIB_NAME_LEN];
-    int fresh = art_force_fresh;
-    art_force_fresh = 0;
+    int fresh = job->fresh;
     pthread_mutex_lock(&view_art_lock);
     snprintf(track, sizeof(track), "%s", view_art_want);
     snprintf(artist, sizeof(artist), "%s", view_art_want_artist);
@@ -1664,10 +1756,10 @@ static void *view_art_worker(void *arg) {
     char jpg[512], key[512];
     uint16_t *bits = NULL;
     for (int n = 0; !bits; n++) {
-        int rc = art_candidate(track, n, jpg, sizeof(jpg), key, sizeof(key), ART_VIEW_SCRATCH);
+        int rc = art_candidate(track, n, jpg, sizeof(jpg), key, sizeof(key), job->scratch);
         if (rc == -1) break;
         if (rc == ART_SKIP) continue;
-        bits = cover_load_capped(jpg, key, ART_PX, ART_VIEW_LOCAL_SCRATCH, fresh,
+        bits = cover_load_capped(jpg, key, ART_PX, job->local_scratch, fresh,
                                  1 /* the album the user just opened */);
     }
     /* Same Last.fm-then-Spotify network fallback art_worker() uses, kept
@@ -1695,15 +1787,21 @@ static void *view_art_worker(void *arg) {
         }
     }
 
+    /* By request, not by track: reopening the same album (or holding its
+     * cover to refresh it) is a newer request for the same path, and an
+     * older worker finishing last would put back what the newer one
+     * replaced. */
     pthread_mutex_lock(&view_art_lock);
-    if (strcmp(track, view_art_want) != 0) { free(bits); }
+    if (job->gen != view_art_gen) { free(bits); }
     else { free(view_art_bits); view_art_bits = bits; view_art_seq_v++; view_art_done = 1; }
     pthread_mutex_unlock(&view_art_lock);
+    art_job_finish(job);
     return NULL;
 }
 
 static void view_art_request(const char *track, const char *artist, const char *album) {
-if (view_art_thread_valid) { pthread_join(view_art_thread, NULL); view_art_thread_valid = 0; }
+    int fresh = art_force_fresh;     /* see art_request() */
+    art_force_fresh = 0;
     pthread_mutex_lock(&view_art_lock);
     free(view_art_bits);
     view_art_bits = NULL;
@@ -1712,9 +1810,14 @@ if (view_art_thread_valid) { pthread_join(view_art_thread, NULL); view_art_threa
     snprintf(view_art_want, sizeof(view_art_want), "%s", track);
     snprintf(view_art_want_artist, sizeof(view_art_want_artist), "%s", artist ? artist : "");
     snprintf(view_art_want_album, sizeof(view_art_want_album), "%s", album ? album : "");
+    int gen = ++view_art_gen;
     pthread_mutex_unlock(&view_art_lock);
-    if (pthread_create(&view_art_thread, NULL, view_art_worker, NULL) == 0)
-        view_art_thread_valid = 1;
+    art_job_t *job = art_job_new("view", gen, fresh);
+    if (!job || art_job_spawn(view_art_worker, job) != 0) {
+        pthread_mutex_lock(&view_art_lock);
+        if (gen == view_art_gen) view_art_done = 1;   /* nothing is coming */
+        pthread_mutex_unlock(&view_art_lock);
+    }
 }
 
 /* R-albumtheme: view_art_bits equivalent of compute_cover_palette() just
@@ -1742,7 +1845,11 @@ static void view_compute_cover_palette(void) {
     pthread_mutex_unlock(&view_art_lock);
     if (!bits) { np_view_palette_valid = 0; return; }
 
-    derive_palette_from_bits(bits, &np_view_bg, &np_view_accent, &np_view_fg);
+    if (!derive_palette_from_bits(bits, &np_view_bg, &np_view_accent, &np_view_fg)) {
+        np_view_palette_valid = 0;
+        np_view_palette_seq = -1;     /* try again next frame */
+        return;
+    }
     pal_cache_save(view_art_want_artist, view_art_want_album, np_view_bg, np_view_accent, np_view_fg);
     np_view_palette_valid = 1;
 }
@@ -1765,13 +1872,13 @@ static uint16_t np_view_col_line(void) {
  * without an explicit clear the header silently kept showing stale art from
  * wherever browsing came from. */
 static void view_art_clear(void) {
-    if (view_art_thread_valid) { pthread_join(view_art_thread, NULL); view_art_thread_valid = 0; }
     pthread_mutex_lock(&view_art_lock);
     free(view_art_bits);
     view_art_bits = NULL;
     view_art_seq_v++;
     view_art_done = 1;
     view_art_want[0] = '\0';
+    view_art_gen++;              /* whatever is still in flight is now stale */
     pthread_mutex_unlock(&view_art_lock);
 }
 
@@ -1823,8 +1930,6 @@ static pthread_mutex_t artist_art_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint16_t *artist_art_bits;
 static char      artist_bio_text[8192];
 static char      artist_art_want[LIB_NAME_LEN];
-static pthread_t artist_art_thread;
-static int       artist_art_thread_valid;
 static int       artist_art_seq_v;
 /* Distinguishes "fetch still running" from "fetch finished and found
  * nothing" -- artist_bio_text[0] alone can't tell those apart, and the
@@ -1844,13 +1949,25 @@ static int artist_art_seq(void) {
  * one existing precedent) -- artist names routinely carry '/' (a genuine
  * character in some names, not just a tag-writer quirk), which would
  * otherwise be read as a path separator by every fopen() below. */
+/* Mapping every other byte to '_' is lossy, though -- every byte of UTF-8
+ * included -- so "Sigur Rós" and "Sigur Rás" shared one photo and one bio.
+ * A name that lost anything gets the same djb2 hash pal_cache_path() uses
+ * appended, which keeps apart names that flatten alike. A name that lost
+ * nothing keeps its plain key, and so the cache it already has. */
 static void artist_cache_key(const char *artist, char *out, size_t out_n) {
     size_t j = 0;
-    for (size_t i = 0; artist[i] && j + 1 < out_n; i++) {
+    int lossy = 0;
+    unsigned long h = 5381;
+    for (size_t i = 0; artist[i]; i++) {
         unsigned char c = (unsigned char)artist[i];
-        out[j++] = (isalnum(c) || c == '-' || c == ' ') ? (char)c : '_';
+        h = ((h << 5) + h) ^ c;
+        int keep = isalnum(c) || c == '-' || c == ' ';
+        if (!keep) lossy = 1;
+        if (j + 1 + 9 < out_n) out[j++] = keep ? (char)c : '_';   /* room for "~xxxxxxxx" */
+        else lossy = 1;                                           /* truncated: lossy too */
     }
     out[j] = '\0';
+    if (lossy) snprintf(out + j, out_n - j, "~%08lx", h & 0xFFFFFFFFul);
 }
 
 static void *artist_art_worker(void *arg) {
@@ -1972,6 +2089,7 @@ static void *artist_art_worker(void *arg) {
         artist_art_loading = 0;
     }
     pthread_mutex_unlock(&artist_art_lock);
+    art_job_finish(NULL);
     return NULL;
 }
 
@@ -1991,10 +2109,6 @@ static void artist_art_request(const char *artist) {
      * want is overwritten below, under the same lock, before that check
      * ever runs) -- nothing here actually depended on the join for
      * correctness, only for tidiness. */
-    if (artist_art_thread_valid) {
-        pthread_detach(artist_art_thread);
-        artist_art_thread_valid = 0;
-    }
     pthread_mutex_lock(&artist_art_lock);
     free(artist_art_bits);
     artist_art_bits = NULL;
@@ -2003,8 +2117,11 @@ static void artist_art_request(const char *artist) {
     artist_art_loading = 1;
     snprintf(artist_art_want, sizeof(artist_art_want), "%s", artist ? artist : "");
     pthread_mutex_unlock(&artist_art_lock);
-    if (pthread_create(&artist_art_thread, NULL, artist_art_worker, NULL) == 0)
-        artist_art_thread_valid = 1;
+    if (art_job_spawn(artist_art_worker, NULL) != 0) {
+        pthread_mutex_lock(&artist_art_lock);
+        artist_art_loading = 0;          /* nothing is coming */
+        pthread_mutex_unlock(&artist_art_lock);
+    }
 }
 
 static void artist_blit_art_clip(uint16_t *fb, int x, int y, int clip_top, int clip_bot) {
@@ -2313,6 +2430,13 @@ static const struct { const char *label; } top_menu[] = {
 #define TOP_SETTINGS   7
 #define TOP_N ((int)(sizeof(top_menu) / sizeof(top_menu[0])))
 
+/* Home sections that read or write the card, and so are closed while USB
+ * mass storage has it (see the Home draw's R81 comment). */
+static int top_needs_card(int i) {
+    return i == TOP_MUSIC || i == TOP_AUDIOBOOKS || i == TOP_PODCASTS ||
+           i == TOP_RADIO || i == TOP_EQ || i == TOP_MSEB;
+}
+
 /* Reached via "Music" from the main menu (SC_MUSIC_MENU). Each entry is a
  * column to group by, except Albums which skips the grouping step and
  * lists the lot, and Playlists which is not a library query at all. */
@@ -2448,6 +2572,11 @@ static char seek_toast_text[24];
 
 static void seek_toast(int delta_ms) {
     snprintf(seek_toast_text, sizeof(seek_toast_text), "%+d s", delta_ms / 1000);
+    seek_toast_ticks = SEEK_TOAST_TICKS;
+}
+/* The same pill, for a few words that are not a seek. */
+static void np_toast(const char *msg) {
+    snprintf(seek_toast_text, sizeof(seek_toast_text), "%s", msg);
     seek_toast_ticks = SEEK_TOAST_TICKS;
 }
 static int vol_drag_pct = -1, vol_applied = -1, vol_apply_tick;
@@ -2655,29 +2784,30 @@ static int usb_done_x(void) {
 
 /* Mass storage exports the card's block device.  It cannot coexist with
  * even one local reader or writer without risking exFAT corruption. */
+static int stor_walking(void);
+
 static void set_usb_storage_mode(int mode) {
     if (mode == 1) {
         audio_stop();
         pod_cancel_io();
-        /* These can read cached artwork or write a fetched cover on the SD
-         * card.  Their work is intentionally joined, not abandoned, before
-         * the filesystem is given to the host. */
-        if (art_thread_valid) {
-            pthread_join(art_thread, NULL);
-            art_thread_valid = 0;
-        }
-        if (view_art_thread_valid) {
-            pthread_join(view_art_thread, NULL);
-            view_art_thread_valid = 0;
-        }
-        if (artist_art_thread_valid) {
-            pthread_join(artist_art_thread, NULL);
-            artist_art_thread_valid = 0;
-        }
+        /* Everything else that touches the card on its own: the cover
+         * prewarm and the Stats storage walk stop at their next file, the
+         * waveform worker drops its decode at its next chunk. */
+        card_released = 1;
+        waveform_pause(1);
+        /* The cover workers can read cached artwork or write a fetched cover
+         * on the card -- superseded ones included, still finishing a fetch
+         * nobody wants any more. Their work is intentionally waited for, not
+         * abandoned, before the filesystem is given to the host. */
+        while (art_jobs_running() > 0 || cover_prewarm_running || stor_walking() ||
+               waveform_busy())
+            usleep(10000);
         scanner_pause_for_usb(1);
         index_pause_for_usb(1);
         while (scanner_scan_running() || index_scan_running()) usleep(10000);
     } else {
+        card_released = 0;
+        waveform_pause(0);
         scanner_pause_for_usb(0);
         index_pause_for_usb(0);
     }
@@ -2835,7 +2965,7 @@ static int settings_content_rows(void) {
  * pushed by hand, not by CI against a tagged commit), so this stays a
  * literal that a human edits; the discipline is remembering to, not the
  * mechanism. */
-#define LIBRARY_VERSION "0.57.1"
+#define LIBRARY_VERSION "0.57.2"
 
 /* A custom-built kernel keeps uname()'s own release string exactly
  * "4.4.94+" on purpose -- that string is also the vermagic every one of the
@@ -3154,6 +3284,7 @@ static int  ab_speed_permille = 1000;     /* persists across books; reset only b
  * through the same code an album's tracks use; this carries the part a
  * lib_track_t has nowhere to put — where in its file each chapter starts. */
 static ab_book_data_t ab_book;
+static char ab_book_title[AB_NAME_LEN];   /* ab_book's own name -- ab_book_data_t has no title */
 static char ab_playing[LIB_PATH_LEN];     /* the file the decoder actually has open */
 
 static int was_active;    /* to spot a track ending of its own accord */
@@ -3224,14 +3355,21 @@ static void radio_recording_delete(int i) {
 }
 
 static int        pod_list;
-/* A feed sync or episode download asked for while net_held(): started by the
- * main loop once playback over Bluetooth pauses or stops. The download is
- * remembered by feed and episode name, not just index, so a different feed
- * opened in between can never start the wrong episode. */
+/* A feed sync or episode downloads asked for while net_held(): started by the
+ * main loop once playback over Bluetooth pauses or stops. Downloads wait in
+ * order, each remembered by feed and episode name rather than by index -- the
+ * user may be looking at a different feed by the time one starts, and it
+ * must still start (pod_download_start_named()), and start the right one. */
 static int  pod_sync_deferred;
-static int  pod_dl_deferred_idx = -1;
-static char pod_dl_deferred_feed[POD_NAME_LEN];
-static char pod_dl_deferred_name[LIB_NAME_LEN];
+#define POD_DL_WAIT_MAX 16
+static struct { char feed[POD_NAME_LEN]; char name[POD_NAME_LEN]; } pod_dl_wait[POD_DL_WAIT_MAX];
+static int  pod_dl_wait_n;
+
+static int pod_dl_waiting(const char *feed, const char *name) {
+    for (int i = 0; i < pod_dl_wait_n; i++)
+        if (!strcmp(pod_dl_wait[i].feed, feed) && !strcmp(pod_dl_wait[i].name, name)) return 1;
+    return 0;
+}
 /* BG47: separate from ab_speed_permille on purpose -- persists across
  * episodes the same way ab_speed_permille persists across books, but a
  * podcast's chosen speed has no reason to leak into or be overwritten by
@@ -3411,14 +3549,16 @@ static void kb_open(const char *title, kb_purpose_t purpose, const char *init_te
 
 /* All edits happen at kb_cursor rather than at the end of the buffer, so
  * text can be corrected mid-string instead of only backspaced to. */
-static void kb_insert_at_cursor(char ch) {
-    if (kb_len >= KB_BUF_MAX - 1) return;
+/* 0 when the buffer is already full and nothing went in. */
+static int kb_insert_at_cursor(char ch) {
+    if (kb_len >= KB_BUF_MAX - 1) return 0;
     /* +1 moves the NUL along with the tail. */
     memmove(kb_buf + kb_cursor + 1, kb_buf + kb_cursor,
             (size_t)(kb_len - kb_cursor) + 1);
     kb_buf[kb_cursor] = ch;
     kb_len++;
     kb_cursor++;
+    return 1;
 }
 
 /* Same key tapped again inside the cycle window -- replace the character
@@ -3447,7 +3587,13 @@ static void kb_apply_key(int key) {
         kb_char_shifted = (kb_mode == KB_MODE_LETTERS) && (kb_shift != KB_SHIFT_OFF);
         char ch = cyc[0];
         if (kb_char_shifted) ch = (char)toupper((unsigned char)ch);
-        kb_insert_at_cursor(ch);
+        if (!kb_insert_at_cursor(ch)) {
+            /* Full: nothing was typed, so a second tap of this key must not
+             * "cycle" -- that would overwrite the unrelated character before
+             * the cursor. */
+            kb_last_key = -1;
+            return;
+        }
         /* Shift-once is consumed by the character it just capitalized, win
          * or lose which letter cycling eventually lands on; caps-lock keeps
          * going. */
@@ -3529,50 +3675,53 @@ static void hex_encode(const char *in, char *out, size_t outsz) {
         o += (size_t)snprintf(out + o, outsz - o, "%02x", *p);
     out[o] = '\0';
 }
-static void hex_decode(const char *in, char *out, size_t outsz) {
-    size_t o = 0;
-    for (const char *p = in; p[0] && p[1] && o + 1 < outsz; p += 2) {
-        int hi = (p[0] >= 'a') ? p[0] - 'a' + 10 : p[0] - '0';
-        int lo = (p[1] >= 'a') ? p[1] - 'a' + 10 : p[1] - '0';
-        out[o++] = (char)((hi << 4) | lo);
-    }
-    out[o] = '\0';
-}
 
-#define WIFI_CREDS_PATH "/usr/data/settings.txt"
-
-/* Read-modify-write, same idiom save_conf() already uses for music.conf --
- * a network re-entered (password changed, or just reselected) replaces its
- * own line rather than appending a duplicate. Kept in its own file rather
- * than folded into music.conf: credentials are a different kind of data
- * (potentially many rows, not a fixed set of singleton keys) and arguably
- * deserve being easy to find/wipe on their own. */
-static void wifi_cred_write(const char *ssid, const char *password) {
-    char hex_ssid[80]; hex_encode(ssid, hex_ssid, sizeof(hex_ssid));
-    char lines[64][256];
-    int n = 0;
-    FILE *f = fopen(WIFI_CREDS_PATH, "r");
-    if (f) {
-        char line[256];
-        char prefix[96];
-        snprintf(prefix, sizeof(prefix), "wifi_cred = %s ", hex_ssid);
-        while (n < 64 && fgets(line, sizeof(line), f)) {
-            if (strncmp(line, prefix, strlen(prefix)) != 0)
-                snprintf(lines[n++], sizeof(lines[0]), "%s", line);
-        }
-        fclose(f);
-    }
-    f = fopen(WIFI_CREDS_PATH, "w");
+/* Every Wi-Fi password joined from here used to be copied into this file as
+ * well, hex-encoded -- which is plain text to anyone who can read the file --
+ * and nothing ever read the copy back: wpa_supplicant.conf is the store that
+ * actually joins a network. No longer written; what earlier versions left
+ * behind is stripped out once at start (only those lines -- anything else in
+ * the file stays), and the file removed if that was all it held. */
+#define WIFI_CREDS_OLD_PATH "/usr/data/settings.txt"
+static void wifi_creds_purge(void) {
+    FILE *f = fopen(WIFI_CREDS_OLD_PATH, "r");
     if (!f) return;
-    for (int i = 0; i < n; i++) fputs(lines[i], f);
-    if (password) {
-        char hex_pw[192]; hex_encode(password, hex_pw, sizeof(hex_pw));
-        fprintf(f, "wifi_cred = %s %s\n", hex_ssid, hex_pw);
+    char tmp[sizeof(WIFI_CREDS_OLD_PATH) + 8];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", WIFI_CREDS_OLD_PATH);
+    FILE *o = fopen(tmp, "w");
+    if (!o) { fclose(f); return; }
+    char line[512];
+    int kept = 0, dropped = 0, ok = 1;
+    while (fgets(line, sizeof(line), f)) {
+        if (!strncmp(line, "wifi_cred = ", 12)) { dropped++; continue; }
+        if (fputs(line, o) == EOF) ok = 0;
+        kept++;
     }
     fclose(f);
+    if (fflush(o) != 0 || fsync(fileno(o)) != 0) ok = 0;
+    if (fclose(o) != 0) ok = 0;
+    if (!ok || !dropped) { unlink(tmp); return; }
+    if (kept) {
+        if (rename(tmp, WIFI_CREDS_OLD_PATH) != 0) { unlink(tmp); return; }
+    } else {
+        unlink(tmp);
+        unlink(WIFI_CREDS_OLD_PATH);
+    }
+    mlog("[music] wifi: removed %d stored password line(s) from %s\n", dropped, WIFI_CREDS_OLD_PATH);
 }
-static void wifi_save_credential(const char *ssid, const char *password) {
-    wifi_cred_write(ssid, password);
+
+/* What wpa_supplicant will take as a WPA passphrase: 8 to 63 characters, or
+ * a raw 256-bit key written as exactly 64 hex digits. Anything else it
+ * refuses -- silently, from here: the network was saved without a key and
+ * the row just sat on "Connecting..." until the timeout. */
+static int wifi_psk_is_hex(const char *pw) {
+    if (strlen(pw) != 64) return 0;
+    for (const char *p = pw; *p; p++) if (!isxdigit((unsigned char)*p)) return 0;
+    return 1;
+}
+static int wifi_psk_ok(const char *pw) {
+    size_t n = strlen(pw);
+    return (n >= 8 && n <= 63) || wifi_psk_is_hex(pw);
 }
 
 /* wpa_supplicant's own saved networks (wpa_cli list_networks: "id\tssid\t
@@ -3617,7 +3766,6 @@ static void wifi_remove_saved(const char *ssid) {
 static void wifi_forget(const char *ssid) {
     wifi_remove_saved(ssid);
     if (system("wpa_cli save_config >/dev/null 2>&1") == -1) mlog("[music] wifi: save_config failed\n");
-    wifi_cred_write(ssid, NULL);
     wifi_saved_refresh();
     mlog("[music] wifi: forgot %s\n", ssid);
 }
@@ -3671,8 +3819,11 @@ static void *wifi_connect_worker(void *arg) {
     char *set_ssid[] = { "wpa_cli", "-i", "wlan0", "set_network", id, "ssid", hex, NULL };
     st_run_argv(set_ssid);
     if (j->pw[0]) {
+        /* A passphrase goes in quotes; a raw 64-hex-digit key without them,
+         * which is how wpa_supplicant tells the two apart. */
         char quoted[140];
-        snprintf(quoted, sizeof(quoted), "\"%s\"", j->pw);
+        if (wifi_psk_is_hex(j->pw)) snprintf(quoted, sizeof(quoted), "%s", j->pw);
+        else snprintf(quoted, sizeof(quoted), "\"%s\"", j->pw);
         char *set_psk[] = { "wpa_cli", "-i", "wlan0", "set_network", id, "psk", quoted, NULL };
         st_run_argv(set_psk);
     } else {
@@ -3700,7 +3851,6 @@ static void wifi_connect(const char *ssid, const char *password) {
     pthread_t t;
     if (pthread_create(&t, NULL, wifi_connect_worker, j) == 0) pthread_detach(t);
     else free(j);
-    wifi_save_credential(ssid, password);
     mlog("[music] wifi: connecting to %s\n", ssid);
 }
 
@@ -3806,6 +3956,11 @@ static void wifi_link_tick(void) {
 static void kb_commit(void) {
     switch (kb_purpose) {
         case KB_PURPOSE_WIFI_PASSWORD:
+            if (!wifi_psk_ok(kb_buf)) {
+                /* Stay on the keyboard with the text as typed, and say why. */
+                snprintf(kb_title, sizeof(kb_title), "8 to 63 characters");
+                return;
+            }
             snprintf(wifi_connecting_ssid, sizeof(wifi_connecting_ssid), "%s", kb_wifi_target_ssid);
             wifi_connecting_since = time(NULL);
             wifi_connect(kb_wifi_target_ssid, kb_buf);
@@ -5191,16 +5346,19 @@ static void queue_follower(void);
  * spliced into shuffle_order[] itself (after the playing track, or last).
  * Inserting used to leave shuffle_order[] a length behind, and the lazy
  * regenerate then reshuffled the whole queue -- so Play Next did not play
- * next, and everything already shown in the Queue screen moved. */
-static void queue_insert(int track_idx, int next) {
-    if (track_idx < 0 || track_idx >= track_n) return;
+ * next, and everything already shown in the Queue screen moved.
+ *
+ * 1 once queued; 0 if not (a full queue), so the caller does not report a
+ * track as queued that isn't. */
+static int queue_insert(int track_idx, int next) {
+    if (track_idx < 0 || track_idx >= track_n) return 0;
     int cold = queue_n == 0;
     if (cold) {
         snprintf(q_artist, sizeof(q_artist), "%s", cur_artist);
         snprintf(q_album,  sizeof(q_album),  "%s", cur_album);
         q_is_playlist = browsing_is_playlist;
     }
-    if (queue_n >= QUEUE_MAX) return;
+    if (queue_n >= QUEUE_MAX) return 0;
     int has_cur = cur_track >= 0 && cur_track < queue_n;
     int at = (next && has_cur) ? cur_track + 1 : queue_n;
     int in_sync = shuffle_n == queue_n;
@@ -5239,6 +5397,7 @@ static void queue_insert(int track_idx, int next) {
     if (!q_is_playlist) queue_mixed = 1;
     queue_follower();                                  /* what comes next may have changed */
     mlog("[music] queued %s at %d%s\n", queue[at].name, at, next ? " (next)" : "");
+    return 1;
 }
 
 /* BG73: "Play next" specifically, as opposed to plain queue_insert()'s
@@ -5255,8 +5414,8 @@ static void queue_insert(int track_idx, int next) {
  * was actually chosen -- so Play Next there still just slots the new track
  * in and leaves the rest of the playlist to resume after it, same as
  * queue_insert() already does for everyone. */
-static void queue_play_next(int track_idx) {
-    if (track_idx < 0 || track_idx >= track_n) return;
+static int queue_play_next(int track_idx) {
+    if (track_idx < 0 || track_idx >= track_n) return 0;
     if (queue_n > 0 && !q_is_playlist && cur_track >= 0 && cur_track < queue_n) {
         /* Drop the old album's leftovers -- but not anything the user queued
          * themselves. R-qident: this used to be a bare `queue_n = cur_track
@@ -5285,7 +5444,7 @@ static void queue_play_next(int track_idx) {
     }
     /* BG85's deferred identity is recorded inside queue_insert() now (R-qident)
      * -- Add to queue needed it too. */
-    queue_insert(track_idx, 1);
+    return queue_insert(track_idx, 1);
 }
 
 /* Whether queueing what's currently being *browsed* into the queue that's
@@ -5406,10 +5565,8 @@ static void *radio_art_worker(void *arg) {
              * one that function already does per track. Skipped with no
              * bits -- the default theme stays in effect, same as any other
              * station with no usable art. */
-            if (bits && cover_palette_enabled) {
-                derive_palette_from_bits(bits, &np_bg, &np_accent, &np_fg);
-                np_palette_valid = 1;
-            }
+            if (bits && cover_palette_enabled)
+                np_palette_valid = derive_palette_from_bits(bits, &np_bg, &np_accent, &np_fg);
             pthread_mutex_unlock(&radio_art_lock);
         } else {
             free(bits);
@@ -5518,9 +5675,9 @@ static int play_station(int i) {
  * whatever the screen is actually showing), queue[] directly otherwise.
  * queue[] is also cur_track's own index space, so a direct reorder there
  * has to carry cur_track along with whichever physical slot the playing
- * track ends up in -- tracked by path rather than by hand-rolling the
- * index arithmetic a shift-by-one would need, since a wrong index here
- * plays the wrong track outright rather than just displaying one. */
+ * track ends up in -- by the shift's own index arithmetic, not by path: the
+ * same file can be queued twice, and matching by path then picked whichever
+ * copy came first, which plays the wrong entry outright. */
 static void queue_move_display(int from, int to) {
     if (from == to || from < 0 || to < 0 || from >= queue_n || to >= queue_n) return;
     if (queue_shuffled()) {
@@ -5530,17 +5687,19 @@ static void queue_move_display(int from, int to) {
         else            for (int i = from; i > to; i--) shuffle_order[i] = shuffle_order[i - 1];
         shuffle_order[to] = v;
     } else {
-        char playing_path[LIB_PATH_LEN];
-        int had_playing = cur_track >= 0 && cur_track < queue_n;
-        if (had_playing) snprintf(playing_path, sizeof(playing_path), "%s", queue[cur_track].path);
         lib_track_t v = queue[from];
         if (from < to) for (int i = from; i < to; i++) queue[i] = queue[i + 1];
         else            for (int i = from; i > to; i--) queue[i] = queue[i - 1];
         queue[to] = v;
-        if (had_playing)
-            for (int i = 0; i < queue_n; i++)
-                if (!strcmp(queue[i].path, playing_path)) { cur_track = i; break; }
+        int c = cur_track;
+        if (c == from)                             c = to;
+        else if (from < to && c > from && c <= to) c--;
+        else if (from > to && c >= to && c < from) c++;
+        cur_track = c;
     }
+    /* Reordered by hand: no longer the album as browsed (see
+     * queue_remove_display()). */
+    if (!q_is_playlist) queue_mixed = 1;
     /* R-qident: hand the worker the *new* next track. This was the missing
      * call behind "the title said Transmission, the audio was Love Will Tear
      * Us Apart": the worker holds its gapless follower (g_next_path) from
@@ -5678,6 +5837,23 @@ static void queue_remove_display(int display_i) {
          * screen showed the track after. */
         queue_follower();
     }
+    /* No longer the album as browsed, so "back" from Now Playing shows the
+     * queue itself rather than an album page listing the removed track --
+     * same rule and same playlist exemption as Clear. */
+    if (!q_is_playlist) queue_mixed = 1;
+}
+
+/* Whether album-page row tracks[idx] is the track playing now. By path for a
+ * plain album: tracks[] there is a fresh query in the album's own order,
+ * which a Queue-screen reorder or removal leaves different from queue[] (see
+ * go_back()). By index for a playlist, whose page is the queue's own order and
+ * can hold the same file twice. */
+static int album_row_playing(int idx) {
+    if (!audio_is_active() || cur_track < 0 || cur_track >= queue_n) return 0;
+    if (idx < 0 || idx >= track_n) return 0;
+    if (strcmp(cur_album, q_album) || strcmp(cur_artist, q_artist)) return 0;
+    if (browsing_is_playlist) return idx == cur_track;
+    return !strcmp(tracks[idx].path, queue[cur_track].path);
 }
 
 /* R29: waveform seek bar, for music and podcast episodes (audiobooks are
@@ -5809,23 +5985,45 @@ static void play_from_list(int idx) {
  * else — the chapter list, the mini player, the hardware keys — goes on
  * using tracks[]/queue[], which is why the chapters are mirrored into them. */
 
+/* Chapter i of the open book, in the lib_track_t shape tracks[]/queue[] hold. */
+static void ab_chapter_track(int i, lib_track_t *t) {
+    memset(t, 0, sizeof(*t));
+    snprintf(t->name, sizeof(t->name), "%s", ab_book.chap[i].title);
+    snprintf(t->path, sizeof(t->path), "%s", ab_book.files[ab_book.chap[i].file]);
+    t->dur_ms = (int)ab_book.chap[i].dur_ms;
+    t->track = -1;
+    t->disc  = -1;
+}
+
 static void ab_load_book(const ab_book_t *b) {
     ab_open_book(b->dir, &ab_book);
+    snprintf(ab_book_title, sizeof(ab_book_title), "%s", b->title);
     int max = (int)(sizeof(tracks) / sizeof(tracks[0]));
     track_n = 0;
-    for (int i = 0; i < ab_book.chap_n && track_n < max; i++) {
-        lib_track_t *t = &tracks[track_n];
-        memset(t, 0, sizeof(*t));
-        snprintf(t->name, sizeof(t->name), "%s", ab_book.chap[i].title);
-        snprintf(t->path, sizeof(t->path), "%s", ab_book.files[ab_book.chap[i].file]);
-        t->dur_ms = (int)ab_book.chap[i].dur_ms;
-        t->track = -1;
-        t->disc  = -1;
-        track_n++;
-    }
+    for (int i = 0; i < ab_book.chap_n && track_n < max; i++)
+        ab_chapter_track(i, &tracks[track_n++]);
     snprintf(cur_album, sizeof(cur_album), "%s", b->title);
     cur_artist[0] = '\0';
     ab_list = 1;
+}
+
+/* How many of the open book's chapters queue[] mirrors. */
+static int ab_queue_len(void) {
+    return ab_book.chap_n < QUEUE_MAX ? ab_book.chap_n : QUEUE_MAX;
+}
+
+/* Whether queue[] already mirrors the open book. Checked against the book
+ * itself -- its name, its chapter count and its first and last chapters --
+ * rather than by remembering who built the queue, which every other path
+ * that replaces it would have to remember to forget. */
+static int ab_queue_is_book(void) {
+    int n = ab_queue_len();
+    if (n <= 0 || queue_n != n || strcmp(q_album, ab_book_title) || q_artist[0]) return 0;
+    const ab_chapter_t *first = &ab_book.chap[0], *last = &ab_book.chap[n - 1];
+    return !strcmp(queue[0].path, ab_book.files[first->file]) &&
+           !strcmp(queue[0].name, first->title) &&
+           !strcmp(queue[n - 1].path, ab_book.files[last->file]) &&
+           !strcmp(queue[n - 1].name, last->title);
 }
 
 /* The next file after the one chapter `i` lives in, for gapless roll-over.
@@ -5840,16 +6038,26 @@ static const char *ab_next_file(int i) {
 }
 
 static void ab_play_chapter(int i) {
-    if (i < 0 || i >= ab_book.chap_n || i >= track_n) return;
+    if (i < 0 || i >= ab_queue_len()) return;
     audiobook_mode = 1;
     radio_mode = 0;
     recording_playback_mode = 0;
     podcast_mode = 0;
-    if (queue_n != track_n) {
-        memcpy(queue, tracks, sizeof(queue[0]) * (size_t)track_n);
-        queue_n = track_n;
-        snprintf(q_album, sizeof(q_album), "%s", cur_album);
+    /* The queue mirrors the book, and is built from the book -- never from
+     * tracks[], which is whatever list is on screen. A headset's next or
+     * previous chapter, or the file-boundary fallback, can land here while
+     * a music album is being browsed; copying that into queue[] made the
+     * on-screen transport play the album next, and bounded the chapter
+     * index by the album's length. */
+    if (!ab_queue_is_book()) {
+        int n = ab_queue_len();
+        for (int k = 0; k < n; k++) ab_chapter_track(k, &queue[k]);
+        queue_n = n;
+        shuffle_n = -1;
+        snprintf(q_album, sizeof(q_album), "%s", ab_book_title);
         q_artist[0] = '\0';
+        q_is_playlist = 0;
+        queue_mixed = 0;
         qid_clear();   /* BG85: audiobooks never go through queue_play_next() */
     }
     cur_track = i;
@@ -6121,7 +6329,7 @@ static int mini_visible(void) {
      * gates every reader of this function at once rather than needing a
      * separate check wherever the banner (or anything else) cares. */
     return audio_is_active() && screen != SC_PLAYING &&
-           (queue_n > 0 || radio_mode) && st_usb_mode() != 1;
+           (queue_n > 0 || radio_mode || recording_playback_mode) && st_usb_mode() != 1;
 }
 
 /* Cover (or book cover), title, subtitle and a pause button, over the bottom
@@ -6139,7 +6347,11 @@ static int mini_visible(void) {
  * compute_cover_palette(), kept fresh whenever the mini-player is on screen
  * -- see its own call site's comment -- which covers every screen any of
  * this chrome can appear over). */
-static int np_chrome_themed(void) { return cover_palette_enabled && !audiobook_mode; }
+/* Not for a radio recording either: its Now Playing is drawn plain, and
+ * np_bg & co. still hold the palette of whatever music it interrupted. */
+static int np_chrome_themed(void) {
+    return cover_palette_enabled && !audiobook_mode && !recording_playback_mode;
+}
 
 /* The dropdown and the volume/brightness popups follow the page under them:
  * the browsed album's palette (np_view_*) on an album page, the playing
@@ -6216,13 +6428,20 @@ static void listen_load(void) {
     }
     fclose(f);
     if (lines > 4000) {
-        f = fopen(LISTEN_PATH, "w");
+        /* Compacted into a temp file and renamed over the journal, never
+         * rewritten in place: a crash part-way through would otherwise have
+         * lost the whole history, not just the last minute of it. */
+        char tmp[sizeof(LISTEN_PATH) + 8];
+        snprintf(tmp, sizeof(tmp), "%s.tmp", LISTEN_PATH);
+        f = fopen(tmp, "w");
         if (!f) return;
         for (int i = 0; i < listen_n; i++)
             for (int k = 0; k < LC_N; k++)
                 if (listen_days[i].sec[k])
                     fprintf(f, "%u %d %u\n", listen_days[i].ymd, k, listen_days[i].sec[k]);
-        fclose(f);
+        int ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
+        if (fclose(f) != 0) ok = 0;
+        if (!ok || rename(tmp, LISTEN_PATH) != 0) unlink(tmp);
     }
 }
 
@@ -6351,7 +6570,7 @@ static long long stor_dir_bytes(const char *path, int depth) {
     struct dirent *e;
     char p[PATH_MAX];
     static unsigned n_seen;
-    while ((e = readdir(d))) {
+    while ((e = readdir(d)) && !card_released) {
         /* Card reads are not prioritised on this kernel, so a full walk
          * competes head-on with playback reading its own file. While
          * something plays, pause briefly every few dozen entries. */
@@ -6374,7 +6593,7 @@ static void *stor_worker(void *arg) {
     DIR *d = opendir(STOR_ROOT);
     if (d) {
         struct dirent *e;
-        while ((e = readdir(d))) {
+        while ((e = readdir(d)) && !card_released) {
             const char *n = e->d_name;
             if (n[0] == '.' || !strcmp(n, "Audiobooks") || !strcmp(n, "Podcasts") ||
                 !strcmp(n, "Playlists") || !strcmp(n, "EQProfiles") ||
@@ -6387,9 +6606,19 @@ static void *stor_worker(void *arg) {
         }
         closedir(d);
     }
-    stor_audio = stor_dir_bytes(STOR_AUDIOBOOKS, 0);
-    stor_pod   = stor_dir_bytes(STOR_PODCASTS, 0);
-    stor_rec   = stor_dir_bytes(STOR_RECORDINGS, 0);
+    long long audio = stor_dir_bytes(STOR_AUDIOBOOKS, 0);
+    long long pod   = stor_dir_bytes(STOR_PODCASTS, 0);
+    long long rec   = stor_dir_bytes(STOR_RECORDINGS, 0);
+    if (card_released) {
+        /* Cut short by USB mass storage: partial sums are wrong sums, so keep
+         * whatever the last complete walk found (if any). */
+        __sync_synchronize();
+        stor_state = stor_at ? 2 : 0;
+        return NULL;
+    }
+    stor_audio = audio;
+    stor_pod   = pod;
+    stor_rec   = rec;
     stor_music = music;
     stor_at = time(NULL);
     __sync_synchronize();
@@ -6397,8 +6626,10 @@ static void *stor_worker(void *arg) {
     return NULL;
 }
 
+static int stor_walking(void) { return stor_state == 1; }
+
 static void stor_request(void) {
-    if (stor_state == 1) return;
+    if (stor_state == 1 || card_released) return;
     if (stor_state == 2 && time(NULL) - stor_at < 120) return;
     stor_state = 1;
     pthread_t th;
@@ -6436,7 +6667,11 @@ static void draw_storage_stats(uint16_t *fb) {
         y += ROW_H;
         fill_rect(fb, 0, y - 1, FB_W, 1, COL_LINE);
     }
-    if (total > 0) {
+    if (card_released && !done) {
+        /* stor_request() will not walk a card the host has; say so rather
+         * than leave "..." standing as if it were still working. */
+        draw_text(fb, 24, y + 14, "Not measured in USB Storage Mode", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
+    } else if (total > 0) {
         char t[40], tt[24];
         stor_fmt(tt, sizeof(tt), total);
         snprintf(t, sizeof(t), "Card %s", tt);
@@ -6482,11 +6717,16 @@ static void batt_log_load(void) {
     }
     fclose(f);
     if (lines > BATT_MAX + BATT_MAX / 2) {
-        f = fopen(BATT_LOG_PATH, "w");
+        /* Same temp-and-rename as the listening journal's compaction. */
+        char tmp[sizeof(BATT_LOG_PATH) + 8];
+        snprintf(tmp, sizeof(tmp), "%s.tmp", BATT_LOG_PATH);
+        f = fopen(tmp, "w");
         if (!f) return;
         for (int i = 0; i < batt_n; i++)
             fprintf(f, "%u %d %d\n", batt_log[i].t, batt_log[i].pct, batt_log[i].chg);
-        fclose(f);
+        int ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
+        if (fclose(f) != 0) ok = 0;
+        if (!ok || rename(tmp, BATT_LOG_PATH) != 0) unlink(tmp);
     }
 }
 
@@ -6628,6 +6868,11 @@ static void draw_mini(uint16_t *fb) {
      * rather than sitting inset within it on every side. */
     int thumb = MINI_H + 8, tx = 0, ty = FB_H - thumb;
     int text_x = 20;
+    /* A radio recording plays outside the queue -- queue[] still holds the
+     * music it interrupted, and art_bits that music's cover -- so the bar
+     * mirrors the recording's own Now Playing instead: a blank box, its
+     * name, and play/pause alone (no seek bar, nothing to skip to). */
+    int rec = recording_playback_mode;
     if (!radio_mode) {
         /* COL_ROW (the full player's own art placeholder) is the same value
          * as this bar's COL_HEADER background, so it would be invisible
@@ -6635,7 +6880,7 @@ static void draw_mini(uint16_t *fb) {
          * the bar while art loads or when a track has none. Themed the same
          * way the bar's own background just above is. */
         fill_rect(fb, tx, ty, thumb, thumb, themed ? np_col_line() : COL_LINE);
-        blit_art_scaled(fb, tx, ty, thumb);
+        if (!rec) blit_art_scaled(fb, tx, ty, thumb);
         text_x = tx + thumb + 16;
     }
 
@@ -6651,7 +6896,7 @@ static void draw_mini(uint16_t *fb) {
      * side), so it's never the art that ends up covering the bar -- 6px
      * thick (R79: 3x the original bump to 2px), so it survives sitting
      * this close to the bezel and reads at a glance. */
-    if (!radio_mode && cur_track >= 0 && cur_track < queue_n) {
+    if (!radio_mode && !rec && cur_track >= 0 && cur_track < queue_n) {
         lib_track_t *t = &queue[cur_track];
         int pos, dur;
         /* BG56: audio_dur_ms()/audio_pos_ms() are file-scoped, not
@@ -6683,7 +6928,7 @@ static void draw_mini(uint16_t *fb) {
             pos = raw_pos;
         }
         if (dur > 0) {
-            int w = FB_W * pos / dur;
+            int w = (int)((int64_t)FB_W * pos / dur);   /* 64-bit: FB_W*pos overflows past ~75 min */
             if (w > FB_W) w = FB_W;
             if (w > 0) fill_rect(fb, 0, FB_H - 6, w, 6, themed ? np_col_accent() : COL_ACCENT);
         }
@@ -6693,9 +6938,15 @@ static void draw_mini(uint16_t *fb) {
      * mode -- radio's lone play button leaves the most room, audiobook's
      * three buttons the least. */
     int text_edge = radio_mode ? MINI_RADIO_BACK_CX - 20
+                  : rec ? MINI_RADIO_ZONE_PLAY - 20
                   : audiobook_mode ? MINI_ZONE_BACK - 20
                   : MINI_ZONE_PLAY - 20;
-    if (radio_mode) {
+    if (rec) {
+        draw_text(fb, text_x, by + 12, recording_playback_name, themed ? np_col_fg() : COL_TEXT,
+                  TEXT_PX_SMALL, text_edge);
+        draw_text(fb, text_x, by + 42, "Recording", themed ? np_col_dim() : COL_DIM,
+                  TEXT_PX_SMALL, text_edge);
+    } else if (radio_mode) {
         draw_text(fb, text_x, by + 12, radio_name, themed ? np_col_fg() : COL_TEXT, TEXT_PX_SMALL, text_edge);
         /* How far behind live, in place of the fixed "Internet radio" that used
          * to sit here -- once the mini player can rewind (the -10s below), the
@@ -6712,7 +6963,7 @@ static void draw_mini(uint16_t *fb) {
                           ? (themed ? np_col_dim() : COL_DIM)
                           : (themed ? np_col_accent() : COL_ACCENT);
         draw_text(fb, text_x, by + 42, livebuf, live_col, TEXT_PX_SMALL, text_edge);
-    } else {
+    } else if (cur_track >= 0 && cur_track < queue_n) {
         lib_track_t *t = &queue[cur_track];
         draw_text(fb, text_x, by + 12, t->name, themed ? np_col_fg() : COL_TEXT, TEXT_PX_SMALL, text_edge);
         /* A chapter carries no artist -- tracks[] built by ab_load_book()
@@ -6739,8 +6990,8 @@ static void draw_mini(uint16_t *fb) {
     /* Radio is the one mode with nothing either side of play/pause, so it
      * keeps the original larger button and position rather than shrinking
      * to match a cluster it isn't part of. */
-    int cx = radio_mode ? FB_W - 46 : MINI_PLAY_CX;
-    int pr = radio_mode ? 26 : MINI_BTN_R;
+    int cx = (radio_mode || rec) ? FB_W - 46 : MINI_PLAY_CX;
+    int pr = (radio_mode || rec) ? 26 : MINI_BTN_R;
     fill_circle(fb, cx, cy, pr, themed ? np_col_accent() : COL_ACCENT);
     if (audio_is_paused()) {
         fill_triangle(fb, cx + 2, cy, pr - 4, +1, themed ? np_col_bg() : COL_BG);
@@ -6775,7 +7026,7 @@ static void draw_mini(uint16_t *fb) {
         draw_text(fb, MINI_RADIO_BACK_CX - text_width(back_lbl, TEXT_PX_SMALL) / 2,
                   cy - TEXT_PX_SMALL / 2 + 2, back_lbl,
                   themed ? np_col_fg() : COL_TEXT, TEXT_PX_SMALL, FB_W);
-    } else if (!radio_mode) {
+    } else if (!rec) {
         /* Next track: triangle against a bar, the same glyph the full
          * player uses for its own next button -- a lone triangle here read
          * as a second play button rather than "skip". Themed white/black
@@ -7258,11 +7509,14 @@ static void draw_screen(uint16_t *fb) {
         /* R81: the card is unsafe to read from while it's exported as a USB
          * drive to whatever it's plugged into -- a host machine can rename,
          * move, or delete files out from under a scan or a currently-open
-         * book/feed at any moment, with no way for this app to know. Music/
-         * Audiobooks/Podcasts (the three that actually read the card open-
-         * endedly) grey out and stop opening for exactly as long as that's
-         * true; Parametric EQ/MSEB/Radio/Settings don't touch the card the
-         * same way and stay live. */
+         * book/feed at any moment, with no way for this app to know. Every
+         * section that uses the card greys out and stops opening for exactly
+         * as long as that's true: Music/Audiobooks/Podcasts, and also Radio
+         * (its time-shift buffer, its recordings and the curl it runs all
+         * live on the card), Parametric EQ (its profiles are files there) and
+         * MSEB (.mseb.txt, likewise). Stats and Settings stay live: their own
+         * state is in /usr/data, and the one card walk Stats does is refused
+         * while the card is away (stor_request()). */
         int usb_storage = st_usb_mode() == 1;
         /* A Lucide line icon in the accent colour with the name beneath it,
          * laid out by home_tile(). */
@@ -7271,7 +7525,7 @@ static void draw_screen(uint16_t *fb) {
             &icon_home_eq, &icon_home_mseb, &icon_home_radio, &icon_home_stats, &icon_home_settings,
         };
         for (int i = 0; i < TOP_N; i++) {
-            int disabled = usb_storage && (i == TOP_MUSIC || i == TOP_AUDIOBOOKS || i == TOP_PODCASTS);
+            int disabled = usb_storage && top_needs_card(i);
             int tx, ty, tw, th;
             home_tile(i, &tx, &ty, &tw, &th);
             if (tx + tw < FB_W) fill_rect(fb, tx + tw - 1, ty, 1, th, COL_LINE);
@@ -7660,7 +7914,7 @@ static void draw_screen(uint16_t *fb) {
             int cbyy = cby - (cbh - 6) / 2;
             fill_rect(fb, 24, cbyy, FB_W - 48, cbh, COL_LINE);
             if (chap_dur > 0) {
-                int w = (FB_W - 48) * chap_pos / chap_dur;
+                int w = (int)((int64_t)(FB_W - 48) * chap_pos / chap_dur);
                 if (w > FB_W - 48) w = FB_W - 48;
                 fill_rect(fb, 24, cbyy, w, cbh, COL_ACCENT);
                 if (scrub_active) fill_circle(fb, 24 + w, cby + 3, 13, COL_ACCENT);
@@ -8000,7 +8254,7 @@ static void draw_screen(uint16_t *fb) {
          * shaped instead of flat. */
         if (wave_loaded && !audiobook_mode && !strcmp(t->path, wave_path)) {
             int wave_w = FB_W - 48;
-            int played_col = dur > 0 ? WAVE_BUCKETS * pos / dur : 0;
+            int played_col = dur > 0 ? (int)((int64_t)WAVE_BUCKETS * pos / dur) : 0;
             /* Reported live, twice: first as uneven spacing (a fixed col_w
              * drawn at an independently-truncated cx each iteration drifts
              * in and out of step with its own rounding -- fixed by sizing
@@ -8030,14 +8284,14 @@ static void draw_screen(uint16_t *fb) {
                           c <= played_col ? wave_accent : wave_line);
             }
             if (scrub_active) {
-                int w = dur > 0 ? wave_w * pos / dur : 0;
+                int w = dur > 0 ? (int)((int64_t)wave_w * pos / dur) : 0;
                 if (w > wave_w) w = wave_w;
                 fill_circle(fb, 24 + w, wave_cy, 13, np_col_accent());
             }
         } else {
             fill_rect(fb, 24, byy, FB_W - 48, bh, np_col_line());
             if (dur > 0) {
-                int w = (FB_W - 48) * pos / dur;
+                int w = (int)((int64_t)(FB_W - 48) * pos / dur);
                 if (w > FB_W - 48) w = FB_W - 48;
                 fill_rect(fb, 24, byy, w, bh, np_col_accent());
                 if (scrub_active)
@@ -8309,8 +8563,7 @@ static void draw_screen(uint16_t *fb) {
             int row_y = ry - off;
             if (row_y > clip_bot) break;   /* rows only get later from here -- nothing further can be visible */
             if (row_y + ROW_H > 0) {
-                int playing = audio_is_active() && idx == cur_track &&
-                             !strcmp(cur_album, q_album) && !strcmp(cur_artist, q_artist);
+                int playing = album_row_playing(idx);
                 /* R70: same shapes as SC_QUEUE's own dragging_this/
                  * swiping_this -- see that screen's own comments for why
                  * each highlight/reveal is drawn the way it is. */
@@ -8526,7 +8779,11 @@ static void draw_screen(uint16_t *fb) {
              * -- show the download affordance in that slot instead, or its
              * live progress if this is the one downloading right now. */
             if (pod_list && !pod_eps[idx].downloaded) {
-                if (pod_download_active() && pod_download_slot() == idx) {
+                /* Matched by feed and name, not by pod_download_slot(): the
+                 * running download may belong to another feed than the one
+                 * showing, or have started from the waiting list. */
+                if (pod_download_active() && !strcmp(pod_download_feed(), cur_feed) &&
+                    !strcmp(pod_download_name(), pod_eps[idx].name)) {
                     long tot = pod_download_total();
                     long got = pod_download_bytes();
                     /* BG110: belt-and-suspenders alongside podcast.c's own
@@ -8535,11 +8792,13 @@ static void draw_screen(uint16_t *fb) {
                      * percent if it ever does (a still-wrong header, a
                      * chunked response with no Content-Length at all) beats
                      * a six-digit or negative number on screen either way. */
+                    /* 64-bit: long is 32 here, and got * 100 overflowed it
+                     * past ~21 MB -- most of an hour-long episode. */
                     if (tot > 0 && got >= 0 && got <= tot)
-                        snprintf(buf, sizeof(buf), "%ld%%", got * 100 / tot);
+                        snprintf(buf, sizeof(buf), "%d%%", (int)((long long)got * 100 / tot));
                     else
                         snprintf(buf, sizeof(buf), "%ld KB", got / 1024);
-                } else if (pod_dl_deferred_idx == idx && !strcmp(cur_feed, pod_dl_deferred_feed)) {
+                } else if (pod_dl_waiting(cur_feed, pod_eps[idx].name)) {
                     snprintf(buf, sizeof(buf), "Waiting");
                 } else {
                     snprintf(buf, sizeof(buf), "Download");
@@ -9499,6 +9758,29 @@ static int drag_threshold(void) {
     return ms < FAST_TAP_MS ? FAST_DRAG_MIN : DRAG_MIN;
 }
 
+/* A finger that slid sideways and lifted still arrives as a tap, at the
+ * release point: read_gesture() calls only vertical travel a drag, and the
+ * horizontal controls rely on that -- the scrub bar seeks, the volume popup
+ * sets, on exactly that release. Everywhere else it is never what was meant:
+ * a back swipe begun a little too far from the edge, or a finger drifting
+ * sideways, opened or toggled whichever row it happened to lift over. Asked
+ * only for a release that travelled SLIDE_NOT_TAP_PX sideways -- twice
+ * DRAG_MIN, so a tap that merely rolled a little stays a tap. The volume
+ * popup, quick settings and sheets are handled before this is asked. */
+#define SLIDE_NOT_TAP_PX (2 * DRAG_MIN)
+static int slide_is_not_a_tap(void) {
+    switch (screen) {
+        case SC_PLAYING:      /* scrub bar, title drag */
+        case SC_EQ:           /* preamp slider */
+        case SC_EQ_BAND:      /* frequency/gain/Q sliders */
+        case SC_MSEB:         /* band sliders */
+        case SC_KEYBOARD:     /* a key is a key, drift or not */
+            return 0;
+        default:
+            return 1;
+    }
+}
+
 static int read_gesture(int fd, int *ox, int *oy) {
     r1_input_event_t ev;
     static int x, y, down_x = -1, down_y = -1, moved, have_down;
@@ -9670,11 +9952,16 @@ static int go_back(void) {
              * persisted, not routed around), and there's no equivalent
              * fresh query this cheap for chapters or episodes.
              *
-             * cur_track indexes into tracks[] everywhere below this (see
-             * BG73's own comment on tracks[cur_track] a little further down)
-             * -- after a fresh query, tracks[] is a different array in a
-             * different order than queue[], so cur_track has to be remapped
-             * by path rather than carried over as a raw index. */
+             * After a fresh query tracks[] is a different array, possibly in a
+             * different order, from queue[] -- so the playing track's row is
+             * found by path (play_i, for the cover below; the row highlight
+             * does the same, album_row_playing()). cur_track is NOT remapped:
+             * it indexes queue[], and playback, Now Playing, next/prev and
+             * the gapless follower all read it that way. Pointing it at an
+             * album position (as this once did) silently moved playback onto
+             * a different queue entry whenever the queue's order had drifted
+             * from the album's. */
+            int play_i = -1;
             if (!audiobook_mode && !podcast_mode && !q_is_playlist) {
                 char playing_path[LIB_PATH_LEN];
                 snprintf(playing_path, sizeof(playing_path), "%s",
@@ -9682,10 +9969,11 @@ static int go_back(void) {
                 track_n = lib_tracks_for_album(q_artist, q_album, tracks,
                                                (int)(sizeof(tracks) / sizeof(tracks[0])), 0);
                 for (int i = 0; i < track_n; i++)
-                    if (!strcmp(tracks[i].path, playing_path)) { cur_track = i; break; }
+                    if (!strcmp(tracks[i].path, playing_path)) { play_i = i; break; }
             } else {
                 memcpy(tracks, queue, sizeof(queue[0]) * (size_t)queue_n);
                 track_n = queue_n;
+                play_i = cur_track;          /* tracks[] is queue[] here */
             }
             snprintf(cur_artist, sizeof(cur_artist), "%s", q_artist);
             snprintf(cur_album,  sizeof(cur_album),  "%s", q_album);
@@ -9772,9 +10060,9 @@ static int go_back(void) {
                  * splice in a track from a different album, tracks[0] can be
                  * a leftover from an album this queue has already moved on
                  * from (cur_album now names the *new* one), so it has to be
-                 * the actually-playing entry's own path instead. */
+                 * the actually-playing entry's own row instead (play_i). */
                 if (track_n > 0) {
-                    int a = (cur_track >= 0 && cur_track < track_n) ? cur_track : 0;
+                    int a = (play_i >= 0 && play_i < track_n) ? play_i : 0;
                     view_art_request(tracks[a].path, cur_artist, cur_album);
                 }
             }
@@ -10547,8 +10835,11 @@ static void draw_quick_settings(uint16_t *fb) {
     int on = eq_enabled() && !usb_bypass_active;
     draw_eq_icon(fb, c0 + 5, by3 + 16, on ? accent : dim);
     draw_text(fb, c0 + label_dx, by3 + 6, "Parametric EQ", on ? fg : dim, TEXT_PX_SMALL, c0 + cw);
+    /* In USB Storage Mode the profile picker and the MSEB toggle both need
+     * the card (profiles and .mseb.txt live there) and refuse; say why. */
     draw_text(fb, c0 + label_dx, by3 + 32,
-              usb_bypass_active ? "USB Transport" : eq_cur_path[0] ? eq_cur.name : "no profile",
+              usb_bypass_active ? "USB Transport" : card_released ? "USB Storage Mode"
+              : eq_cur_path[0] ? eq_cur.name : "no profile",
               dim, TEXT_PX_SMALL, c0 + cw);
 
     /* Same shape as Parametric EQ -- a quick toggle, not a way in to editing
@@ -10560,7 +10851,8 @@ static void draw_quick_settings(uint16_t *fb) {
     draw_eq_icon(fb, c1 + 5, by4 + 16, mseb_shown ? accent : dim);
     draw_text(fb, c1 + label_dx, by4 + 6, "MSEB", mseb_shown ? fg : dim, TEXT_PX_SMALL, c1 + cw);
     draw_text(fb, c1 + label_dx, by4 + 32,
-              usb_bypass_active ? "USB Transport" : "HiBy tuning bands",
+              usb_bypass_active ? "USB Transport" : card_released ? "USB Storage Mode"
+              : "HiBy tuning bands",
               dim, TEXT_PX_SMALL, c1 + cw);
 
     /* Cover colours (left) / USB working mode (right), same row. USB keeps
@@ -10756,7 +11048,7 @@ static void draw_scrub_strip(uint16_t *fb) {
     int byy = by - (bh - 6) / 2;
     fill_rect(fb, 24, byy, FB_W - 48, bh, COL_LINE);
     if (dur > 0) {
-        int w = (FB_W - 48) * pos / dur;
+        int w = (int)((int64_t)(FB_W - 48) * pos / dur);
         if (w > FB_W - 48) w = FB_W - 48;
         fill_rect(fb, 24, byy, w, bh, COL_ACCENT);
         if (scrub_active) fill_circle(fb, 24 + w, by + 3, 13, COL_ACCENT);
@@ -11294,7 +11586,13 @@ static void save_conf(void) {
         }
         fclose(f);
     }
-    f = fopen(CONF_PATH, "w");
+    /* Written whole to a temp file and renamed over the old one, same as
+     * resume_save(): rewriting music.conf in place meant a crash, a
+     * supervisor reboot or a flat battery part-way through left it truncated,
+     * and every setting back at its default on the next start. */
+    char tmp[sizeof(CONF_PATH) + 8];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", CONF_PATH);
+    f = fopen(tmp, "w");
     if (!f) return;
     for (int i = 0; i < n; i++) fputs(lines[i], f);
     fprintf(f, "accent_index = %d\n", g_accent_idx);
@@ -11325,7 +11623,11 @@ static void save_conf(void) {
     if (brightness_pref > 0) fprintf(f, "brightness = %d\n", brightness_pref);
     fprintf(f, "ab_speed_permille = %d\n", ab_speed_permille);   /* BG91 */
     fprintf(f, "pod_speed_permille = %d\n", pod_speed_permille); /* BG91 */
-    fclose(f);
+    /* fsync before the rename, so the new name cannot reach flash ahead of
+     * the data it names. */
+    int ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
+    if (fclose(f) != 0) ok = 0;
+    if (!ok || rename(tmp, CONF_PATH) != 0) unlink(tmp);
 }
 
 /* ---- R66: resume after auto-shutdown -------------------------------------
@@ -12372,6 +12674,7 @@ int music_entry(void *a0, void *a1) {
      * obvious suspect is probably not the real one. */
     uint64_t ent_t0 = us_now(), ent_conf, ent_fb, ent_lib;
     load_conf();
+    wifi_creds_purge();
     ent_conf = us_now();
     screen = SC_MENU; reset_scroll();
 
@@ -12488,6 +12791,15 @@ int music_entry(void *a0, void *a1) {
 
     bt_poll_run = 1;
     bt_thread_valid = (pthread_create(&bt_thread, NULL, bt_poll, NULL) == 0);
+    /* Started while USB mass storage already has the card -- restarted while
+     * it was exported: the background card work is held off from the start,
+     * the same as entering the mode does, until the Home banner's Done. */
+    if (st_usb_mode() == 1) {
+        card_released = 1;
+        waveform_pause(1);
+        scanner_pause_for_usb(1);
+        index_pause_for_usb(1);
+    }
     waveform_start(mlog);   /* R29: background shape worker -- see waveform.c */
 
     /* Redrawing every 33 ms regardless burns CPU on a screen that is usually
@@ -12793,6 +13105,9 @@ int music_entry(void *a0, void *a1) {
                         if (x < qs_col_x(0) + 50) {
                             eq_set_enabled(!eq_enabled());
                             save_conf();          /* BG38 */
+                        } else if (card_released) {
+                            /* The profiles are on the card, which USB mass
+                             * storage has -- see this cell's draw. */
                         } else {
                             /* Closed first, not left open behind the sheet --
                              * qs_open && g==1 is checked ahead of sheet_open
@@ -12803,7 +13118,7 @@ int music_entry(void *a0, void *a1) {
                             eq_profile_n = ep_scan(eq_profiles, EP_MAX_PROFILES);
                             sheet_open = 3;
                         }
-                    } else {
+                    } else if (!card_released) {   /* .mseb.txt is on the card */
                         /* No sheet to open for this one -- there's nothing
                          * to pick, just the one fixed set of bands -- so the
                          * whole cell toggles. */
@@ -12991,8 +13306,9 @@ int music_entry(void *a0, void *a1) {
                              audiobook_mode ? "An audiobook"
                                             : podcast_mode ? "A podcast" : "Music");
                 } else {
-                    queue_play_next(sheet_track);   /* BG73 */
-                    snprintf(sheet_note, sizeof(sheet_note), "Playing next");
+                    snprintf(sheet_note, sizeof(sheet_note), "%s",
+                             queue_play_next(sheet_track) ? "Playing next"   /* BG73 */
+                                                          : "Queue is full");
                 }
                 sheet_open = 0;
             } else if (i == 1) {
@@ -13003,8 +13319,8 @@ int music_entry(void *a0, void *a1) {
                              audiobook_mode ? "An audiobook"
                                             : podcast_mode ? "A podcast" : "Music");
                 } else {
-                    queue_insert(sheet_track, 0);
-                    snprintf(sheet_note, sizeof(sheet_note), "Added to queue");
+                    snprintf(sheet_note, sizeof(sheet_note), "%s",
+                             queue_insert(sheet_track, 0) ? "Added to queue" : "Queue is full");
                 }
                 sheet_open = 0;
             } else if (i == 2) {
@@ -13027,6 +13343,8 @@ int music_entry(void *a0, void *a1) {
             inertia_active = 0;
             list_velocity = 0;
             dirty = 1;
+        } else if (g == 1 && abs(x - touch_x) > SLIDE_NOT_TAP_PX && slide_is_not_a_tap()) {
+            /* A sideways slide, lifted -- see slide_is_not_a_tap(). */
         } else if (g == 1) {
             sheet_note[0] = '\0';
             if (screen == SC_PLAYING && audiobook_mode && y >= STATUS_H) {
@@ -13096,7 +13414,12 @@ int music_entry(void *a0, void *a1) {
                             const char *ext = rb_current_kind() == RB_KIND_ADTS ? "aac" : "mp3";
                             radio_recording_new_path(radio_name, ext, radio_recording_path_buf,
                                                      sizeof(radio_recording_path_buf));
-                            rb_recording_start(radio_recording_path_buf);
+                            if (rb_recording_start(radio_recording_path_buf) != 0) {
+                                /* Said out loud: this used to do nothing at
+                                 * all, with the button simply not changing. */
+                                np_toast("Can't record");
+                                mlog("[music] recording could not start: %s\n", radio_recording_path_buf);
+                            }
                         }
                     } else if (x > mid + 48) {
                         if (audio_radio_offset_ms() > 0)
@@ -13317,6 +13640,11 @@ int music_entry(void *a0, void *a1) {
                     if (x > MINI_ZONE_SIDE)      audio_seek_ms(audio_pos_ms() + 30000);
                     else if (x > MINI_ZONE_PLAY) audio_toggle();
                     else if (x > MINI_ZONE_BACK) audio_seek_ms(audio_pos_ms() - 30000);
+                    else                          screen = SC_PLAYING;
+                } else if (recording_playback_mode) {
+                    /* Play/pause only, as drawn -- "next" here used to play
+                     * on through the music queue the recording interrupted. */
+                    if (x > MINI_RADIO_ZONE_PLAY) audio_toggle();
                     else                          screen = SC_PLAYING;
                 } else {
                     if (x > MINI_ZONE_SIDE)      play_index(next_track_index());
@@ -13758,15 +14086,16 @@ int music_entry(void *a0, void *a1) {
                     if (usb_storage && y >= FB_H - 60 && x >= usb_done_x() - 24) {
                         set_usb_storage_mode(0);
                     } else if (idx >= TOP_N) { /* nothing there */ }
-                    else if (idx == TOP_MUSIC && !usb_storage) {
+                    else if (usb_storage && top_needs_card(idx)) { /* greyed out */ }
+                    else if (idx == TOP_MUSIC) {
                         screen = SC_MUSIC_MENU; reset_scroll();
-                    } else if (idx == TOP_AUDIOBOOKS && !usb_storage) {
+                    } else if (idx == TOP_AUDIOBOOKS) {
                         ab_book_n = ab_scan_books(ab_books, AB_MAX_BOOKS);
                         ab_rebuild_rows();
                         screen = SC_AUDIOBOOKS; reset_scroll();
                         total = ab_book_n;
                         mlog("[music] %d audiobooks\n", ab_book_n);
-                    } else if (idx == TOP_PODCASTS && !usb_storage) {
+                    } else if (idx == TOP_PODCASTS) {
                         pod_feed_n = pod_scan_feeds(pod_feeds, POD_MAX_FEEDS);
                         pod_rebuild_rows();
                         screen = SC_PODCASTS; reset_scroll();
@@ -13900,15 +14229,23 @@ int music_entry(void *a0, void *a1) {
                         int pi = scroll + idx;
                         if (pod_eps[pi].downloaded) {
                             play_request(RECQ_EPISODE, pi);
-                        } else if (!pod_download_active()) {
-                            if (net_held()) {
-                                pod_dl_deferred_idx = pi;
-                                snprintf(pod_dl_deferred_feed, sizeof(pod_dl_deferred_feed), "%s", cur_feed);
-                                snprintf(pod_dl_deferred_name, sizeof(pod_dl_deferred_name), "%s", pod_eps[pi].name);
-                                snprintf(sheet_note, sizeof(sheet_note), "Downloads when Bluetooth playback pauses");
+                        } else if (net_held() || wifi_bt_parked) {
+                            /* Held for Bluetooth playback: joins the waiting
+                             * list, which the main loop works through once
+                             * playback pauses -- every episode asked for, in
+                             * order, whichever feed is showing by then. */
+                            if (pod_dl_waiting(cur_feed, pod_eps[pi].name)) {
+                                snprintf(sheet_note, sizeof(sheet_note), "Already waiting to download");
+                            } else if (pod_dl_wait_n >= POD_DL_WAIT_MAX) {
+                                snprintf(sheet_note, sizeof(sheet_note), "Too many downloads waiting");
                             } else {
-                                pod_download_start(pi);
+                                snprintf(pod_dl_wait[pod_dl_wait_n].feed, sizeof(pod_dl_wait[0].feed), "%s", cur_feed);
+                                snprintf(pod_dl_wait[pod_dl_wait_n].name, sizeof(pod_dl_wait[0].name), "%s", pod_eps[pi].name);
+                                pod_dl_wait_n++;
+                                snprintf(sheet_note, sizeof(sheet_note), "Downloads when Bluetooth playback pauses");
                             }
+                        } else if (!pod_download_active()) {
+                            pod_download_start(pi);
                         }
                     } else if (ab_list) {
                         /* This list is the book's chapters. */
@@ -14140,6 +14477,7 @@ int music_entry(void *a0, void *a1) {
             mlog("[music] power held -- graceful shutdown, saving first\n");
             ab_save_current_pos();
             pod_save_current_pos();
+            listen_flush();          /* up to a minute of listening not yet written */
             /* BG112: NOT "either page holds the last drawn frame" the way
              * the auto-shutdown path's own identical-looking call can rely
              * on -- the countdown overlay has been the last thing drawn for
@@ -14273,37 +14611,68 @@ int music_entry(void *a0, void *a1) {
          * consumed its own "__DONE__" (and cleared the flag itself) by the
          * time reap looks, leaving reap to flag only a genuine early exit --
          * one that ended without ever writing that line. */
-        if ((pod_sync_deferred || pod_dl_deferred_idx >= 0) && !net_held() &&
+        /* Redraws only when something actually starts: while held work waits
+         * behind a download or sync already running, nothing on screen has
+         * changed, and this used to repaint every tick for as long as that
+         * lasted. */
+        if ((pod_sync_deferred || pod_dl_wait_n > 0) && !net_held() &&
             !wifi_bt_parked && (st_wifi_has_ip() || !wifi_pref)) {
             if (pod_sync_deferred && !pod_update_running()) {
                 pod_sync_deferred = 0;
                 pod_update_start();
                 mlog("[music] starting the feed sync held for Bluetooth playback\n");
+                dirty = 1;
             }
-            if (pod_dl_deferred_idx >= 0 && !pod_download_active()) {
-                int i = pod_dl_deferred_idx;
-                pod_dl_deferred_idx = -1;
-                if (!strcmp(cur_feed, pod_dl_deferred_feed) && i < pod_ep_n &&
-                    !strcmp(pod_eps[i].name, pod_dl_deferred_name) && !pod_eps[i].downloaded) {
-                    pod_download_start(i);
-                    mlog("[music] starting the download held for Bluetooth playback: %s\n", pod_eps[i].name);
-                }
+            if (pod_dl_wait_n > 0 && !pod_download_active()) {
+                char feed[POD_NAME_LEN], name[POD_NAME_LEN];
+                snprintf(feed, sizeof(feed), "%s", pod_dl_wait[0].feed);
+                snprintf(name, sizeof(name), "%s", pod_dl_wait[0].name);
+                memmove(&pod_dl_wait[0], &pod_dl_wait[1],
+                        (size_t)(pod_dl_wait_n - 1) * sizeof(pod_dl_wait[0]));
+                pod_dl_wait_n--;
+                int rc = pod_download_start_named(feed, name);
+                mlog("[music] download held for Bluetooth playback: %s -- %s / %s\n",
+                     rc == 0 ? "starting" : rc == 1 ? "already on the card" : "could not start",
+                     feed, name);
+                dirty = 1;
             }
-            dirty = 1;
         }
         if (pod_update_running()) {
+            /* Repaint only for what shows it: the log, on the sync screen,
+             * when a line arrives; and the end of the run everywhere (the
+             * Sync bar's label, a refreshed feed list). Repainting every tick
+             * for the whole sync, on every screen, was a full frame plus a
+             * page copy 30 times a second for minutes at a time. */
+            char last_before[POD_NAME_LEN];
+            int n_before = pod_sync_log_n;
+            snprintf(last_before, sizeof(last_before), "%s",
+                     n_before > 0 ? pod_sync_log[n_before - 1] : "");
             pod_sync_log_n = pod_update_tail(pod_sync_log, POD_SYNC_LOG_N);
-            if (!pod_update_running() && (screen == SC_PODCASTS || screen == SC_POD_SYNC)) {
-                /* Just finished: the feed list on screen may have new
-                 * subfolders (a brand new feed) or new manifest-only
-                 * episodes -- refresh it the same way opening Podcasts does. */
-                pod_feed_n = pod_scan_feeds(pod_feeds, POD_MAX_FEEDS);
-                pod_rebuild_rows();
-                total = pod_feed_n;
+            int log_changed = pod_sync_log_n != n_before ||
+                              (pod_sync_log_n > 0 && strcmp(pod_sync_log[pod_sync_log_n - 1], last_before));
+            if (!pod_update_running()) {
+                if (screen == SC_PODCASTS || screen == SC_POD_SYNC) {
+                    /* Just finished: the feed list on screen may have new
+                     * subfolders (a brand new feed) or new manifest-only
+                     * episodes -- refresh it the same way opening Podcasts does. */
+                    pod_feed_n = pod_scan_feeds(pod_feeds, POD_MAX_FEEDS);
+                    pod_rebuild_rows();
+                    total = pod_feed_n;
+                }
+                dirty = 1;
+            } else if (log_changed && screen == SC_POD_SYNC) {
+                dirty = 1;
             }
-            dirty = 1;
         }
         pod_update_reap();
+        {
+            /* A run that dies without "__DONE__" ends in the reap instead,
+             * which the branch above never sees finish. */
+            static int sync_was;
+            int sync_now = pod_update_running();
+            if (sync_was && !sync_now) dirty = 1;
+            sync_was = sync_now;
+        }
 
         /* Pulling the headphones out should not carry on broadcasting to the
          * room. Only for the wired route — unplugging the jack says nothing
@@ -15133,9 +15502,12 @@ int music_entry(void *a0, void *a1) {
         /* Not on a chapter list: "play next" and "add to queue" are about a
          * queue of tracks, and a book's chapters are not that — acting on
          * them would rewrite the chapter table out from under the player. */
+        /* touch_y below the status strip on every page: the album page's cover
+         * runs up underneath it, and holding the back arrow a little long
+         * used to refresh the artwork (or, scrolled, open the actions for a
+         * track hidden under the strip) instead of going back. */
         if (touch_down && !touch_moved && !edge_active && !hold_fired && !sheet_open &&
-            screen == SC_TRACKS && !ab_list &&
-            touch_y >= (pod_list ? CONTENT_Y : 0)) {
+            screen == SC_TRACKS && !ab_list && touch_y >= CONTENT_Y) {
             struct timespec now;
             clock_gettime(CLOCK_MONOTONIC, &now);
             long held = (now.tv_sec - touch_at.tv_sec) * 1000L +
@@ -15197,18 +15569,19 @@ int music_entry(void *a0, void *a1) {
 
         /* R74: press-and-hold on a playlist -- Rename/Delete. Row 0 is
          * "New Playlist" (R71), not a real entry, so it's excluded the same
-         * way the tap handler already excludes it from playlists[]. Flat
-         * CONTENT_Y/ROW_H math, same as this screen's own tap dispatch --
-         * SC_PLAYLISTS has no header/disc-banner concerns track_index_at()
-         * exists for. */
+         * way the tap handler already excludes it from playlists[]. Same
+         * pixel-offset row math as this screen's own draw and tap dispatch
+         * (smooth_row): since R76 the list scrolls by the pixel, so a list
+         * at rest part-way through a row put the old whole-row formula one
+         * playlist above the one under the finger. */
         if (touch_down && !touch_moved && !edge_active && !hold_fired && !sheet_open &&
-            screen == SC_PLAYLISTS) {
+            screen == SC_PLAYLISTS && touch_y >= CONTENT_Y) {
             struct timespec now;
             clock_gettime(CLOCK_MONOTONIC, &now);
             long held = (now.tv_sec - touch_at.tv_sec) * 1000L +
                         (now.tv_nsec - touch_at.tv_nsec) / 1000000L;
             if (held >= HOLD_MS) {
-                int idx = scroll + (touch_y - CONTENT_Y) / ROW_H;
+                int idx = (touch_y - CONTENT_Y + scroll * ROW_H + scroll_px) / ROW_H;
                 hold_fired = 1;
                 if (idx >= 1 && idx - 1 < playlist_n) {
                     sheet_open = 4;
@@ -15472,6 +15845,7 @@ int music_entry(void *a0, void *a1) {
                  * as a book's by up to the same 15s here, and R66's restore
                  * reads exactly that file back to place the episode. */
                 pod_save_current_pos();
+                listen_flush();
                 /* R66. Either page holds the last drawn frame: nothing has
                  * been drawn since the screen locked (`if (locked) dirty = 0`),
                  * and the mirror below the draw block keeps both identical

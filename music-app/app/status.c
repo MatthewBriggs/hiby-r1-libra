@@ -25,8 +25,25 @@
 #include <errno.h>
 
 #include "status.h"
+#include <pthread.h>
 #include <signal.h>
 #include <sys/wait.h>
+
+/* Milliseconds on the monotonic clock, for the short answer caches below. */
+static long long mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* How long a query that shells out keeps its answer. These are asked from
+ * draw code, and a screen that redraws every frame -- Settings while it
+ * scrolls, quick settings while it slides -- asked again ~30 times a second,
+ * each a fork and exec (4.3 ms measured, before the tool itself runs). A
+ * positive answer (a joined network, a connected headset) is stable and kept
+ * longer; "nothing" is what is waiting to change, so it is re-asked sooner. */
+#define ANSWER_TTL_MS 10000
+#define EMPTY_TTL_MS  2000
 
 /* Runs `cmd` with /bin/sh in the background, fully detached: double-forked so
  * it never becomes a zombie, and with every file descriptor above stderr
@@ -249,9 +266,14 @@ int st_bt_battery(void) {
  * asked for while the panel is open. */
 void st_wifi_ssid(char *out, unsigned n) {
     static char cached[64];
-    static time_t when;
-    time_t now = time(NULL);
-    if (cached[0] && now - when < 10) { snprintf(out, n, "%s", cached); return; }
+    static long long when;
+    static int valid;
+    long long now = mono_ms();
+    if (valid && now - when < (cached[0] ? ANSWER_TTL_MS : EMPTY_TTL_MS)) {
+        snprintf(out, n, "%s", cached);
+        return;
+    }
+    valid = 1;
     when = now;
     cached[0] = '\0';
     /* wpa_cli, not iwconfig — the latter is not on this firmware. Non-ASCII
@@ -270,13 +292,25 @@ void st_wifi_ssid(char *out, unsigned n) {
     snprintf(out, n, "%s", cached);
 }
 
+/* Asked from both the UI thread and music_hook.c's bt_poll() thread, so the
+ * cache is locked -- but not across the commands, which would stall a redraw
+ * behind the other thread's D-Bus round trips. Two callers refreshing at once
+ * just both ask. */
+static pthread_mutex_t bt_name_lock = PTHREAD_MUTEX_INITIALIZER;
+
 void st_bt_name(char *out, unsigned n) {
     static char cached[64];
-    static time_t when;
-    time_t now = time(NULL);
-    if (cached[0] && now - when < 10) { snprintf(out, n, "%s", cached); return; }
-    when = now;
-    cached[0] = '\0';
+    static long long when;
+    static int valid;
+    long long now = mono_ms();
+    pthread_mutex_lock(&bt_name_lock);
+    if (valid && now - when < (cached[0] ? ANSWER_TTL_MS : EMPTY_TTL_MS)) {
+        snprintf(out, n, "%s", cached);
+        pthread_mutex_unlock(&bt_name_lock);
+        return;
+    }
+    pthread_mutex_unlock(&bt_name_lock);
+    char fresh[64] = "";
     char path[256];
     if (bt_pcm_path(path, sizeof(path))) {
         /* .../dev_94_DB_56_8E_03_43/... -> 94:DB:...  then ask BlueZ its name */
@@ -297,13 +331,18 @@ void st_bt_name(char *out, unsigned n) {
                 char *e = strchr(nm, '\n');
                 size_t len = e ? (size_t)(e - nm) : strlen(nm);
                 while (len && (nm[len-1] == '\r' || nm[len-1] == ' ')) len--;
-                if (len >= sizeof(cached)) len = sizeof(cached) - 1;
-                memcpy(cached, nm, len);
-                cached[len] = '\0';
+                if (len >= sizeof(fresh)) len = sizeof(fresh) - 1;
+                memcpy(fresh, nm, len);
+                fresh[len] = '\0';
             }
         }
     }
+    pthread_mutex_lock(&bt_name_lock);
+    snprintf(cached, sizeof(cached), "%s", fresh);
+    when = mono_ms();
+    valid = 1;
     snprintf(out, n, "%s", cached);
+    pthread_mutex_unlock(&bt_name_lock);
 }
 
 /* ---- Bluetooth pairing ---------------------------------------------------
@@ -779,8 +818,16 @@ void st_wifi_dhcp(void) {
 }
 
 /* No sysfs equivalent: rfkill reads unblocked whether the adapter is powered
- * or not, so it has to be asked. Only called while the panel is open. */
+ * or not, so it has to be asked -- and it is asked from draw code (Settings,
+ * the Bluetooth screen, quick settings), so the answer is kept briefly rather
+ * than re-run on every frame of a scroll. st_bt_set() drops it, so a toggle is
+ * re-read on the next ask. UI thread only. */
+static long long bt_on_when;
+static int bt_on_cached = -1;
+
 int st_bt_on(void) {
+    long long now = mono_ms();
+    if (bt_on_cached >= 0 && now - bt_on_when < EMPTY_TTL_MS) return bt_on_cached;
     FILE *p = popen("hciconfig hci0 2>/dev/null", "r");
     if (!p) return 0;
     char line[256];
@@ -788,6 +835,8 @@ int st_bt_on(void) {
     while (fgets(line, sizeof(line), p))
         if (strstr(line, "UP RUNNING")) { up = 1; break; }
     pclose(p);
+    bt_on_cached = up;
+    bt_on_when = now;
     return up;
 }
 
@@ -820,6 +869,7 @@ void st_wifi_set(int on) {
  * no `timeout` applet (see bt_pair()'s own history with that), hence the
  * hand-rolled bounded loop rather than wrapping this in one. */
 void st_bt_set(int on) {
+    bt_on_cached = -1;     /* re-read on the next ask */
     if (!on) {
         st_spawn("/usr/bin/bt_disable >/dev/null 2>&1");
         return;
@@ -854,11 +904,10 @@ void st_bt_set(int on) {
  * first version was trying to apply and didn't quite land: don't invent
  * behaviour for undocumented state, reuse the vendor's own, already-
  * working mechanism instead. */
-int st_usb_mode(void) {
-    /* Live, not persisted: which gadget the UDC is actually bound to right
-     * now. adb_demo bound + adbd running -> ADB mode; android0's
-     * mass_storage.0 bound -> Storage mode. Mirrors how st_bt_on() already
-     * asks the real hardware state instead of trusting a cached flag. */
+static long long usb_mode_when;
+static int usb_mode_cached = -2;     /* -2: not asked yet */
+
+static int usb_mode_read(void) {
     FILE *f = fopen("/sys/kernel/config/usb_gadget/adb_demo/UDC", "r");
     if (f) {
         char s[64] = "";
@@ -876,6 +925,21 @@ int st_usb_mode(void) {
     return -1;   /* neither bound -- e.g. USB not plugged in */
 }
 
+int st_usb_mode(void) {
+    /* Live, not persisted: which gadget the UDC is actually bound to right
+     * now. adb_demo bound + adbd running -> ADB mode; android0's
+     * mass_storage.0 bound -> Storage mode. Mirrors how st_bt_on() already
+     * asks the real hardware state instead of trusting a cached flag -- held
+     * for a second at most, since the mini player's visibility test asks
+     * this several times a frame and every ask was two configfs reads.
+     * st_usb_mode_set() drops it. UI thread only. */
+    long long now = mono_ms();
+    if (usb_mode_cached != -2 && now - usb_mode_when < 1000) return usb_mode_cached;
+    usb_mode_cached = usb_mode_read();
+    usb_mode_when = now;
+    return usb_mode_cached;
+}
+
 /* Switching TO Storage mode (mode == 1) stops ADB as an unavoidable part
  * of what adboff actually does -- the two gadget functions need exclusive
  * ownership of the one UDC, same as DAC/OTG do per S90adb's own comment.
@@ -887,6 +951,7 @@ int st_usb_mode(void) {
  * except the screen). Backgrounded either way: both scripts bring up a
  * new gadget and, for ADB, wait on enumeration -- not instant. */
 void st_usb_mode_set(int mode) {
+    usb_mode_cached = -2;     /* re-read on the next ask */
     st_spawn(mode == 1 ? "/usr/bin/adboff >/dev/null 2>&1" : "/usr/bin/adbon >/dev/null 2>&1");
 }
 

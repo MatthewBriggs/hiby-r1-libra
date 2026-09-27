@@ -78,6 +78,11 @@ static int  g_pre_done_i;
 static char g_have_path[512];   /* what g_have answers for -- set once settled */
 static int  g_have_ok;          /* 1: g_have is a shape; 0: this file has none */
 static uint8_t g_have[WAVEFORM_BUCKETS];
+/* waveform_pause(): while set, nothing here touches the card -- see its
+ * comment in waveform.h. g_busy is whether the worker is out of its wait,
+ * i.e. part-way through a job that may be reading audio or the cache file. */
+static int  g_paused;
+static int  g_busy;
 
 /* Every key in the file, in file order, so a lookup is a scan of RAM and one
  * read of the record it lands on rather than a scan of the file on every
@@ -258,7 +263,9 @@ static int still_wanted(void *ctx) {
     const char *path = (const char *)ctx;
     pthread_mutex_lock(&g_lock);
     int ok;
-    if (strcmp(g_wanted, path) == 0) {
+    if (g_paused) {
+        ok = 0;                        /* the card is about to go away */
+    } else if (strcmp(g_wanted, path) == 0) {
         ok = 1;
     } else {
         int cur_needs_work = g_wanted[0] && strcmp(g_wanted, g_have_path) != 0;
@@ -284,6 +291,11 @@ static void be_idle(void) {
 static void *worker(void *arg) {
     (void)arg;
     be_idle();
+    /* Started paused (the app came up while USB mass storage had the card):
+     * the housekeeping below reads and deletes on the card too, so it waits. */
+    pthread_mutex_lock(&g_lock);
+    while (g_paused) pthread_cond_wait(&g_wake, &g_lock);
+    pthread_mutex_unlock(&g_lock);
     clear_old_cache();
     /* The index and the cache file are shared with waveform_get(), which now
      * reads them on the caller's thread to answer a cached track at once --
@@ -299,16 +311,18 @@ static void *worker(void *arg) {
         char path[sizeof(g_wanted)];
         int prefetch;
         pthread_mutex_lock(&g_lock);
+        g_busy = 0;
         int slot = -1;
         for (;;) {
             /* The track on screen first, always. Only when it is settled --
              * or there is none -- are the queue's next tracks worth the core,
-             * and then in order. */
+             * and then in order. Nothing at all while paused. */
             int cur = g_wanted[0] && strcmp(g_wanted, g_have_path) != 0;
             slot = cur ? -1 : pre_slot();
-            if (cur || slot >= 0) { prefetch = !cur; break; }
+            if (!g_paused && (cur || slot >= 0)) { prefetch = !cur; break; }
             pthread_cond_wait(&g_wake, &g_lock);
         }
+        g_busy = 1;
         snprintf(path, sizeof(path), "%s", prefetch ? g_next[slot] : g_wanted);
         pthread_mutex_unlock(&g_lock);
 
@@ -425,7 +439,7 @@ int waveform_get(const char *path, uint8_t *out) {
      * track: one stat and, at most, one 152-byte read. Every poll after it
      * costs a string compare, and a track with no cached shape falls through
      * to the worker exactly as before. */
-    if (changed && path[0] && strcmp(g_have_path, path) != 0) {
+    if (changed && !g_paused && path[0] && strcmp(g_have_path, path) != 0) {
         load_index();
         uint64_t key = path_key(path);
         uint8_t bars[WAVEFORM_BUCKETS];
@@ -440,4 +454,18 @@ int waveform_get(const char *path, uint8_t *out) {
     if (ready && out) memcpy(out, g_have, WAVEFORM_BUCKETS);
     pthread_mutex_unlock(&g_lock);
     return ready;
+}
+
+void waveform_pause(int on) {
+    pthread_mutex_lock(&g_lock);
+    g_paused = on;
+    if (!on) pthread_cond_signal(&g_wake);
+    pthread_mutex_unlock(&g_lock);
+}
+
+int waveform_busy(void) {
+    pthread_mutex_lock(&g_lock);
+    int busy = g_busy;
+    pthread_mutex_unlock(&g_lock);
+    return busy;
 }

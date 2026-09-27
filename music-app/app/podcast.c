@@ -226,6 +226,7 @@ void pod_speed_store(const char *feed, int permille) {
  * can find that episode's name/url/feed-dir without the caller re-passing
  * them -- same shape as the standalone app's single global episodes[]. */
 static char g_feed_dir[POD_PATH_LEN];
+static char g_feed[POD_NAME_LEN];       /* the feed's own name, g_feed_dir's last part */
 static char g_ep_name[POD_MAX_ITEMS][POD_NAME_LEN];
 static char g_ep_url[POD_MAX_ITEMS][POD_PATH_LEN];
 static long g_ep_mtime[POD_MAX_ITEMS];
@@ -328,8 +329,9 @@ static void sort_episodes(pod_episode_t *items, int n) {
 int pod_load_episodes(const char *feed, pod_episode_t *out, int max) {
     int n = 0;
     snprintf(g_feed_dir, sizeof(g_feed_dir), "%s/%s", PODCAST_DIR, feed);
+    snprintf(g_feed, sizeof(g_feed), "%s", feed);
     DIR *d = opendir(g_feed_dir);
-    if (!d) return 0;
+    if (!d) { g_ep_n = 0; return 0; }
     struct dirent *e;
     /* Nothing is ever deleted automatically, so a long-running feed can
      * exceed `max`. Once full, displace whichever entry is currently oldest
@@ -427,6 +429,13 @@ static long  dl_total;
 static char  dl_part_path[POD_PATH_LEN];
 static char  dl_final_path[POD_PATH_LEN];
 static int   dl_ok;
+/* What is downloading, captured when it starts rather than looked up again
+ * through g_ep_*[dl_slot] when it ends: g_ep_* is whichever feed was opened
+ * last, and browsing to another feed mid-download used to stamp the finished
+ * file with the other feed's date for that slot. */
+static char  dl_feed[POD_NAME_LEN];
+static char  dl_name[POD_NAME_LEN];
+static long  dl_mtime;
 
 static const char *ext_for_url(const char *url) {
     static char ext[8];
@@ -447,14 +456,11 @@ static const char *ext_for_url(const char *url) {
     return "mp3";
 }
 
-void pod_download_start(int idx) {
-    if (dl_pid > 0) return;
-    if (idx < 0 || idx >= g_ep_n) return;
-    if (!g_ep_url[idx][0]) return;
-
-    const char *ext = ext_for_url(g_ep_url[idx]);
-    snprintf(dl_final_path, sizeof(dl_final_path), "%s/%s.%s",
-             g_feed_dir, g_ep_name[idx], ext);
+static int dl_begin(const char *feed, const char *name, const char *url, long mtime, int slot) {
+    if (dl_pid > 0 || !url[0]) return -1;
+    const char *ext = ext_for_url(url);
+    snprintf(dl_final_path, sizeof(dl_final_path), "%s/%s/%s.%s",
+             PODCAST_DIR, feed, name, ext);
     snprintf(dl_part_path, sizeof(dl_part_path), "%s.part", dl_final_path);
     unlink(dl_part_path);
     unlink(DL_HDR_PATH);
@@ -464,17 +470,60 @@ void pod_download_start(int idx) {
         setpgid(0, 0);       /* cancellation must include curl descendants */
         execl(PODSYNC_CURL, PODSYNC_CURL, "-fsSL", "--cacert", PODSYNC_CA,
               "--connect-timeout", "20", "--max-time", "900",
-              "-D", DL_HDR_PATH, "-o", dl_part_path, g_ep_url[idx],
+              "-D", DL_HDR_PATH, "-o", dl_part_path, url,
               (char *)NULL);
         _exit(127);
     }
-    if (pid > 0) {
-        dl_pid = pid;
-        dl_slot = idx;
-        dl_bytes = 0;
-        dl_total = 0;
-    }
+    if (pid < 0) return -1;
+    dl_pid = pid;
+    dl_slot = slot;
+    dl_bytes = 0;
+    dl_total = 0;
+    dl_mtime = mtime;
+    snprintf(dl_feed, sizeof(dl_feed), "%s", feed);
+    snprintf(dl_name, sizeof(dl_name), "%s", name);
+    return 0;
 }
+
+void pod_download_start(int idx) {
+    if (idx < 0 || idx >= g_ep_n) return;
+    dl_begin(g_feed, g_ep_name[idx], g_ep_url[idx], g_ep_mtime[idx], idx);
+}
+
+int pod_download_start_named(const char *feed, const char *name) {
+    if (dl_pid > 0 || !feed[0] || !name[0]) return -1;
+    char manifest[POD_PATH_LEN];
+    snprintf(manifest, sizeof(manifest), "%s/%s/episodes.tsv", PODCAST_DIR, feed);
+    FILE *mf = fopen(manifest, "r");
+    if (!mf) return -1;
+    /* Same parse as pod_load_episodes()'s manifest fold-in. */
+    char line[1024];
+    int rc = -1;
+    while (fgets(line, sizeof(line), mf)) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        char *url = strchr(line, '\t');
+        if (!url) continue;
+        *url++ = '\0';
+        char *date = strchr(url, '\t');
+        if (date) *date++ = '\0';
+        if (strcmp(line, name) != 0) continue;
+        /* Already on the card (fetched some other way meanwhile)? Then there
+         * is nothing to do, which counts as done rather than as failure. */
+        const char *ext = ext_for_url(url);
+        char final_path[POD_PATH_LEN];
+        snprintf(final_path, sizeof(final_path), "%s/%s/%s.%s", PODCAST_DIR, feed, name, ext);
+        struct stat st;
+        if (stat(final_path, &st) == 0) { rc = 1; break; }
+        rc = dl_begin(feed, name, url, date ? parse_iso_date(date) : 0, -1);
+        break;
+    }
+    fclose(mf);
+    return rc;
+}
+
+const char *pod_download_feed(void) { return dl_pid > 0 ? dl_feed : ""; }
+const char *pod_download_name(void) { return dl_pid > 0 ? dl_name : ""; }
 
 int pod_download_active(void) { return dl_pid > 0; }
 int pod_download_slot(void)   { return dl_slot; }
@@ -529,9 +578,9 @@ int pod_download_poll(void) {
 
     if (ok) {
         rename(dl_part_path, dl_final_path);
-        if (dl_slot >= 0 && dl_slot < g_ep_n && g_ep_mtime[dl_slot] > 0) {
+        if (dl_mtime > 0) {
             struct utimbuf ub;
-            ub.actime = ub.modtime = (time_t)g_ep_mtime[dl_slot];
+            ub.actime = ub.modtime = (time_t)dl_mtime;
             utime(dl_final_path, &ub);
         }
     } else {

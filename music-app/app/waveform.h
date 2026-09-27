@@ -38,4 +38,12 @@ int waveform_get(const char *path, uint8_t *out);
  * the fourth has been armed in its place. */
 void waveform_prefetch(const char *first, const char *second);
 
+/* Stops all card access -- no new job starts, a decode in progress is
+ * abandoned at its next chunk, and waveform_get() answers only from memory --
+ * until called again with 0. For USB mass storage, which must not share the
+ * card with a local reader. waveform_busy() is 1 until the job that was
+ * running when the pause landed has actually let go. */
+void waveform_pause(int on);
+int waveform_busy(void);
+
 #endif

@@ -15,10 +15,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include "spotify.h"
+
+/* Thread id, for temp-file names. Cover lookups run on several threads at
+ * once (the playing track's, the browsed album's, the artist page's), and
+ * getpid() is the same in all of them -- a name per process had two lookups
+ * writing and reading one JSON response, or one .part image, between them. */
+static int tid(void) { return (int)syscall(SYS_gettid); }
 
 #define SETTINGS_PATH "/data/mnt/sd_0/settings.txt"
 #define CURL_BIN      "/data/mnt/sd_0/.podsync/curl"
@@ -116,7 +123,7 @@ static int get_access_token(char *token, size_t token_n) {
     char auth[160];
     snprintf(auth, sizeof(auth), "%s:%s", g_client_id, g_client_secret);
     char tmp[64];
-    snprintf(tmp, sizeof(tmp), "/tmp/.spotify_token_%d.json", (int)getpid());
+    snprintf(tmp, sizeof(tmp), "/tmp/.spotify_token_%d.json", tid());
 
     char *argv[] = {
         (char *)CURL_BIN, "-fsSL", "--cacert", (char *)CURL_CA,
@@ -246,7 +253,7 @@ int spotify_fetch_cover(const char *artist, const char *album, const char *dest_
     snprintf(auth_hdr, sizeof(auth_hdr), "Authorization: Bearer %s", token);
 
     char meta_path[64];
-    snprintf(meta_path, sizeof(meta_path), "/tmp/.spotify_search_%d.json", (int)getpid());
+    snprintf(meta_path, sizeof(meta_path), "/tmp/.spotify_search_%d.json", tid());
     char *argv[] = {
         (char *)CURL_BIN, "-fsSL", "--cacert", (char *)CURL_CA,
         "--connect-timeout", "10", "--max-time", "15",
@@ -294,8 +301,8 @@ int spotify_fetch_cover(const char *artist, const char *album, const char *dest_
     free(buf);
     if (!img_url[0]) return -1;
 
-    char tmp_jpg[300];
-    snprintf(tmp_jpg, sizeof(tmp_jpg), "%s.part", dest_jpg);
+    char tmp_jpg[600];
+    snprintf(tmp_jpg, sizeof(tmp_jpg), "%s.part%d", dest_jpg, tid());
     char *dl_argv[] = {
         (char *)CURL_BIN, "-fsSL", "--cacert", (char *)CURL_CA,
         "--connect-timeout", "10", "--max-time", "20",
@@ -330,7 +337,7 @@ int spotify_fetch_artist_image(const char *artist, const char *dest_jpg) {
     snprintf(auth_hdr, sizeof(auth_hdr), "Authorization: Bearer %s", token);
 
     char meta_path[64];
-    snprintf(meta_path, sizeof(meta_path), "/tmp/.spotify_artist_%d.json", (int)getpid());
+    snprintf(meta_path, sizeof(meta_path), "/tmp/.spotify_artist_%d.json", tid());
     char *argv[] = {
         (char *)CURL_BIN, "-fsSL", "--cacert", (char *)CURL_CA,
         "--connect-timeout", "10", "--max-time", "15",
@@ -372,8 +379,8 @@ int spotify_fetch_artist_image(const char *artist, const char *dest_jpg) {
     free(buf);
     if (!img_url[0]) return -1;
 
-    char tmp_jpg[300];
-    snprintf(tmp_jpg, sizeof(tmp_jpg), "%s.part", dest_jpg);
+    char tmp_jpg[600];
+    snprintf(tmp_jpg, sizeof(tmp_jpg), "%s.part%d", dest_jpg, tid());
     char *dl_argv[] = {
         (char *)CURL_BIN, "-fsSL", "--cacert", (char *)CURL_CA,
         "--connect-timeout", "10", "--max-time", "20",

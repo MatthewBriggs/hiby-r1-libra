@@ -576,12 +576,23 @@ void radio_recording_new_path(const char *station_name, const char *ext,
     time_t t = time(NULL);
     struct tm tmv;
     localtime_r(&t, &tmv);
-    /* Station name kept as-is (no illegal FAT/exFAT characters expected in
-     * any real station name in the seed file), just given a fixed-format
-     * timestamp so a folder of these sorts sensibly and each one's date is
-     * readable without opening it. */
+    /* The station's name, given a fixed-format timestamp so a folder of these
+     * sorts sensibly and each one's date is readable without opening it. The
+     * name comes from radio_stations.conf, which is edited by hand, so it is
+     * made safe for a file name first: a '/' ("AC/DC Radio") would be read as
+     * a directory, ':' '?' '*' and friends are refused by exFAT outright, and
+     * either way open() failed and Record silently did nothing. A leading '.'
+     * would hide the file from radio_recordings_load(). */
+    char safe[160];
+    size_t j = 0;
+    for (size_t i = 0; station_name[i] && j + 1 < sizeof(safe); i++) {
+        unsigned char c = (unsigned char)station_name[i];
+        int bad = c < 0x20 || c == 0x7f || strchr("/\\:*?\"<>|", c) || (j == 0 && c == '.');
+        safe[j++] = bad ? '_' : (char)c;
+    }
+    safe[j] = '\0';
     snprintf(out, n, "%s/%s %04d-%02d-%02d %02d-%02d-%02d.%s",
-             RADIO_REC_DIR, station_name,
+             RADIO_REC_DIR, safe[0] ? safe : "Radio",
              tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
              tmv.tm_hour, tmv.tm_min, tmv.tm_sec, ext);
 }

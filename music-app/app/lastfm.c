@@ -16,10 +16,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include "lastfm.h"
+
+/* Thread id, for temp-file names. Cover lookups run on several threads at
+ * once (the playing track's, the browsed album's, the artist page's), and
+ * getpid() is the same in all of them -- a name per process had two lookups
+ * writing and reading one JSON response, or one .part image, between them. */
+static int tid(void) { return (int)syscall(SYS_gettid); }
 
 #define SETTINGS_PATH   "/data/mnt/sd_0/settings.txt"
 #define CURL_BIN        "/data/mnt/sd_0/.podsync/curl"
@@ -221,7 +228,7 @@ int lastfm_fetch_artist(const char *artist, const char *dest_jpg,
              g_api_key, ea);
 
     char meta_path[64];
-    snprintf(meta_path, sizeof(meta_path), "/tmp/.lastfm_artist_%d.json", (int)getpid());
+    snprintf(meta_path, sizeof(meta_path), "/tmp/.lastfm_artist_%d.json", tid());
     if (run_curl(url, meta_path) != 0) { unlink(meta_path); return -1; }
 
     FILE *f = fopen(meta_path, "rb");
@@ -237,8 +244,8 @@ int lastfm_fetch_artist(const char *artist, const char *dest_jpg,
 
     char img_url[600];
     if (extract_best_image_url(buf, img_url, sizeof(img_url)) == 0) {
-        char tmp_jpg[300];
-        snprintf(tmp_jpg, sizeof(tmp_jpg), "%s.part", dest_jpg);
+        char tmp_jpg[600];
+        snprintf(tmp_jpg, sizeof(tmp_jpg), "%s.part%d", dest_jpg, tid());
         if (run_curl(img_url, tmp_jpg) == 0 && rename(tmp_jpg, dest_jpg) == 0)
             result |= 1;
         else
@@ -290,7 +297,7 @@ int lastfm_fetch_cover(const char *artist, const char *album, const char *dest_j
              g_api_key, ea, eb);
 
     char meta_path[64];
-    snprintf(meta_path, sizeof(meta_path), "/tmp/.lastfm_meta_%d.json", (int)getpid());
+    snprintf(meta_path, sizeof(meta_path), "/tmp/.lastfm_meta_%d.json", tid());
     if (run_curl(url, meta_path) != 0) { unlink(meta_path); return -1; }
 
     FILE *f = fopen(meta_path, "rb");
@@ -307,8 +314,8 @@ int lastfm_fetch_cover(const char *artist, const char *album, const char *dest_j
     free(buf);
     if (rc != 0) return -1;
 
-    char tmp_jpg[300];
-    snprintf(tmp_jpg, sizeof(tmp_jpg), "%s.part", dest_jpg);
+    char tmp_jpg[600];
+    snprintf(tmp_jpg, sizeof(tmp_jpg), "%s.part%d", dest_jpg, tid());
     if (run_curl(img_url, tmp_jpg) != 0) { unlink(tmp_jpg); return -1; }
     if (rename(tmp_jpg, dest_jpg) != 0) { unlink(tmp_jpg); return -1; }
     return 0;

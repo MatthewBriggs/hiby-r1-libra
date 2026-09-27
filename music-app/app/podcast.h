@@ -93,6 +93,15 @@ int  pod_speed_lookup(const char *feed);
  * file. One at a time. `idx` indexes the array pod_load_episodes() last
  * filled. */
 void pod_download_start(int idx);
+/* The same, for an episode named in `feed`'s manifest rather than by its
+ * index in whatever list was loaded last -- for a download asked for earlier
+ * and started later, when the user may be looking at another feed entirely.
+ * 0 started, 1 already on the card, -1 not started (busy, or not found). */
+int  pod_download_start_named(const char *feed, const char *name);
+/* The running download's feed and episode name, "" when none -- for marking
+ * its row, by name, in whichever feed's list is showing. */
+const char *pod_download_feed(void);
+const char *pod_download_name(void);
 /* Polls the running download. Returns 1 once it completes (ok or not -- call
  * pod_download_ok() to tell which), 0 while still running, -1 if nothing is
  * downloading. Safe to call every frame; cheap when idle. */
