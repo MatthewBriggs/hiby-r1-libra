@@ -2967,7 +2967,7 @@ static int settings_content_rows(void) {
  * pushed by hand, not by CI against a tagged commit), so this stays a
  * literal that a human edits; the discipline is remembering to, not the
  * mechanism. */
-#define LIBRARY_VERSION "0.58"
+#define LIBRARY_VERSION "0.58.1"
 
 /* A custom-built kernel keeps uname()'s own release string exactly
  * "4.4.94+" on purpose -- that string is also the vermagic every one of the
@@ -9839,7 +9839,12 @@ static int qd_scroll, qd_scroll_px;  /* the queue's own scroll while it is not t
  * something else owns that edge -- the A-Z strip, a playlist's reorder grips
  * -- or a finger is already busy with a slider; and not with nothing queued,
  * or on the radio, which has no queue. */
+static int locked;                   /* the screen lock -- see set_locked() */
 static int qd_pull_allowed(void) {
+    /* Not with the screen off: touch is still read while locked (drained, so
+     * nothing queues up against the grab), and a pocket brushing the right
+     * edge must not open anything. */
+    if (locked) return 0;
     if (queue_n <= 0 || radio_mode || recording_playback_mode) return 0;
     if (screen == SC_QUEUE || screen == SC_KEYBOARD) return 0;
     if (screen == SC_TRACKS && browsing_is_playlist && !ab_list && !pod_list) return 0;
@@ -14999,7 +15004,7 @@ int music_entry(void *a0, void *a1) {
          * the finger doesn't have to stay past that exact line to keep
          * tracking -- only to start). Release decides open or cancel below,
          * off the real reveal distance rather than a fixed early threshold. */
-        if (!qs_open && touch_down && touch_y < QS_PULL_ZONE &&
+        if (!qs_open && !locked && touch_down && touch_y < QS_PULL_ZONE &&
             !(vol_ticks > 0 && touch_y >= STATUS_H) && !qd_active && !qd_edge_active &&
             (qs_pulling || live_y - touch_y > QS_PULL)) {
             qs_pulling = 1;
@@ -15049,7 +15054,14 @@ int music_entry(void *a0, void *a1) {
             int sl = qd_edge_travel > FB_W ? FB_W : qd_edge_travel;
             if (sl != qd_slide) { qd_slide = sl; dirty = 1; }
             idle = 0;
-        } else if (g == 6 && qd_active && qd_pulling) {
+        } else if (qd_active && qd_pulling) {
+            /* The finger is no longer on it -- decided from the touch state
+             * itself, not from the release gesture (6): that is discarded
+             * with every other gesture while the screen is locked, so a pull
+             * whose finger lifted after the screen went off never heard it,
+             * and sat part-open for good, the screen showing the slide's two
+             * frozen images while taps went on reaching the page beneath.
+             * Reported live, 95% open after a wake. */
             qd_pulling = 0;
             qd_target = qd_slide >= FB_W / 3 ? FB_W : 0;
             dirty = 1; idle = 0;
