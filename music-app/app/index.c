@@ -418,6 +418,13 @@ static void *scan_worker(void *arg) {
     ilog("[index] scan thread started\n");
 
     for (;;) {
+        /* Waits for a request before the first pass too: the kick that
+         * starts this thread (index_rescan_now()) is itself the request.
+         * Running a pass on start and then finding that kick still set is
+         * what made the first scan after every boot run twice. */
+        while (!g_kick) sleep(1);
+        g_kick = 0;
+
         /* RBR/BG95: this used to open STOCK_DB_PATH unconditionally, same
          * as library.c's own lib_open() did before RP6 -- and like that
          * function, it needed the identical fix. hiby_player's own scanner
@@ -508,9 +515,8 @@ static void *scan_worker(void *arg) {
          * timer here just meant redundant passes between manual scans. A
          * kick that arrived *during* the pass just finished is intentionally
          * still honoured here rather than treated as already satisfied --
-         * it asked for the freshest possible pass, not merely "a" pass. */
-        while (!g_kick) sleep(1);
-        g_kick = 0;
+         * it asked for the freshest possible pass, not merely "a" pass.
+         * The wait itself is at the top of this loop. */
     }
     return NULL;
 }
@@ -528,8 +534,8 @@ int index_scan_progress(int *scanned, int *written) {
 
 void index_rescan_now(void) {
     if (g_usb_paused) return;
-    index_scan_start();   /* in case it was never started at all */
     g_kick = 1;
+    index_scan_start();   /* in case it was never started at all */
 }
 
 void index_pause_for_usb(int paused) {

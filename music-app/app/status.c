@@ -166,12 +166,23 @@ void wpa_unescape(const char *in, size_t inlen, char *out, size_t outsz) {
     out[o] = '\0';
 }
 
+/* Looked up once: the tool that exists on this image is fixed until the next
+ * flash. The BlueALSA 5 overlay leaves the old bluealsa-cli on the image, so
+ * the new name, not the old one's absence, is what decides. */
+int st_ba_v5(void) {
+    static int v = -1;
+    if (v < 0) v = access("/usr/bin/bluealsactl", X_OK) == 0;
+    return v;
+}
+const char *st_ba_ctl(void) { return st_ba_v5() ? "bluealsactl" : "bluealsa-cli"; }
+
 /* The first BlueALSA sink path, which both queries need. */
 /* Exposed as st_bt_pcm_path() below: audio.c needs the same path to set the
  * PCM's SoftVolume property. */
 static int bt_pcm_path(char *out, unsigned n) {
-    char buf[1024];
-    run_cmd("bluealsa-cli list-pcms 2>/dev/null", buf, sizeof(buf));
+    char buf[1024], cmd[64];
+    snprintf(cmd, sizeof(cmd), "%s list-pcms 2>/dev/null", st_ba_ctl());
+    run_cmd(cmd, buf, sizeof(buf));
     char *line = strtok(buf, "\n");
     while (line) {
         /* Must match a2dp AND /sink, exactly as audio.c's bt_sink_connected()
@@ -202,7 +213,7 @@ void st_bt_codec(char *out, unsigned n) {
     if (!bt_pcm_path(path, sizeof(path))) { when = now; return; }
 
     char cmd[384], buf[512];
-    snprintf(cmd, sizeof(cmd), "bluealsa-cli codec '%s' 2>/dev/null", path);
+    snprintf(cmd, sizeof(cmd), "%s codec '%s' 2>/dev/null", st_ba_ctl(), path);
     run_cmd(cmd, buf, sizeof(buf));
 
     /* The real output, with a headset connected, is two lines:
@@ -212,13 +223,16 @@ void st_bt_codec(char *out, unsigned n) {
      *
      * Take the selected one. The first attempt at this used strcasestr, which
      * needs _GNU_SOURCE to be declared and silently returned rubbish without
-     * it — hence an empty codec and a footer that just said "Bluetooth". */
+     * it — hence an empty codec and a footer that just said "Bluetooth".
+     *
+     * BlueALSA 5 appends the configuration to the name ("aptX:2f000000..."),
+     * so stop at a colon as well. */
     char *sel = strstr(buf, "Selected codec:");
     if (sel) {
         sel += strlen("Selected codec:");
         while (*sel == ' ' || *sel == '\t') sel++;
         char *end = sel;
-        while (*end && *end != '\n' && *end != '\r' && *end != ' ') end++;
+        while (*end && *end != '\n' && *end != '\r' && *end != ' ' && *end != ':') end++;
         *end = '\0';
         if (*sel) snprintf(cached, sizeof(cached), "%s", sel);
     }
@@ -625,7 +639,7 @@ void bt_pair(const char *mac) {
         "_mac=%s; "
         "printf 'agent NoInputNoOutput\\ndefault-agent\\npair '$_mac'\\ntrust '$_mac'\\nquit\\n' | bluetoothctl >/dev/null 2>&1; "
         "_path=/org/bluez/hci0/dev_$(echo $_mac | tr ':' '_'); "
-        "_pcm_up() { bluealsa-cli list-pcms 2>/dev/null | grep -qi \"$(echo $_mac | tr ':' '_').*a2dp\"; }; "
+        "_pcm_up() { %s list-pcms 2>/dev/null | grep -qi \"$(echo $_mac | tr ':' '_').*a2dp\"; }; "
         "_ok=0; "
         "for _gap in 1 2 3 5 5 5 10 10 10 10; do "
         "_pcm_up && { _ok=1; break; }; "
@@ -637,7 +651,7 @@ void bt_pair(const char *mac) {
         "done; "
         "echo \"$_mac $([ $_ok = 1 ] && echo ok || echo failed)\" > /usr/data/bt_pair_status"
         ") >/dev/null 2>&1",
-        mac);
+        mac, st_ba_ctl());
     st_spawn(cmd);
 }
 

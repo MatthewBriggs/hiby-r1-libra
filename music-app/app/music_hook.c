@@ -70,6 +70,9 @@ typedef struct {
 #include "audio.h"
 #include "waveform.h"
 #include "btplayer.h"
+#ifndef CLOCK_BOOTTIME
+#define CLOCK_BOOTTIME 7
+#endif
 #include "eq.h"
 #include "eqprofile.h"
 #include "mseb.h"
@@ -2849,6 +2852,9 @@ static int pod_info_x(int mid) { return mid + POD_SKIP_OFF + 70; }
  * order is worked out, a setting that can wedge the device is not one worth
  * shipping. What this timeout drives instead is releasing the parts that
  * actually draw current -- see deep_suspend(). */
+static const int SCREEN_TO_CHOICES[] = { 0, 30, 60, 120, 300 };
+#define SCREEN_TO_CHOICE_N ((int)(sizeof(SCREEN_TO_CHOICES) / sizeof(SCREEN_TO_CHOICES[0])))
+static int idle_lock_s;                          /* 0 = never; see CONF_PATH's comment */
 static const int SLEEP_CHOICES[] = { 0, 1, 2, 5, 10, 30 };
 #define SLEEP_CHOICE_N ((int)(sizeof(SLEEP_CHOICES) / sizeof(SLEEP_CHOICES[0])))
 static int sleep_idx = 2;                       /* index into SLEEP_CHOICES */
@@ -2903,14 +2909,11 @@ static int set_row_lock_y(void)  { return CONTENT_Y; }
 static int set_lock_desc_y(void) { return set_row_lock_y() + ROW_H; }
 static int set_row_usbbypass_y(void)  { return set_lock_desc_y() + 64; }
 static int set_usbbypass_desc_y(void) { return set_row_usbbypass_y() + ROW_H; }
-/* "Idle sleep" used to sit here. Its row is gone from Settings: it drove
- * deep_suspend(), and that whole line of work is paused until there is source
- * for open_hiby_player to compare against -- an unattended overnight run with
- * it on ended in a hard power cycle and measured no improvement. The timeout
- * is still read from music.conf so an existing config still parses, but with
- * deep_sleep defaulting to 0 nothing reaches the suspend path, and there is no
- * longer a way to switch it on by accident from the UI. Auto shutdown is the
- * shipped answer to the same problem. */
+/* "Idle sleep" used to sit here, and was withdrawn after an unattended
+ * overnight run ended in a hard power cycle. It is back as "Sleep", below
+ * Auto shutdown, now that compas-player (open_hiby_player's successor) ships
+ * suspend-to-RAM on by default and its sequence is readable -- see
+ * deep_suspend(). */
 /* R81: two-line description like the toggles above it, hence the +64 block
  * rather than a plain ROW_H row. */
 static int set_row_btautoplay_y(void)  { return set_usbbypass_desc_y() + 64; }
@@ -2920,12 +2923,20 @@ static int set_btautoplay_desc_y(void) { return set_row_btautoplay_y() + ROW_H; 
  * Bluetooth-specific row (Auto-play) above it rather than down with the
  * unrelated appearance rows. */
 static int set_row_btvolsteps_y(void) { return set_btautoplay_desc_y() + ROW_H; }
-static int set_row_autooff_y(void)  { return set_row_btvolsteps_y() + ROW_H; }
+/* Screen timeout: first of the three idle rows, in the order they happen --
+ * screen off, then Sleep, then Auto shutdown. Plain ROW_H row; the value
+ * reads for itself. */
+static int set_row_screento_y(void) { return set_row_btvolsteps_y() + ROW_H; }
+static int set_row_autooff_y(void)  { return set_row_screento_y() + ROW_H; }
 static int set_autooff_desc_y(void) { return set_row_autooff_y() + ROW_H; }
 /* R41: no description under this one -- "Light theme" needs no explaining
  * the way the toggles above did, so it's a plain ROW_H row like Accent
  * colour and About below it, not another +64 two-line block. */
-static int set_row_lighttheme_y(void) { return set_autooff_desc_y() + 64; }
+/* Sleep: same two-line shape as Auto shutdown, and next to it because the
+ * two are one decision -- what happens to a locked, idle device. */
+static int set_row_sleep_y(void)  { return set_autooff_desc_y() + 64; }
+static int set_sleep_desc_y(void) { return set_row_sleep_y() + ROW_H; }
+static int set_row_lighttheme_y(void) { return set_sleep_desc_y() + 64; }
 /* R44: plain ROW_H row too -- the offset reads for itself once picked, same
  * as Theme above it. */
 static int set_row_timezone_y(void) { return set_row_lighttheme_y() + ROW_H; }
@@ -2967,7 +2978,7 @@ static int settings_content_rows(void) {
  * pushed by hand, not by CI against a tagged commit), so this stays a
  * literal that a human edits; the discipline is remembering to, not the
  * mechanism. */
-#define LIBRARY_VERSION "0.58.1"
+#define LIBRARY_VERSION "0.59"
 
 /* A custom-built kernel keeps uname()'s own release string exactly
  * "4.4.94+" on purpose -- that string is also the vermagic every one of the
@@ -9215,8 +9226,16 @@ static void draw_screen(uint16_t *fb) {
         snprintf(buf, sizeof(buf), "%d", audio_bt_vol_steps());
         draw_right_col_clip(fb, ry + ROW_H / 2 - TEXT_PX_SMALL / 2, buf, COL_ACCENT, CONTENT_Y, clip_bot);
 
+        ry = set_row_screento_y() - off;
+        fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
+        draw_text_clip(fb, 24, ry + 20, "Screen timeout", COL_TEXT, TEXT_PX_BODY, FB_W - 200, CONTENT_Y, clip_bot);
+        if (idle_lock_s == 0)      snprintf(buf, sizeof(buf), "Never");
+        else if (idle_lock_s < 60) snprintf(buf, sizeof(buf), "%d s", idle_lock_s);
+        else                       snprintf(buf, sizeof(buf), "%d min", idle_lock_s / 60);
+        draw_right_col_clip(fb, ry + ROW_H / 2 - TEXT_PX_SMALL / 2, buf, COL_ACCENT, CONTENT_Y, clip_bot);
+
         ry = set_row_autooff_y() - off;
-        int autooff_h = set_row_lighttheme_y() - set_row_autooff_y();
+        int autooff_h = set_row_sleep_y() - set_row_autooff_y();
         fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
         draw_text_clip(fb, 24, ry + 20, "Auto shutdown", COL_TEXT, TEXT_PX_BODY, FB_W - 200, CONTENT_Y, clip_bot);
         if (auto_off_minutes() == 0) snprintf(buf, sizeof(buf), "Never");
@@ -9226,6 +9245,17 @@ static void draw_screen(uint16_t *fb) {
         int ay = set_autooff_desc_y() - off;
         draw_text_clip(fb, 24, ay, "Powers the device off when locked with", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
         draw_text_clip(fb, 24, ay + 26, "nothing playing. Tap to change.", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
+
+        ry = set_row_sleep_y() - off;
+        int sleep_h = set_row_lighttheme_y() - set_row_sleep_y();
+        fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
+        draw_text_clip(fb, 24, ry + 20, "Sleep", COL_TEXT, TEXT_PX_BODY, FB_W - 200, CONTENT_Y, clip_bot);
+        if (!deep_sleep_enabled || sleep_minutes() == 0) snprintf(buf, sizeof(buf), "Off");
+        else snprintf(buf, sizeof(buf), "%d min", sleep_minutes());
+        draw_right_col_clip(fb, ry + sleep_h / 2 - TEXT_PX_SMALL / 2, buf, COL_ACCENT, CONTENT_Y, clip_bot);
+        int sy = set_sleep_desc_y() - off;
+        draw_text_clip(fb, 24, sy, "Suspends when locked with nothing playing;", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
+        draw_text_clip(fb, 24, sy + 26, "power button wakes it. Experimental.", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
 
         ry = set_row_lighttheme_y() - off;
         fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
@@ -11534,14 +11564,15 @@ static void draw_ui(uint16_t *fb) {
  * left alone they would have stretched the same pulse over fifteen seconds. */
 #define LED_PULSE_TICKS 50     /* one full up/down cycle: ~5s */
 #define LED_SWAP_TICKS  100    /* colour alternates every ~10s (2 pulses) */
-/* Seconds of no input before the panel goes dark; 0 disables it. Off for now
- * by explicit request while the crash and index work settle — the auto-lock
- * was one of several things making it hard to tell what state a report was
- * actually describing. Meant to come back properly later (see the backlog),
- * not abandoned. */
+/* Seconds of no input before the panel goes dark and the device locks; 0
+ * disables it. Was off with no way to change it (switched off while crash and
+ * index work settled), which meant Sleep could only ever start after a manual
+ * lock. Now a Settings row, "Screen timeout". Measured in elapsed time from
+ * the last input rather than loop ticks: the loop's rate while awake depends
+ * on what is being drawn. */
 #define CONF_PATH "/usr/data/music.conf"
-#define IDLE_DEFAULT_S 0
-static int idle_ticks = IDLE_DEFAULT_S * 30;    /* loop runs at ~30/s while awake */
+/* SCREEN_TO_CHOICES and idle_lock_s are declared up with SLEEP_CHOICES, which
+ * the Settings screen draws from long before this point. */
 
 /* Moved up from its previous spot just after save_conf() -- load_conf()
  * needs to set this directly, and C won't let it reference a static declared
@@ -11599,7 +11630,7 @@ static void load_conf(void) {
         if (sscanf(line, "idle_lock_seconds = %d", &v) == 1 ||
             sscanf(line, "idle_lock_seconds=%d", &v) == 1) {
             if (v < 0) v = 0;
-            idle_ticks = v * 30;
+            idle_lock_s = v;
         } else if (sscanf(line, "accent_index = %d", &v) == 1 ||
                    sscanf(line, "accent_index=%d", &v) == 1) {
             if (v >= 0 && v < ACCENT_N) {
@@ -11775,6 +11806,7 @@ static void save_conf(void) {
                 !conf_line_is(lines[n], "deep_sleep") &&
                 !conf_line_is(lines[n], "sleep_minutes") &&
                 !conf_line_is(lines[n], "auto_off_minutes") &&
+                !conf_line_is(lines[n], "idle_lock_seconds") &&
                 !conf_line_is(lines[n], "bt_vol_steps") &&
                 !conf_line_is(lines[n], "eq_on") &&
                 !conf_line_is(lines[n], "eq_profile_path") &&
@@ -11810,6 +11842,7 @@ static void save_conf(void) {
     fprintf(f, "sleep_minutes = %d\n", sleep_minutes());
     fprintf(f, "deep_sleep = %d\n", deep_sleep_enabled);
     fprintf(f, "auto_off_minutes = %d\n", auto_off_minutes());
+    fprintf(f, "idle_lock_seconds = %d\n", idle_lock_s);
     fprintf(f, "bt_vol_steps = %d\n", audio_bt_vol_steps());
     /* BG38 */
     fprintf(f, "eq_on = %d\n", eq_enabled());
@@ -12309,62 +12342,160 @@ static void led_pulse_step(void) {
 #define RTC_WAKEALARM  "/sys/class/rtc/rtc0/wakealarm"
 #define RTC_EPOCH      "/sys/class/rtc/rtc0/since_epoch"
 
-/* Belt and braces, and cheap: if the power button ever fails to wake the
- * device the RTC brings it back rather than leaving it dead in a pocket, which
- * is exactly the failure this feature could otherwise produce. Cancelled on
- * the way out, so it costs nothing whenever the button works. */
-#define SUSPEND_RTC_BACKSTOP_S 900
+/* compas-player's (open_hiby_player's successor, now with source) sequence
+ * adds three things to the one above, all about what is still running when
+ * `mem` is written. Suspending with Wi-Fi up takes the SDIO bus the SD card
+ * shares through a suspend with the Wi-Fi driver live; suspending with an
+ * A2DP link up reportedly reboots the device through the watchdog. So:
+ * Wi-Fi is switched off first and waited for (on the custom kernel that
+ * unloads brcmfmac), the adapter is powered off through BlueZ so links are
+ * dropped properly before bt_suspend tears the stack down, and the card is
+ * synced. Playback positions are saved first too, since the one failure
+ * this can still have is a hang that ends in a hard power cycle.
+ *
+ * The power button wakes it, and one alarm: when Auto shutdown is on, the
+ * RTC is set for the moment it falls due, so a device left asleep still
+ * powers off on schedule. That is the only timed wake. There used to be an
+ * RTC backstop every 15 minutes, in case the button ever failed; it woke
+ * the device four times an hour to go straight back to sleep, and was
+ * dropped once the button had proven itself (2026-09-28). The radios come
+ * back on a button wake, or failing that at unlock
+ * (suspend_radios_restore()); an Auto shutdown wake leaves them down, since
+ * the poweroff follows straight away. */
+static int radios_down, radios_wifi, radios_bt;
+
+/* Bluetooth on the way back.
+ *
+ * The first version tore the stack down with stock bt_suspend and rebuilt it
+ * with bt_init: 4-5 s before the adapter was back, nearly all of it
+ * brcm_patchram_plus downloading the firmware again, because bt_suspend
+ * drops the chip's power. So the chip now stays powered through the suspend
+ * with its firmware loaded -- adapter powered off and hci0 down, so nothing
+ * is linked or listening -- and coming back is hci0 up and power on, a
+ * fraction of a second, then the last headset is paged straight away.
+ *
+ * Should hci0 not come back up (the chip lost its state after all), the old
+ * path is still there: the full teardown and bt_init, which also reconnects.
+ * The reconnect mirrors bt_init's own -- A2DP ConnectProfile first, since a
+ * plain connect lands on LE for a dual-mode headset under BlueZ 5.87, then
+ * bluetoothctl's connect -- over a few tries while the headset notices.
+ *
+ * --print-reply is not decoration: without it dbus-send does not wait for
+ * the reply, disconnects, and BlueZ cancels the connect its caller has
+ * left -- so the call did nothing and every reconnect was really the
+ * bluetoothctl fallback, running its full 8 s timeout. Waited for, the
+ * Jabras connect in 1.2-1.6 s (measured). bt_init's own boot reconnect has
+ * the same flaw -- see patch_firmware.py bt_reconnect_last_device(). */
+#define BT_FAST_RESUME \
+    "hciconfig hci0 up 2>/dev/null; _i=0; " \
+    "while ! hciconfig hci0 2>/dev/null | grep -q 'UP RUNNING' && [ $_i -lt 20 ]; do usleep 100000; _i=$((_i+1)); done; " \
+    "if ! hciconfig hci0 2>/dev/null | grep -q 'UP RUNNING'; then " \
+    "  echo \"$(date) fast resume failed, full bt_init\" >> /usr/data/btresume.log; " \
+    "  /usr/bin/bt_suspend; exec /usr/bin/bt_init; fi; " \
+    "bt-adapter --set Powered On; " \
+    "grep -qE '^[[:space:]]*bt_enabled[[:space:]]*=[[:space:]]*1' /usr/data/music.conf || exit 0; " \
+    "_mac=$(grep -oE '([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}' /usr/data/bt_lastused.txt 2>/dev/null | tail -1); " \
+    "[ -n \"$_mac\" ] || exit 0; " \
+    "_p=/org/bluez/hci0/dev_$(echo $_mac | tr ':' '_'); " \
+    "_up() { ST_BA_CTL_PLACEHOLDER list-pcms 2>/dev/null | grep -qi \"$(echo $_mac | tr ':' '_').*a2dp\"; }; " \
+    "for _g in 1 2 3 5 5; do _up && break; " \
+    "  dbus-send --system --print-reply --reply-timeout=10000 --dest=org.bluez $_p org.bluez.Device1.ConnectProfile string:0000110b-0000-1000-8000-00805f9b34fb >/dev/null 2>&1; " \
+    "  _up && break; bluetoothctl --timeout 8 connect $_mac >/dev/null 2>&1; _up && break; sleep $_g; done"
+
+static void suspend_radios_restore(void) {
+    if (!radios_down) return;
+    radios_down = 0;
+    if (radios_bt) {
+        char cmd[2048];
+        const char *tmpl = BT_FAST_RESUME;
+        const char *ph = strstr(tmpl, "ST_BA_CTL_PLACEHOLDER");
+        snprintf(cmd, sizeof(cmd), "( %.*s%s%s ) >/dev/null 2>&1",
+                 (int)(ph - tmpl), tmpl, st_ba_ctl(), ph + strlen("ST_BA_CTL_PLACEHOLDER"));
+        st_spawn(cmd);
+    }
+    if (radios_wifi) st_wifi_set(1);
+    mlog("[music] suspend: radios back (wifi %d, bt %d)\n", radios_wifi, radios_bt);
+}
 
 static int suspend_ok(void) {
-    if (!deep_sleep_enabled) return 0;
-    /* Playing is the only thing that blocks this, and the caller has already
-     * excluded it. A *connected* headset used to block it too, on the grounds
-     * that bt_suspend would drop the link -- but connected is not the same as
-     * in use, the drop is recoverable (bt_resume rebuilds the stack and puts
-     * the adapter back on), and waking by button is accepted. Left in, that
-     * gate would have meant anyone who leaves a headset paired never suspends
-     * at all, which is most of the saving gone for a reconnect nobody asked
-     * to avoid. */
+    if (!deep_sleep_enabled || sleep_minutes() == 0) return 0;
+    /* Playing is excluded by the caller. A *connected* headset does not
+     * block this: connected is not in use, and the link comes back with the
+     * radios on wake. What does block it is work that must not be frozen
+     * half-way: the card handed to a computer, a library scan, a podcast
+     * download or feed update. */
+    if (card_released) return 0;
+    if (scanner_scan_running() || index_scan_running()) return 0;
+    if (pod_download_active() || pod_update_running()) return 0;
     return 1;
 }
 
-static void deep_suspend(void) {
-    /* Stock's bt_resume ends with `bt-adapter --set "Powered" "Off"`, so a
-     * round trip through suspend leaves Bluetooth switched off even if it was
-     * on beforehand -- verified on device, hci0 reads DOWN afterwards. Note
-     * what it was so it can be put back; anything else silently changes a
-     * setting the user chose. */
-    int bt_was_on = st_bt_on();
-    int now = read_int_file(RTC_EPOCH);
-    if (now > 0) {
-        write_int_file(RTC_WAKEALARM, 0);                       /* clear any stale alarm */
-        write_int_file(RTC_WAKEALARM, now + SUSPEND_RTC_BACKSTOP_S);
+/* off_due: CLOCK_BOOTTIME second Auto shutdown falls due, 0 when it is off.
+ * Returns 1 when that alarm is what woke the device -- the caller powers
+ * off -- and 0 for a wake by the button. */
+static int deep_suspend(long off_due) {
+    ab_save_current_pos();
+    pod_save_current_pos();
+    listen_flush();
+
+    if (!radios_down) {
+        /* Stock's bt_resume -- and bt_suspend's teardown generally -- leave
+         * Bluetooth off, so note what was on in order to put it back. */
+        radios_bt = st_bt_on();
+        radios_wifi = st_wifi_on();
+        radios_down = 1;
+        if (radios_wifi) {
+            mlog("[music] suspend: wifi off\n");
+            if (system("/usr/bin/wifi_off.sh >/dev/null 2>&1") == -1) { }
+        }
+        /* Adapter off first so links are dropped properly (an A2DP link
+         * alive into suspend reportedly reboots the device), then hci0
+         * down: the chip stays powered with its firmware loaded -- see
+         * suspend_radios_restore() for why, and for the fallback. */
+        mlog("[music] suspend: bluetooth adapter off, hci0 down\n");
+        if (system("bt-adapter --set Powered Off >/dev/null 2>&1; hciconfig hci0 down >/dev/null 2>&1") == -1) { }
     }
-    mlog("[music] suspend: bluetooth teardown\n");
-    if (system("/usr/bin/bt_suspend >/dev/null 2>&1") == -1) { /* carry on regardless */ }
+    sync();
+
+    /* Clear first: the RTC refuses a new alarm while one is armed, and one
+     * left by an older build (the 15-minute backstop) would still fire. */
+    write_int_file(RTC_WAKEALARM, 0);
+    int armed = 0;
+    if (off_due > 0) {
+        struct timespec nb;
+        clock_gettime(CLOCK_BOOTTIME, &nb);
+        long left = off_due - nb.tv_sec;
+        if (left < 5) left = 5;               /* already due: wake almost at once */
+        int now = read_int_file(RTC_EPOCH);
+        if (now > 0) {
+            write_int_file(RTC_WAKEALARM, now + (int)left);
+            armed = 1;
+            mlog("[music] suspend: auto shutdown alarm in %ld s\n", left);
+        }
+    }
     write_int_file(FB_BLANK_NODE, 4);                           /* FB_BLANK_POWERDOWN */
 
     mlog("[music] suspend: entering mem sleep\n");
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_BOOTTIME, &t0);
     write_text_file(PWR_STATE, "mem");                          /* blocks until resume */
-    mlog("[music] suspend: resumed\n");
+    clock_gettime(CLOCK_BOOTTIME, &t1);
 
-    write_int_file(RTC_WAKEALARM, 0);                           /* backstop no longer needed */
-    /* Backgrounded: bt_resume re-runs brcm_patchram_plus with a sleep 5 and
-     * several more after it, so it is ten seconds of work. Blocking the UI
-     * thread for that would freeze the very double-press the user is about to
-     * make to unlock. Same pattern st_wifi_set/st_bt_set already use.
-     *
-     * The power-on is chained onto it inside the same background shell rather
-     * than issued here, because it has to happen *after* bt_resume's ten
-     * seconds of stack rebuilding, not racing it. */
-    st_spawn(bt_was_on ? "( /usr/bin/bt_resume; bt-adapter --set Powered On ) >/dev/null 2>&1"
-                       : "/usr/bin/bt_resume >/dev/null 2>&1");
+    /* The alarm clears itself when it fires; one still set means the button
+     * got there first. */
+    int by_alarm = armed && read_int_file(RTC_WAKEALARM) <= 0;
+    write_int_file(RTC_WAKEALARM, 0);
+    mlog("[music] suspend: resumed after %ld s (%s)\n", (long)(t1.tv_sec - t0.tv_sec),
+         by_alarm ? "auto shutdown due" : "woken");
+    if (!by_alarm) suspend_radios_restore();
+    return by_alarm;
 }
 
 static void set_locked(int on) {
     if (on == locked) return;
     locked = on;
     audio_set_screen_locked(on);   /* BG90 follow-up -- see its own comment in audio.h */
+    if (!on) suspend_radios_restore();
     if (on) {
         /* BG95 follow-up, found live: the button-lock double-press handler
          * (see its own comment) deliberately forces set_locked() to re-run
@@ -13082,7 +13213,8 @@ int music_entry(void *a0, void *a1) {
     int frames = 0, running = 1, dirty = 1;   /* page declared above, before the resume fades */
     int resume_wait_ticks = 0;   /* safety cap -- see the check below */
     int last_sec = -1, art_seen = 0, view_art_seen = 0, status_tick = 0, idle = 0, rescan_tick = 0;
-    int sleep_idle = 0, auto_off_idle = 0;
+    int sleep_idle = 0;
+    long auto_off_since = 0;   /* CLOCK_BOOTTIME seconds the idle began, 0 = not idle */
     int ab_pos_tick = 0;
     int blank_tick = 0;    /* BG6 watchdog, see below -- last_lit_bright is file-scope now (BG95) */
     while (running) {
@@ -13146,6 +13278,28 @@ int music_entry(void *a0, void *a1) {
             int scan_running = scanner_scan_running() || index_scan_running();
             if (scan_was_running && !scan_running) cover_prewarm_start();
             scan_was_running = scan_running;
+        }
+
+        /* A scan publishes its database by rename (scanner.c scan_pass()),
+         * so the library's open handle is still on the file it replaced --
+         * reopen onto the new one. And a library the startup check found
+         * damaged has been moved aside: reopen (onto whatever is left) and
+         * rebuild it. */
+        {
+            static int lib_gen;
+            int gen = scanner_generation();
+            if (gen != lib_gen) {
+                lib_gen = gen;
+                if (lib_reopen() != 0) mlog("[music] library reopen failed\n");
+                else mlog("[music] library reopened on scan %d\n", gen);
+                dirty = 1;
+            }
+            if (lib_take_damaged()) {
+                lib_reopen();
+                scanner_rescan_now();
+                mlog("[music] library was damaged: rebuilding from the card\n");
+                dirty = 1;
+            }
         }
 
         /* BG38 (part 2): drain bt_poll's fuzzy-matched profile, if it found
@@ -14026,6 +14180,7 @@ int music_entry(void *a0, void *a1) {
                 int ry_autooff = set_row_autooff_y() - off, ry_about = set_row_about_y() - off;
                 int ry_btautoplay = set_row_btautoplay_y() - off;
                 int ry_btvolsteps = set_row_btvolsteps_y() - off;
+                int ry_screento = set_row_screento_y() - off;
                 int ry_lighttheme = set_row_lighttheme_y() - off;
                 int ry_timezone = set_row_timezone_y() - off;
                 int ry_wifi = set_row_wifi_y() - off, ry_bt = set_row_bt_y() - off;
@@ -14044,7 +14199,9 @@ int music_entry(void *a0, void *a1) {
                 int lock_h = set_row_usbbypass_y() - set_row_lock_y();
                 int usbbypass_h = set_row_btautoplay_y() - set_row_usbbypass_y();
                 int btautoplay_h = set_row_btvolsteps_y() - set_row_btautoplay_y();
-                int autooff_h = set_row_lighttheme_y() - set_row_autooff_y();
+                int autooff_h = set_row_sleep_y() - set_row_autooff_y();
+                int ry_sleep = set_row_sleep_y() - off;
+                int sleep_h = set_row_lighttheme_y() - set_row_sleep_y();
                 if (y >= ry_lock && y < ry_lock + lock_h) {
                     button_lock_enabled = !button_lock_enabled;
                     save_conf();
@@ -14058,11 +14215,30 @@ int music_entry(void *a0, void *a1) {
                     bt_vol_step_idx = (bt_vol_step_idx + 1) % BT_VOL_STEP_CHOICE_N;
                     audio_set_bt_vol_steps(BT_VOL_STEP_CHOICES[bt_vol_step_idx]);
                     save_conf();
+                } else if (y >= ry_screento && y < ry_screento + ROW_H) {
+                    int i = 0;
+                    while (i < SCREEN_TO_CHOICE_N && SCREEN_TO_CHOICES[i] != idle_lock_s) i++;
+                    idle_lock_s = SCREEN_TO_CHOICES[(i + 1) % SCREEN_TO_CHOICE_N];
+                    save_conf();
                 } else if (y >= ry_autooff && y < ry_autooff + autooff_h) {
                     /* Cycles rather than opening a picker: six short values,
                      * and a whole screen for them would be more chrome than
                      * the choice is worth. */
                     auto_off_idx = (auto_off_idx + 1) % AUTO_OFF_CHOICE_N;
+                    save_conf();
+                } else if (y >= ry_sleep && y < ry_sleep + sleep_h) {
+                    /* Off -> 1 -> 2 -> 5 -> 10 -> 30 min -> Off. "Off" is
+                     * deep_sleep = 0, so an existing music.conf's
+                     * sleep_minutes (default 2, from the withdrawn row) does
+                     * not switch it on by itself. */
+                    if (!deep_sleep_enabled || sleep_idx == 0) {
+                        deep_sleep_enabled = 1;
+                        sleep_idx = 1;
+                    } else if (sleep_idx == SLEEP_CHOICE_N - 1) {
+                        deep_sleep_enabled = 0;
+                    } else {
+                        sleep_idx++;
+                    }
                     save_conf();
                 } else if (y >= ry_lighttheme && y < ry_lighttheme + ROW_H) {
                     screen = SC_SETTINGS_THEMEMODE; reset_scroll();
@@ -16090,7 +16266,16 @@ int music_entry(void *a0, void *a1) {
         }
         if (button_locked) led_pulse_step();
 
-        if (!locked && idle_ticks > 0 && ++idle >= idle_ticks) set_locked(1);
+        if (!locked && idle_lock_s > 0) {
+            /* idle is zeroed by every input; its first tick after that marks
+             * when the quiet began. */
+            static long idle_since_ms;
+            struct timespec its;
+            clock_gettime(CLOCK_MONOTONIC, &its);
+            long now_ms = its.tv_sec * 1000L + its.tv_nsec / 1000000L;
+            if (idle++ == 0) idle_since_ms = now_ms;
+            if (now_ms - idle_since_ms >= idle_lock_s * 1000L) set_locked(1);
+        }
 
         /* Low-power idle. Counted in loop ticks, and while locked the loop runs
          * at 10 Hz, which is the only rate that can ever reach the threshold --
@@ -16121,9 +16306,22 @@ int music_entry(void *a0, void *a1) {
         }
 
         int playing = audio_is_active() && !audio_is_paused();
-        if (locked && !playing && sleep_minutes() > 0 && suspend_ok()) {
+        if (locked && !playing && suspend_ok()) {
             if (++sleep_idle >= sleep_minutes() * 60 * 10) {
-                deep_suspend();
+                long off_due = 0;
+                if (auto_off_minutes() > 0) {
+                    if (!auto_off_since) {
+                        struct timespec nb;
+                        clock_gettime(CLOCK_BOOTTIME, &nb);
+                        auto_off_since = nb.tv_sec;
+                    }
+                    off_due = auto_off_since + (long)auto_off_minutes() * 60;
+                }
+                /* Woken by the Auto shutdown alarm: leave auto_off_since as
+                 * it is, so the block below finds it due and powers off on
+                 * this same pass. Woken by the button: a person is about to
+                 * use it, so the idle clock starts again. */
+                if (!deep_suspend(off_due)) auto_off_since = 0;
                 /* Resumed. Start the whole timeout again rather than suspending
                  * on the very next tick: the press that woke the device is a
                  * single press, which button_locked swallows, so an immediate
@@ -16140,8 +16338,15 @@ int music_entry(void *a0, void *a1) {
          * a poweroff is not a suspend, does not care whether deep sleep is
          * enabled, and there is nothing to resume into afterwards, so unlike
          * sleep_idle there is no reset-and-repeat: this fires once. */
+        /* Measured on CLOCK_BOOTTIME, which keeps counting through suspend,
+         * rather than in loop ticks, which stop with the loop. A button wake
+         * restarts it (see the suspend call above); the alarm wake that
+         * suspend sets for the due time leaves it, and it fires here. */
+        struct timespec bts;
+        clock_gettime(CLOCK_BOOTTIME, &bts);
         if (locked && !playing && auto_off_minutes() > 0) {
-            if (++auto_off_idle >= auto_off_minutes() * 60 * 10) {
+            if (!auto_off_since) auto_off_since = bts.tv_sec;
+            if (bts.tv_sec - auto_off_since >= (long)auto_off_minutes() * 60) {
                 mlog("[music] auto shutdown after %d min idle\n", auto_off_minutes());
                 /* Explicit rather than relying on the exit path below: there is
                  * no SIGTERM handler here, so whatever poweroff's shutdown
@@ -16164,10 +16369,10 @@ int music_entry(void *a0, void *a1) {
                 if (system("/sbin/poweroff") == -1) { }
                 /* poweroff is not instant; keep the loop from re-firing this
                  * every tick while the shutdown sequence runs. */
-                auto_off_idle = 0;
+                auto_off_since = bts.tv_sec;
             }
         } else {
-            auto_off_idle = 0;
+            auto_off_since = 0;
         }
 
         /* BG6: undo the stock player's standby blanking.

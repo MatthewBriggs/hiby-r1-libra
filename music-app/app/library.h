@@ -38,6 +38,13 @@ typedef struct {
 
 int  lib_open(void);
 void lib_close(void);
+/* Close and open again, onto whichever database is current now -- after a
+ * scan publishes a new one (scanner_generation()) or a damaged one is moved
+ * aside. */
+int  lib_reopen(void);
+/* 1, once, when the startup check found the scanned library damaged and
+ * moved it aside; the caller reopens and starts a rescan. */
+int  lib_take_damaged(void);
 
 /* `expected`: the album row's own track count, from the same Albums list
  * the caller just tapped (lib_row_t.count) -- lets the folder-recovery

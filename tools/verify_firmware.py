@@ -441,6 +441,7 @@ def main():
                             "module_driver/soc_utils.sh"}
                 expected |= set(SET_FUNCTIONS_FILES)
                 expected |= set(WIFI_SCRIPTS)   # --brcmfmac-switch rewrites both
+                expected |= {"usr/bin/bt_resume"}  # --brcmfmac-switch drops --enable_lpm there too
                 # kernel_build_id: --kernel-build-id re-stamps this file, which
                 # shows up as "changed" (not "added") whenever the base image
                 # already carried a stamp from an earlier pass -- both are
@@ -476,6 +477,17 @@ def main():
                 expected_removed = {"etc/init.d/S80_bt_init", "etc/init.d/S21mount_ubifs"}
                 expected_removed |= set(STRIPPED_FONTS_AND_BINARIES)
                 expected_removed |= set(BRCMFMAC_SWITCH_REMOVED)
+
+                # --bluealsa5 lists everything it installed or edited in the
+                # image itself (patch_firmware.py BLUEALSA5_MANIFEST): those
+                # are intended, changed or new alike.
+                bmanifest = os.path.join(root, "usr/share/licenses/base-upgrade/libra-installed.txt")
+                if os.path.exists(bmanifest):
+                    with open(bmanifest) as fh:
+                        blist = {l.strip() for l in fh if l.strip() and not l.startswith("#")}
+                    expected |= blist
+                    expected_added |= blist
+                    print(f"    BlueALSA 5 overlay: {len(blist)} files per its manifest")
 
                 def removed_ok(path):
                     return path in expected_removed or path.startswith(LITEGUI_DIR)

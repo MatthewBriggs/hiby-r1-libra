@@ -1282,6 +1282,11 @@ int audio_probe_format(const char *path, int *bits, int *rate,
 typedef long  snd_pcm_sframes_t;
 typedef unsigned long snd_pcm_uframes_t;
 
+/* Where Libra's own ALSA configuration lives under BlueALSA 5, and the
+ * device it defines there -- see bt_pin_pcm(). */
+#define BT_ALSA_HOME "/usr/data/alsa"
+#define BT_PINNED_PCM "libra_bt"
+
 static void *g_alsa;
 static int (*x_open)(void **, const char *, int, int);
 static int (*x_close)(void *);
@@ -1315,6 +1320,8 @@ static int (*x_swp_apply)(void *, void *);
 
 static int load_libs(void) {
     if (g_alsa) return 0;
+    /* Before libasound reads its configuration: see bt_pin_pcm(). */
+    if (st_ba_v5()) setenv("HOME", BT_ALSA_HOME, 1);
     {
         g_alsa = dlopen("libasound.so.2", RTLD_LAZY);
         if (!g_alsa) g_alsa = dlopen("libasound.so", RTLD_LAZY);
@@ -1547,7 +1554,9 @@ out:
 /* ---- output routing ------------------------------------------------------ */
 /* An A2DP sink shows up as a bluealsa PCM ending in /sink. */
 static int bt_sink_connected(void) {
-    FILE *p = popen("bluealsa-cli list-pcms 2>/dev/null", "r");
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "%s list-pcms 2>/dev/null", st_ba_ctl());
+    FILE *p = popen(cmd, "r");
     if (!p) return 0;
     char line[256];
     int found = 0;
@@ -1715,6 +1724,52 @@ static int bt_softvol_set;   /* SoftVolume asked for once this connection */
  * headset's or bluealsa's arbitrary value can't overwrite it. -1 until the
  * first Bluetooth connection has settled on a level. */
 static int bt_last_pct = -1;
+
+/* bt_last_pct, kept across restarts. It used to live only in memory, which
+ * BlueALSA 4 hid: a new link there kept the transport's previous level, so
+ * a restarted Libra adopting whatever it read was merely arbitrary. BlueALSA
+ * 5 starts every new link at 127, full scale, so the same adoption put the
+ * first track after a reboot straight into the user's ears at maximum --
+ * seen on the first test of the 5 image. Its own file rather than
+ * music.conf: this changes on every volume press, and it is written from the
+ * Bluetooth thread only once a level has held for BT_PCT_SAVE_SECS, so a
+ * run of presses costs one small write. */
+#define BT_PCT_FILE "/usr/data/bt_volume"
+#define BT_PCT_SAVE_SECS 3
+/* With nothing saved, a reading this close to full scale is a default, not
+ * a choice anybody made -- start from BT_PCT_FIRST instead. */
+#define BT_PCT_FIRST 35
+static int bt_pct_saved = -1;
+
+static int bt_pct_load(void) {
+    FILE *f = fopen(BT_PCT_FILE, "r");
+    if (!f) return -1;
+    int v = -1;
+    if (fscanf(f, "%d", &v) != 1 || v < 0 || v > 100) v = -1;
+    fclose(f);
+    bt_pct_saved = v;
+    return v;
+}
+
+static void bt_pct_save_if_settled(void) {
+    static int pending = -1;
+    static time_t since;
+    int cur = bt_last_pct;
+    if (cur < 0 || cur == bt_pct_saved) { pending = -1; return; }
+    time_t now = time(NULL);
+    if (cur != pending) { pending = cur; since = now; return; }
+    if (now - since < BT_PCT_SAVE_SECS) return;
+    char tmp[64];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", BT_PCT_FILE);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    fprintf(f, "%d\n", cur);
+    int ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
+    ok = fclose(f) == 0 && ok;
+    if (ok && rename(tmp, BT_PCT_FILE) == 0) bt_pct_saved = cur;
+    else unlink(tmp);
+    pending = -1;
+}
 
 static int bt_vol_max  = 127;    /* AVRCP's own range; re-read per mixer in
                                    * case a future device differs */
@@ -2019,7 +2074,20 @@ static void bt_enable_softvol(void) {
     bt_softvol_set = 1;
     char cmd[640], qpath[520];
     shell_quote(path, qpath, sizeof(qpath));
-    snprintf(cmd, sizeof(cmd), "bluealsa-cli soft-volume %s true >/dev/null 2>&1", qpath);
+    /* Only switch it on if it is off: BlueALSA 5 resets the level to 127 on
+     * every SoftVolume write, on or off, so re-asserting it mid-track is an
+     * audible jump to full scale. bt_pin_pcm() normally has it on already. */
+    if (st_ba_v5()) {
+        snprintf(cmd, sizeof(cmd), "%s soft-volume %s 2>/dev/null", st_ba_ctl(), qpath);
+        FILE *p = popen(cmd, "r");
+        char line[64] = "";
+        if (p) { if (!fgets(line, sizeof(line), p)) line[0] = '\0'; pclose(p); }
+        if (strstr(line, "true")) {
+            alog("[audio] bt: SoftVolume already on for %s\n", path);
+            return;
+        }
+    }
+    snprintf(cmd, sizeof(cmd), "%s soft-volume %s true >/dev/null 2>&1", st_ba_ctl(), qpath);
     if (system(cmd) == -1) { bt_softvol_set = 0; return; }
 
     int max = bt_vol_max;
@@ -2043,10 +2111,72 @@ static void bt_enable_softvol(void) {
     alog("[audio] bt: SoftVolume on for %s (level %d/%d)\n", path, now, bt_vol_max);
 }
 
+/* What the transport actually is, in music.log, whenever that changes.
+ *
+ * Reported live: a Jabra Elite 4 Active connected with no sound at all, then
+ * after a reboot played the left channel only, while the same buds were fine
+ * on a phone and fine on the R1 again later. The log showed ordinary 2-channel
+ * opens every time and nothing else -- bluealsa keeps no log of its own, so
+ * the codec, the negotiated rate and the per-channel SoftVolume levels at the
+ * moment it went wrong were simply gone. One line per change (not per track:
+ * a Bluetooth open happens on every track boundary) keeps enough to tell "the
+ * R1 sent something different" from "the headset did", after the fact.
+ * Background thread only -- it forks bluealsa-cli. */
+static char bt_info_last[200];
+
+static void bt_log_info(void) {
+    char path[256];
+    if (!st_bt_pcm_path(path, sizeof(path))) return;
+    char cmd[640], qpath[520];
+    shell_quote(path, qpath, sizeof(qpath));
+    snprintf(cmd, sizeof(cmd), "%s info %s 2>/dev/null", st_ba_ctl(), qpath);
+    FILE *p = popen(cmd, "r");
+    if (!p) return;
+    char codec[24] = "?", rate[16] = "?", ch[8] = "?", soft[8] = "?",
+         vol[32] = "?", mute[32] = "?", line[256];
+    while (fgets(line, sizeof(line), p)) {
+        line[strcspn(line, "\n")] = '\0';
+        char *v = strchr(line, ':');
+        if (!v) continue;
+        v++;
+        while (*v == ' ') v++;
+        /* BlueALSA 4 says "Sampling:"/"Muted:", 5 says "Rate:"/"Mute:" and
+         * appends the codec configuration after a colon. */
+        if      (!strncmp(line, "Selected codec:", 15)) { snprintf(codec, sizeof(codec), "%s", v); codec[strcspn(codec, ":")] = '\0'; }
+        else if (!strncmp(line, "Sampling:", 9) || !strncmp(line, "Rate:", 5)) snprintf(rate, sizeof(rate), "%s", v);
+        else if (!strncmp(line, "Channels:", 9))        snprintf(ch, sizeof(ch), "%s", v);
+        else if (!strncmp(line, "SoftVolume:", 11))     snprintf(soft, sizeof(soft), "%s", v);
+        else if (!strncmp(line, "Volume:", 7))          snprintf(vol, sizeof(vol), "%s", v);
+        else if (!strncmp(line, "Muted:", 6) || !strncmp(line, "Mute:", 5)) snprintf(mute, sizeof(mute), "%s", v);
+    }
+    pclose(p);
+    /* The device is the dev_XX_XX.. component of the path. */
+    const char *dev = strstr(path, "dev_");
+    char devs[24] = "?";
+    if (dev) { snprintf(devs, sizeof(devs), "%s", dev); char *s = strchr(devs, '/'); if (s) *s = '\0'; }
+    char info[200];
+    snprintf(info, sizeof(info), "%s %s %s ch %s | soft %s vol %s mute %s",
+             devs, codec, rate, ch, soft, vol, mute);
+    if (strcmp(info, bt_info_last) == 0) return;
+    snprintf(bt_info_last, sizeof(bt_info_last), "%s", info);
+    alog("[audio] bt link: %s\n", info);
+}
+
 void audio_bt_volume_service(void) {
     if (!audio_using_bt()) {
         bt_mixer_misses = 0; bt_mixer_next_try = 0; bt_read_fail_count = 0;
+        bt_info_last[0] = '\0';   /* the next connection logs afresh */
         return;
+    }
+    /* Not only on connect: a codec switch or a channel dropping to 0
+     * mid-connection is exactly what this is here to catch. Two forks, so
+     * every 15s once the first line is in, rather than every ~5s pass; logs
+     * only when something changed. */
+    static time_t bt_info_next;
+    time_t tnow = time(NULL);
+    if (!audio_bt_volume_pending() && (!bt_info_last[0] || tnow >= bt_info_next)) {
+        bt_info_next = tnow + 15;
+        bt_log_info();
     }
 
     int pending, raw_val;
@@ -2100,6 +2230,12 @@ void audio_bt_volume_service(void) {
                 int max = bt_vol_max;
                 int fresh = bt_read_raw(&max);
                 if (fresh >= 0) bt_vol_max = max;
+                if (bt_last_pct < 0) bt_last_pct = bt_pct_load();
+                if (fresh >= 0 && bt_last_pct < 0 && fresh > bt_vol_max * 3 / 4) {
+                    bt_last_pct = BT_PCT_FIRST;
+                    alog("[audio] bt: nothing saved and the link came up at %d/%d -- starting at %d%%\n",
+                         fresh, bt_vol_max, BT_PCT_FIRST);
+                }
                 if (fresh >= 0 && bt_last_pct >= 0) {
                     /* R-btlevel: there is a level the user chose -- write
                      * *that*, don't adopt bluealsa's. The reading above only
@@ -2215,6 +2351,175 @@ void audio_bt_volume_service(void) {
     pthread_mutex_lock(&g_lock);
     g_vol = bt_raw_to_pct(raw);
     pthread_mutex_unlock(&g_lock);
+    bt_pct_save_if_settled();
+}
+
+/* BlueALSA 5 only: an ALSA device for the headset pinned to the rate its A2DP
+ * link already negotiated.
+ *
+ * BlueALSA 4's plugin accepts only the link's own rate, so the "bluealsa"
+ * plug device converts anything else and nothing reaches the headset. 5's
+ * plugin advertises every rate the codec could carry, and opening it at one
+ * the link is not using makes it call SelectCodec -- which in 5 recreates the
+ * transport, dropping the headset or failing outright on one that refuses
+ * the new configuration. Every track at a different rate from the last would
+ * do that. Pinning the plug's slave to the negotiated rate keeps the
+ * conversion in ALSA, which is what the stock "bluealsa" device already did
+ * for us under 4 (and what compas-player does under 5, which is where this
+ * came from).
+ *
+ * The definition goes in $HOME/.asoundrc, the one writable file alsa.conf
+ * reads (the rootfs is squashfs); HOME is pointed at BT_ALSA_HOME when the
+ * libraries load. alsa-lib re-reads its configuration on the next open when
+ * the file changes, and it is replaced atomically so a half-written file can
+ * never break an open. Names the headset by address rather than BlueALSA's
+ * "most recently connected" default, so it cannot follow a different device
+ * than the one just asked about. 0 when this is BlueALSA 4 or the link
+ * cannot be read, and the caller opens the stock device as before. */
+
+/* BlueALSA 5 only: the best codec both ends support.
+ *
+ * Under 4 the daemon settled on the best codec itself (LDAC on the BTR17,
+ * aptX on the Jabras). Under 5 BlueZ picks, by endpoint order and then by
+ * whichever it used last -- quality does not come into it -- and the first
+ * test of the 5 image connected the Jabras on SBC with aptX on offer. So it
+ * is chosen here, in the order the stock HiBy player documents and
+ * compas-player's Automatic uses.
+ *
+ * Only while the PCM is not running: `bluealsactl codec` recreates the
+ * transport, which would cut a stream mid-track. Just before Libra opens the
+ * PCM is exactly when that is true. A codec the headset advertised and then
+ * refused -- the switch failed, or the link did not come back on it -- is not
+ * asked for again on that device this session, so a headset that cannot
+ * keep a codec does not go through a failed switch on every track. */
+static const char *const BT_CODEC_RANK[] = { "LDAC", "aptX-HD", "aptX", "AAC", "SBC" };
+#define BT_CODEC_N (sizeof(BT_CODEC_RANK) / sizeof(BT_CODEC_RANK[0]))
+static char     bt_codec_dev[24];     /* the device bt_codec_refused applies to */
+static unsigned bt_codec_refused;     /* bit per BT_CODEC_RANK entry */
+
+typedef struct {
+    unsigned rate, ch;
+    int running;
+    int softvol;
+    char selected[24];
+    char available[160];
+} bt_link_t;
+
+static int bt_link_read(const char *qpath, bt_link_t *l) {
+    char cmd[640], line[256];
+    snprintf(cmd, sizeof(cmd), "%s info %s 2>/dev/null", st_ba_ctl(), qpath);
+    FILE *p = popen(cmd, "r");
+    if (!p) return 0;
+    memset(l, 0, sizeof(*l));
+    while (fgets(line, sizeof(line), p)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (!strncmp(line, "Rate:", 5)) l->rate = (unsigned)strtoul(line + 5, NULL, 10);
+        else if (!strncmp(line, "Channels:", 9)) l->ch = (unsigned)strtoul(line + 9, NULL, 10);
+        else if (!strncmp(line, "Running:", 8)) l->running = strstr(line, "true") != NULL;
+        else if (!strncmp(line, "SoftVolume:", 11)) l->softvol = strstr(line, "true") != NULL;
+        else if (!strncmp(line, "Selected codec:", 15)) {
+            const char *v = line + 15;
+            while (*v == ' ') v++;
+            snprintf(l->selected, sizeof(l->selected), "%s", v);
+            l->selected[strcspn(l->selected, ": ")] = '\0';
+        } else if (!strncmp(line, "Available codecs:", 17))
+            snprintf(l->available, sizeof(l->available), " %s ", line + 17);
+    }
+    pclose(p);
+    return l->rate != 0;
+}
+
+static void bt_pick_codec(const char *qpath, const char *dev, bt_link_t *l) {
+    if (strcmp(bt_codec_dev, dev) != 0) {
+        snprintf(bt_codec_dev, sizeof(bt_codec_dev), "%s", dev);
+        bt_codec_refused = 0;
+    }
+    if (l->running) return;
+    const char *best = NULL;
+    unsigned bit = 0;
+    for (unsigned i = 0; i < BT_CODEC_N; i++) {
+        char tok[32];
+        snprintf(tok, sizeof(tok), " %s ", BT_CODEC_RANK[i]);
+        if (!strstr(l->available, tok) || (bt_codec_refused & (1u << i))) continue;
+        best = BT_CODEC_RANK[i]; bit = 1u << i;
+        break;
+    }
+    if (!best || !strcasecmp(best, l->selected)) return;
+    char cmd[640];
+    snprintf(cmd, sizeof(cmd), "%s codec %s %s >/dev/null 2>&1", st_ba_ctl(), qpath, best);
+    int rc = system(cmd);
+    char was[24];
+    snprintf(was, sizeof(was), "%s", l->selected);
+    if (!bt_link_read(qpath, l) || strcasecmp(l->selected, best) != 0 || rc != 0) {
+        if (strcmp(best, "SBC") != 0) bt_codec_refused |= bit;
+        alog("[audio] bt codec: %s -> %s refused (now %s), not asking again for this device\n",
+             was, best, l->selected[0] ? l->selected : "?");
+        return;
+    }
+    alog("[audio] bt codec: %s -> %s\n", was, best);
+}
+
+static int bt_pin_pcm(void) {
+    if (!st_ba_v5()) return 0;
+    char path[256];
+    if (!st_bt_pcm_path(path, sizeof(path))) return 0;
+    const char *dev = strstr(path, "dev_");
+    if (!dev || strlen(dev) < 4 + 17) return 0;
+    char mac[18];
+    for (int i = 0; i < 17; i++) mac[i] = dev[4 + i] == '_' ? ':' : dev[4 + i];
+    mac[17] = '\0';
+
+    char qpath[520];
+    shell_quote(path, qpath, sizeof(qpath));
+    bt_link_t link;
+    if (!bt_link_read(qpath, &link)) return 0;
+    bt_pick_codec(qpath, mac, &link);
+    /* A codec switch recreates the PCM, and its path with it only if the
+     * device changed -- which it cannot here -- but the rate may move. */
+    if (!link.rate && !bt_link_read(qpath, &link)) return 0;
+    unsigned rate = link.rate, ch = link.ch;
+    if (!rate) return 0;
+    if (!ch) ch = 2;
+
+    /* SoftVolume, and the level with it, before anything plays. BlueALSA 5
+     * resets the level to 127 on every SoftVolume write, and 5's links start
+     * at 127 anyway: switched on later, from the volume service, the first
+     * fraction of a second of the track went out at full scale until the
+     * user's level was written back. Here the stream is not open yet, so the
+     * two writes land in silence. bt_enable_softvol() then finds it on and
+     * leaves it alone. */
+    if (!link.softvol && !link.running) {
+        int pct = bt_last_pct >= 0 ? bt_last_pct : bt_pct_load();
+        if (pct < 0) pct = BT_PCT_FIRST;
+        int raw = (pct * 127 + 50) / 100;
+        char cmd[640];
+        snprintf(cmd, sizeof(cmd), "%s soft-volume %s on >/dev/null 2>&1 && %s volume %s %d %d >/dev/null 2>&1",
+                 st_ba_ctl(), qpath, st_ba_ctl(), qpath, raw, raw);
+        if (system(cmd) == 0) {
+            if (bt_last_pct < 0) bt_last_pct = pct;
+            alog("[audio] bt: SoftVolume on before opening, level %d/127 (%d%%)\n", raw, pct);
+        }
+    }
+
+    mkdir(BT_ALSA_HOME, 0755);
+    char tmp[64], fin[64];
+    snprintf(tmp, sizeof(tmp), "%s/.asoundrc.tmp", BT_ALSA_HOME);
+    snprintf(fin, sizeof(fin), "%s/.asoundrc", BT_ALSA_HOME);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return 0;
+    fprintf(f, "pcm.%s {\n"
+               "    type plug\n"
+               "    slave {\n"
+               "        pcm { type bluealsa device \"%s\" profile \"a2dp\" }\n"
+               "        rate %u\n"
+               "        channels %u\n"
+               "    }\n"
+               "}\n", BT_PINNED_PCM, mac, rate, ch);
+    int ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
+    ok = fclose(f) == 0 && ok;
+    if (!ok || rename(tmp, fin) != 0) { unlink(tmp); return 0; }
+    alog("[audio] bt output pinned to %u Hz %u ch for %s\n", rate, ch, mac);
+    return 1;
 }
 
 /* ALSA's own numbering. */
@@ -2269,6 +2574,7 @@ static void *pcm_open(unsigned rate, int channels, int deep, int want_fmt) {
          * headset — a2dpsrc/sink plus hfpag/sink and /source — and the bare
          * "bluealsa" device can resolve to the HFP one, which expects
          * narrowband mono. Feeding it 44.1 kHz stereo comes out as static. */
+        if (bt_pin_pcm()) { names[count] = BT_PINNED_PCM; fmts[count++] = FMT_S16_LE; }
         names[count] = "bluealsa:PROFILE=a2dp"; fmts[count++] = FMT_S16_LE;
         names[count] = "bluealsa"; fmts[count++] = FMT_S16_LE;
         /* Advertised but unopenable should not mean silence. */
@@ -2322,7 +2628,10 @@ static void *pcm_open(unsigned rate, int channels, int deep, int want_fmt) {
         g_exact = (!use_bt && names[i] == exact);
         g_out_fmt = fmts[i];
         g_out_rate = r;
-        if (use_bt && i > 0 && names[i] != exact) g_out_kind = 0;   /* fell back to the jack */
+        /* Fell back to the jack. Keyed on the device, not the index: every
+         * candidate before plughw is still Bluetooth, and the pinned device
+         * sits in front of them under BlueALSA 5. */
+        if (use_bt && names[i] == plug) g_out_kind = 0;
         alog("[audio] %s %u Hz %d ch %s%s\n", names[i], r, channels,
              fmts[i] == FMT_S32_LE ? "S32_LE" :
              fmts[i] == FMT_S24_LE ? "S24_LE" : "S16_LE",
@@ -2643,9 +2952,17 @@ static void bt_repush_volume(void) {
     /* R90: bt_vol_raw is this app's own last-known raw setting -- reuse it
      * directly rather than converting g_vol (percent) back to raw, the
      * same "never round-trip through percent" reasoning as everywhere else
-     * in this file now. Falls back to converting g_vol only on a fresh
-     * connection that hasn't read a raw value yet at all. */
-    int raw = bt_vol_raw >= 0 ? bt_vol_raw : bt_pct_to_raw(audio_volume());
+     * in this file now.
+     *
+     * Nothing to push on a connection that has not been read yet. This used
+     * to fall back to converting g_vol, which on a fresh link still holds the
+     * *wired* level: the discovery branch in audio_bt_volume_service() then
+     * applied the user's Bluetooth level and re-queued this guess straight
+     * over it. Seen on the first BlueALSA 5 test -- the saved 35% landed and
+     * was replaced by 89/127, the jack's 11/16, a tick later. Discovery sets
+     * the level on a fresh link; this is only for re-asserting a known one. */
+    if (bt_vol_raw < 0) return;
+    int raw = bt_vol_raw;
     pthread_mutex_lock(&bt_vol_lock);
     bt_vol_pending = 1; bt_vol_pending_raw = raw;
     pthread_mutex_unlock(&bt_vol_lock);

@@ -17,5 +17,9 @@ int  scanner_scan_running(void);
 int  scanner_scan_progress(int *scanned, int *written);
 void scanner_rescan_now(void);
 void scanner_pause_for_usb(int paused);
+/* Bumped each time a pass publishes a new database. The library's handle
+ * still reads the one it replaced until it is reopened -- see music_hook.c's
+ * scan-finished edge. */
+int  scanner_generation(void);
 
 #endif

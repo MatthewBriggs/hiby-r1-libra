@@ -1652,7 +1652,12 @@ BT_CONNECT_BLOCK = BT_POWERED_ON_LINE + """
         if _a2dp_up; then _how=incoming; _note "a2dp present before our attempt"; break; fi
         _try=$((_try + 1))
 
-        _err=$(dbus-send --system --reply-timeout=12000 --dest=org.bluez "$_path" \
+        # --print-reply makes dbus-send wait for the answer. Without it it
+        # sends, disconnects, and BlueZ cancels the connect its caller left:
+        # this call never did anything, every success was the bluetoothctl
+        # fallback below (how=ours-fallback in every btconn.log line).
+        # Waited for, a headset connects in 1.2-1.6 s (measured 2026-09-28).
+        _err=$(dbus-send --system --print-reply --reply-timeout=12000 --dest=org.bluez "$_path" \
           org.bluez.Device1.ConnectProfile \
           string:0000110b-0000-1000-8000-00805f9b34fb 2>&1 >/dev/null)
         _note "ConnectProfile: ${_err:-ok}"
@@ -1887,6 +1892,53 @@ _wl_power_on
 
 BRCM_MODULES = ("r1_wlan_up.ko", "brcmutil.ko", "brcmfmac.ko")
 BRCM_FIRMWARE = ("brcmfmac43430-sdio.bin", "brcmfmac43430-sdio.txt")
+
+
+# Vendor modules that a custom kernel replaces with a mainline driver, keyed by
+# the build-kernel.sh flag that does the replacing. See the kernel repo's
+# docs/11 and scripts/add-mainline-nodes.py for the pin-level reasoning.
+MAINLINE_REPLACES = {
+    "keys": "keyboard_gpio_add",   # -> gpio_keys, node md-gpio-keys
+    "i2c":  "i2c_gpio_add",        # -> i2c-gpio, bus 3 (the CS43131's)
+}
+
+
+def drop_vendor_modules(root, which):
+    """Stop loading the vendor modules a --mainline-* kernel has replaced.
+
+    Both are loaded by one "sh NAME.sh" line each in driver_default_init_script.sh
+    and have no dependants (lsmod shows no users), so removing the line and the
+    files is the whole of it. Loading them anyway would not be harmless: the
+    vendor module and the mainline driver would both request the same GPIOs,
+    and whichever lost would leave its buttons or its bus missing.
+
+    Returns an error string, or None.
+    """
+    path = os.path.join(root, MODULE_INIT_SCRIPT)
+    if not os.path.exists(path):
+        return f"{MODULE_INIT_SCRIPT} not found"
+    names = [MAINLINE_REPLACES[w] for w in which]
+    lines = open(path).read().splitlines(keepends=True)
+    kept, removed = [], []
+    for line in lines:
+        m = re.match(r"\s*sh\s+(\S+)\.sh\s*$", line)
+        if m and m.group(1) in names:
+            removed.append(m.group(1))
+            continue
+        kept.append(line)
+    missing = [nm for nm in names if nm not in removed]
+    if missing:
+        return (f"no 'sh NAME.sh' line for {', '.join(missing)} in "
+                f"{MODULE_INIT_SCRIPT} -- the script has moved on; check it "
+                f"before trusting this build")
+    with open(path, "w") as fh:
+        fh.writelines(kept)
+    for nm in names:
+        for ext in (".ko", ".sh"):
+            f = os.path.join(root, "module_driver", nm + ext)
+            if os.path.exists(f):
+                os.remove(f)
+    return None
 
 
 def switch_to_brcmfmac(root, modules_dir, firmware_dir):
@@ -2271,6 +2323,116 @@ def hasten_bt_init(root):
     return "S22_bt_init"
 
 
+# ---------------------------------------------------------------- BlueALSA 5
+#
+# --bluealsa5 DIR installs compas-player's Bluetooth base-image upgrade
+# (github.com/Starnished66/compas-player, scripts/base_image): BlueALSA 5.0.0,
+# BlueZ 5.87's bluetoothd and tools, and the D-Bus/GLib/ALSA/codec libraries
+# they need, built by ~/Git/r1-bt-stack with compas-player's own scripts and
+# patches. DIR is that build's out/: overlay/ (their runtime overlay) and
+# bluez/ (bluetoothd, bluetoothctl, hciconfig, hcitool, btmon).
+#
+# Three things are deliberately not taken from their overlay:
+#  - libldacdec.so.1, their rebuilt LDAC *decoder*. Upstream publishes no
+#    licence for it, and it is only used when the R1 receives LDAC as a
+#    Bluetooth DAC, which Libra does not do. The stock decoder stays.
+#  - their bt_init / bt_resume / bluealsa_profile. Those are the stock
+#    scripts put through a sed; ours are already heavily patched above, so
+#    the same rename is applied to ours in place instead (bluealsa5_scripts).
+#
+# Every file this installs or edits is listed in BLUEALSA5_MANIFEST inside
+# the image, which is how verify_firmware.py knows those differences are
+# intended.
+BLUEALSA5_MANIFEST = "usr/share/licenses/base-upgrade/libra-installed.txt"
+BLUEALSA5_SKIP = ("usr/bin/bt_init", "usr/bin/bt_resume", "usr/bin/bluealsa_profile")
+
+# BlueALSA 5 enables only SBC and AAC unless told otherwise, so without
+# --all-codecs the BTR17 would lose LDAC and the Jabras aptX. --ldac-abr and
+# high quality are what compas-player's Automatic uses, and the stock player's
+# LDAC_ABR. --a2dp-force-audio-cd is the 44.1 kHz preference INSERT_BT above
+# argues for; v5 has no --a2dp-volume (SoftVolume is per PCM, and Libra sets
+# it per connection).
+BLUEALSA5_SOURCE_ARGS = "--all-codecs --ldac-abr --ldac-quality=high --a2dp-force-audio-cd"
+
+
+def bluealsa5_script(text):
+    """The daemon and its control tool were renamed in BlueALSA 5
+    (bluealsa -> bluealsad, bluealsa-cli -> bluealsactl). Rename every
+    reference in a script, and nothing else that merely starts with the same
+    word: bluealsa-aplay, bluealsa-rfcomm, bluealsa_profile, the ALSA PCM
+    "type bluealsa" and /org/bluealsa D-Bus paths all keep their names.
+    Returns None when there is nothing to change."""
+    out = text
+    # Start lines: rename, drop the v4-only option, add the v5 codec set to
+    # a source daemon (a sink decodes whatever the phone chose).
+    def start(m):
+        line = m.group(0).replace("/usr/bin/bluealsa ", "/usr/bin/bluealsad ", 1)
+        line = line.replace(" --a2dp-volume", "")
+        if "a2dp-source" in line:
+            for arg in BLUEALSA5_SOURCE_ARGS.split():
+                if arg not in line:
+                    line = line.replace("-p a2dp-source", f"-p a2dp-source {arg}", 1)
+        return line
+    out = re.sub(r"/usr/bin/bluealsa [^\n&]*", start, out)
+    out = re.sub(r"\b(killall(?:\s+-9)?\s+|pidof\s+|pgrep\s+\"?)bluealsa(?![\w.:/-])",
+                 r"\1bluealsad", out)
+    out = out.replace("bluealsa-cli", "bluealsactl")
+    return None if out == text else out
+
+
+def install_bluealsa5(root, src):
+    """Copies the overlay in and renames the daemon in every script that
+    names it. Returns the list of image paths installed or edited."""
+    import shutil
+    overlay = os.path.join(src, "overlay")
+    bluez = os.path.join(src, "bluez")
+    for d in (overlay, bluez):
+        if not os.path.isdir(d):
+            die(f"--bluealsa5: missing {d} (run ~/Git/r1-bt-stack first)")
+    touched = []
+    for tree in (overlay, bluez):
+        for dirpath, dirnames, filenames in os.walk(tree):
+            for name in filenames:
+                s_path = os.path.join(dirpath, name)
+                rel = os.path.relpath(s_path, tree)
+                if rel in BLUEALSA5_SKIP or os.path.basename(rel).startswith("libldacdec"):
+                    continue
+                d_path = os.path.join(root, rel)
+                os.makedirs(os.path.dirname(d_path), exist_ok=True)
+                if os.path.lexists(d_path):
+                    os.remove(d_path)
+                if os.path.islink(s_path):
+                    os.symlink(os.readlink(s_path), d_path)
+                else:
+                    shutil.copy2(s_path, d_path)
+                touched.append(rel)
+    for sub in ("usr/bin", "etc/init.d"):
+        base = os.path.join(root, sub)
+        for name in sorted(os.listdir(base)):
+            path = os.path.join(base, name)
+            if os.path.islink(path) or not os.path.isfile(path):
+                continue
+            with open(path, "rb") as fh:
+                head = fh.read(2)
+            if head != b"#!":
+                continue
+            with open(path, encoding="utf-8", errors="surrogateescape") as fh:
+                text = fh.read()
+            new = bluealsa5_script(text)
+            if new is None:
+                continue
+            with open(path, "w", encoding="utf-8", errors="surrogateescape") as fh:
+                fh.write(new)
+            touched.append(f"{sub}/{name}")
+    manifest = os.path.join(root, BLUEALSA5_MANIFEST)
+    os.makedirs(os.path.dirname(manifest), exist_ok=True)
+    touched.append(BLUEALSA5_MANIFEST)
+    with open(manifest, "w") as fh:
+        fh.write("# Installed or edited by patch_firmware.py --bluealsa5\n")
+        fh.write("".join(f"{t}\n" for t in sorted(set(touched))))
+    return sorted(set(touched))
+
+
 def install_boot_adb(root):
     """Add the boot-time ADB wrapper if this rootfs doesn't already have one."""
     dest = os.path.join(root, "etc/init.d/S90adb")
@@ -2622,6 +2784,16 @@ def main():
                          "firmware is taken from --brcm-firmware.")
     ap.add_argument("--brcm-firmware", metavar="DIR",
                     help="directory holding brcmfmac43430-sdio.bin/.txt")
+    ap.add_argument("--mainline-keys", action="store_true",
+                    help="stop loading keyboard_gpio_add: the --kernel was "
+                         "built with build-kernel.sh --mainline-keys and "
+                         "handles the power/next buttons with mainline "
+                         "gpio_keys. Requires --kernel.")
+    ap.add_argument("--mainline-i2c", action="store_true",
+                    help="stop loading i2c_gpio_add: the --kernel was built "
+                         "with build-kernel.sh --mainline-i2c and provides "
+                         "the DAC's bus 3 with mainline i2c-gpio. Requires "
+                         "--kernel.")
     ap.add_argument("--bt-gpio-test", action="store_true",
                     help="EXPERIMENT: power the BT radio by driving PB04 from "
                          "userspace instead of waiting for cywdhd's rfkill0, "
@@ -2633,6 +2805,10 @@ def main():
                          "enumeration and music_hook.c hardcodes event1/event2, "
                          "so it currently breaks touch. See "
                          "background_touch_module().")
+    ap.add_argument("--bluealsa5", metavar="DIR",
+                    help="install the BlueALSA 5 / BlueZ 5.87 base-image "
+                         "upgrade from DIR (~/Git/r1-bt-stack/out); see "
+                         "install_bluealsa5()")
     ap.add_argument("--kernel-build-id", metavar="ID",
                     help="stamp usr/resource/kernel_build_id with this "
                          "string (e.g. '4.4.94_r1') -- read by the app's "
@@ -2691,6 +2867,13 @@ def main():
     rootfs = next((i for i in images if i["type"] == "rootfs"), None)
     if rootfs is None:
         die("no rootfs image in this .upt")
+
+    # The stock kernel has neither replacement driver: dropping the vendor
+    # module without a kernel that carries one leaves the device with no
+    # power button, or no DAC.
+    if (args.mainline_keys or args.mainline_i2c) and not args.kernel:
+        die("--mainline-keys/--mainline-i2c need --kernel: the vendor module "
+            "is only safe to drop from an image whose kernel replaces it")
 
     if args.kernel:
         kernel = next((i for i in images if i["type"] == "kernel"), None)
@@ -2868,6 +3051,16 @@ def main():
                       "off' and R84's idle timer actually power the chip "
                       "down instead of just downing the interface)")
 
+            which = [w for w, on in (("keys", args.mainline_keys),
+                                      ("i2c", args.mainline_i2c)) if on]
+            if which:
+                err = drop_vendor_modules(root, which)
+                if err:
+                    die(f"--mainline-{'/'.join(which)}: {err}")
+                print("patched module_driver (dropped "
+                      f"{', '.join(MAINLINE_REPLACES[w] for w in which)}; "
+                      "the kernel's mainline drivers replace them)")
+
             if enable_rtc32k_at_boot(root):
                 print("patched module_driver/soc_utils.sh (rtc32k_init_on=1: "
                       "enable the 32kHz LPO at module load)")
@@ -3026,6 +3219,23 @@ def main():
                     bpatched = btext
                     print(f"patched {BT_INIT} (dropped --enable_lpm: the chip "
                           f"sleeps unwakeably without cywdhd's wake line)")
+                # bt_resume starts the chip the same way (it is what stock
+                # runs on the way out of suspend), and was missed: every
+                # custom-kernel image shipped it with --enable_lpm, harmless
+                # only because nothing ran it. The release check that should
+                # have caught it ("no enable_lpm anywhere") was run with a
+                # grep that printed nothing for -c.
+                rtarget = os.path.join(root, "usr/bin/bt_resume")
+                if os.path.exists(rtarget):
+                    # surrogateescape: the stock script carries GBK comments,
+                    # which are not UTF-8; they go back out byte for byte.
+                    with open(rtarget, encoding="utf-8", errors="surrogateescape") as fh:
+                        rtext = fh.read()
+                    rnolpm = bt_disable_lpm(rtext)
+                    if rnolpm is not None:
+                        with open(rtarget, "w", encoding="utf-8", errors="surrogateescape") as fh:
+                            fh.write(rnolpm)
+                        print("patched usr/bin/bt_resume (dropped --enable_lpm, same as bt_init)")
 
             reordered = reorder_bt_init_radio_first(btext)
             if reordered is None:
@@ -3040,6 +3250,15 @@ def main():
             if bpatched is not None:
                 with open(btarget, "w") as fh:
                     fh.write(btext)
+
+        # After every bt_init patch above: this renames the daemon in the
+        # finished scripts, including lines those patches added.
+        if args.bluealsa5:
+            done = install_bluealsa5(root, args.bluealsa5)
+            scripts = [t for t in done if t.startswith(("usr/bin/bt", "usr/bin/blue", "etc/init.d/"))
+                       and not t.startswith(("usr/bin/bluealsa", "usr/bin/bluetooth"))]
+            print(f"installed BlueALSA 5 / BlueZ 5.87 ({len(done)} files; "
+                  f"daemon renamed in {', '.join(scripts) or 'no scripts'})")
 
         about = enable_about_tile(root)
         if about:

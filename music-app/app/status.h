@@ -32,6 +32,12 @@ typedef struct { char mac[18]; char name[48]; int rssi; int paired; } bt_found_d
 /* The a2dp sink PCM of the connected headset, as bluealsa names it, or 0 if
  * there is none. Same match bt_pcm_path() documents internally. */
 int st_bt_pcm_path(char *out, unsigned n);
+/* BlueALSA's control tool: "bluealsa-cli" on HiBy's stock BlueALSA 4, or
+ * "bluealsactl" once the BlueALSA 5 base-image overlay is installed (the
+ * tool was renamed; its subcommands kept their names). st_ba_v5() says which
+ * daemon is running, for the few places whose behaviour differs. */
+const char *st_ba_ctl(void);
+int st_ba_v5(void);
 void bt_scan_start(void);
 int  bt_scan_devices(bt_found_dev_t *out, int max);   /* returns count found, <= max */
 /* Fills in the rssi and paired fields of an already-populated

@@ -26,6 +26,9 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <pthread.h>
+#include <time.h>
+#include <unistd.h>
 
 #include "vendor/sqlite3.h"
 #include "library.h"
@@ -81,7 +84,73 @@ static int is_mp3_path(const char *path) {
     return dot && strcasecmp(dot, ".mp3") == 0;
 }
 
+/* A damaged library, found rather than read around.
+ *
+ * scanner.c never writes the live database in place any more (it publishes
+ * each pass by rename), so this should not happen through Libra; but a file
+ * on flash can still be damaged underneath it, and a corrupt page answers
+ * some queries and fails others -- a library missing albums for no visible
+ * reason. So the file is checked once per run, on a thread of its own:
+ * quick_check reads every page, a few hundred ms on this CPU for a full
+ * card, which the startup path should not pay. A failure moves the file
+ * aside (kept, not deleted, in case it is wanted) and asks for a rebuild;
+ * lib_take_damaged() hands that to the UI thread, which owns g_db. */
+static volatile int g_lib_damaged;
+
+static void *lib_verify(void *arg) {
+    (void)arg;
+    sqlite3 *vdb = NULL;
+    if (sqlite3_open_v2(SCANNER_DB_PATH, &vdb, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        if (vdb) sqlite3_close(vdb);
+        return NULL;                       /* no scanned library yet: nothing to check */
+    }
+    char verdict[80] = "";
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(vdb, "pragma quick_check", -1, &st, NULL) == SQLITE_OK) {
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const unsigned char *v = sqlite3_column_text(st, 0);
+            snprintf(verdict, sizeof(verdict), "%s", v ? (const char *)v : "");
+        } else {
+            snprintf(verdict, sizeof(verdict), "%s", sqlite3_errmsg(vdb));
+        }
+        sqlite3_finalize(st);
+    } else {
+        snprintf(verdict, sizeof(verdict), "%s", sqlite3_errmsg(vdb));
+    }
+    sqlite3_close(vdb);
+    if (!strcmp(verdict, "ok")) return NULL;
+    for (char *c = verdict; *c; c++) if (*c == '\n' || *c == '\r') *c = ' ';
+    rename(SCANNER_DB_PATH, SCANNER_DB_PATH ".damaged");
+    g_lib_damaged = 1;
+    FILE *f = fopen("/usr/data/music.log", "a");
+    if (f) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        fprintf(f, "[%6ld.%03ld] [library] %s failed its check (%s) -- moved aside, rebuilding\n",
+                (long)ts.tv_sec, ts.tv_nsec / 1000000L, SCANNER_DB_PATH, verdict);
+        fclose(f);
+    }
+    return NULL;
+}
+
+int lib_take_damaged(void) {
+    if (!g_lib_damaged) return 0;
+    g_lib_damaged = 0;
+    return 1;
+}
+
+int lib_reopen(void) {
+    lib_close();
+    return lib_open();
+}
+
 int lib_open(void) {
+    static int verify_started;
+    if (!verify_started) {
+        verify_started = 1;
+        pthread_t t;
+        if (pthread_create(&t, NULL, lib_verify, NULL) == 0) pthread_detach(t);
+    }
     if (g_db) return 0;
     /* nomutex: only the UI thread touches this handle. */
     int rc = sqlite3_open_v2(SCANNER_DB_PATH, &g_db,

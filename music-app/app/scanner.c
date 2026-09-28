@@ -61,6 +61,7 @@
 #include <dirent.h>
 #include <pthread.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
 
@@ -111,6 +112,10 @@ static volatile int g_scan_started, g_scan_running;
 static volatile int g_scanned, g_written;
 static volatile int g_kick;
 static volatile int g_usb_paused;
+static volatile int g_generation;   /* bumped each time a new database is published */
+static int g_have_old;              /* the previous generation is attached as "old" */
+
+int scanner_generation(void) { return g_generation; }
 
 int scanner_scan_running(void) { return g_scan_running; }
 
@@ -239,9 +244,14 @@ static int scan_one(sqlite3 *widb, const char *real, const struct stat *st) {
      * inside are AAC or Apple Lossless -- those get re-probed once and then
      * carry LIB_FORMAT_ALAC or LIB_FORMAT_AAC_M4A, so this never fires for
      * them again. A row with an album and a settled format is left alone. */
-    static const char *check_sql = "select mtime, album, format from MEDIA_TABLE where path = ?";
+    /* Asked of the previous generation (see scan_pass()), attached as
+     * "old": the database being built starts empty. A file that is current
+     * there is copied across as it stands rather than re-read. With no
+     * previous generation -- the first scan, or one moved aside as corrupt
+     * -- the prepare fails and every file is read. */
+    static const char *check_sql = "select mtime, album, format from old.MEDIA_TABLE where path = ?";
     sqlite3_stmt *cst;
-    if (sqlite3_prepare_v2(widb, check_sql, -1, &cst, NULL) == SQLITE_OK) {
+    if (g_have_old && sqlite3_prepare_v2(widb, check_sql, -1, &cst, NULL) == SQLITE_OK) {
         sqlite3_bind_text(cst, 1, path, -1, SQLITE_TRANSIENT);
         int current = 0;
         if (sqlite3_step(cst) == SQLITE_ROW &&
@@ -253,7 +263,25 @@ static int scan_one(sqlite3 *widb, const char *real, const struct stat *st) {
             current = alb && alb[0] && !m4a_unresolved;
         }
         sqlite3_finalize(cst);
-        if (current) return 0;
+        if (current) {
+            static const char *copy_sql =
+                "insert or replace into main.MEDIA_TABLE "
+                "(path, mtime, name, format, bit, sample_rate, bit_rate, end_time, "
+                " artist, album, album_artist, genre, ctime) "
+                "select path, mtime, name, format, bit, sample_rate, bit_rate, end_time, "
+                " artist, album, album_artist, genre, ctime "
+                "from old.MEDIA_TABLE where path = ?";
+            sqlite3_stmt *kst;
+            int copied = 0;
+            if (sqlite3_prepare_v2(widb, copy_sql, -1, &kst, NULL) == SQLITE_OK) {
+                sqlite3_bind_text(kst, 1, path, -1, SQLITE_TRANSIENT);
+                copied = sqlite3_step(kst) == SQLITE_DONE;
+                sqlite3_finalize(kst);
+            }
+            /* A row that would not copy (a damaged page in the old file)
+             * falls through and is read afresh, like a new file. */
+            if (copied) return 0;
+        }
     }
 
     char name[LIB_NAME_LEN], artist[LIB_NAME_LEN], album[LIB_NAME_LEN];
@@ -389,18 +417,49 @@ static void scan_dir(sqlite3 *widb, const char *dir, int *batch, int depth) {
     closedir(d);
 }
 
-static void *scan_worker(void *arg) {
-    (void)arg;
-    set_low_priority();
+/* One pass, published atomically.
+ *
+ * This used to write straight into the live database with SQLite's journal
+ * and fsyncs both switched off (see index.c's header for why they are off),
+ * committing every 30 files. Fine while nothing goes wrong, but a forced
+ * power-off, a supervisor reboot or a flat battery in the middle of a
+ * transaction could leave the only copy of the library half-written, and
+ * nothing would ever notice or repair it. It also never removed a row, so a
+ * file deleted from the card stayed in the library for good.
+ *
+ * Now each pass builds a complete new database beside the live one --
+ * copying across every row whose file is unchanged (no tag re-read), reading
+ * only new and changed files -- and publishes it with a rename once it is
+ * finished and on flash. Until that rename the live library is untouched, so
+ * an interrupted pass costs nothing but the pass; and a pass lists only what
+ * it found, so deleted files drop out. Same idea as compas-player's
+ * tagcache generations (a new generation is invisible until one pointer
+ * switch commits it), done here with the filesystem's own atomic rename.
+ *
+ * Two cases do not publish: a pass stopped by USB storage mode (incomplete
+ * by definition), and a pass that found no audio at all -- an unreadable or
+ * missing card should not be able to empty the library. */
+#define SCANNER_DB_NEW SCANNER_DB_PATH ".new"
 
+static int fsync_path(const char *path, int dir) {
+    int fd = open(path, dir ? O_RDONLY | O_DIRECTORY : O_RDONLY);
+    if (fd < 0) return -1;
+    int rc = fsync(fd);
+    close(fd);
+    return rc;
+}
+
+static void scan_pass(void) {
+    unlink(SCANNER_DB_NEW);
+    unlink(SCANNER_DB_NEW "-journal");
     sqlite3 *widb = NULL;
-    int orc = sqlite3_open_v2(SCANNER_DB_PATH, &widb,
+    int orc = sqlite3_open_v2(SCANNER_DB_NEW, &widb,
                               SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix-none");
     if (orc != SQLITE_OK) {
-        slog("[scanner] cannot open %s rc=%d: %s\n", SCANNER_DB_PATH, orc,
+        slog("[scanner] cannot create %s rc=%d: %s\n", SCANNER_DB_NEW, orc,
              widb ? sqlite3_errmsg(widb) : sqlite3_errstr(orc));
         if (widb) sqlite3_close(widb);
-        return NULL;
+        return;
     }
     sqlite3_busy_timeout(widb, 500);
     sqlite3_exec(widb, "pragma journal_mode = off", NULL, NULL, NULL);
@@ -410,36 +469,76 @@ static void *scan_worker(void *arg) {
         slog("[scanner] schema create failed: %s\n", errmsg ? errmsg : "?");
         sqlite3_free(errmsg);
         sqlite3_close(widb);
-        return NULL;
+        unlink(SCANNER_DB_NEW);
+        return;
     }
-    slog("[scanner] db opened, schema ready\n");
+    g_have_old = 0;
+    if (access(SCANNER_DB_PATH, R_OK) == 0) {
+        char att[160];
+        snprintf(att, sizeof(att), "attach database '%s' as old", SCANNER_DB_PATH);
+        g_have_old = sqlite3_exec(widb, att, NULL, NULL, NULL) == SQLITE_OK;
+    }
 
-    for (;;) {
-        g_scan_running = 1;
-        g_scanned = 0; g_written = 0;
-        int batch = 0;
-        sqlite3_exec(widb, "begin", NULL, NULL, NULL);
-        /* The whole card, not just a Music folder -- this device's own
-         * default download/import paths don't enforce one, and scan_dir()'s
-         * own Podcasts/Audiobooks exclusion already keeps those two
-         * subsystems' own files out of this table regardless of where they
-         * sit. */
-        scan_dir(widb, SD_ROOT, &batch, 0);
-        sqlite3_exec(widb, "commit", NULL, NULL, NULL);
+    g_scan_running = 1;
+    g_scanned = 0; g_written = 0;
+    int batch = 0;
+    sqlite3_exec(widb, "begin", NULL, NULL, NULL);
+    /* The whole card, not just a Music folder -- this device's own
+     * default download/import paths don't enforce one, and scan_dir()'s
+     * own Podcasts/Audiobooks exclusion already keeps those two
+     * subsystems' own files out of this table regardless of where they
+     * sit. */
+    scan_dir(widb, SD_ROOT, &batch, 0);
+    int committed = sqlite3_exec(widb, "commit", NULL, NULL, NULL) == SQLITE_OK;
+    if (g_have_old) sqlite3_exec(widb, "detach database old", NULL, NULL, NULL);
+    g_have_old = 0;
+    int closed = sqlite3_close(widb) == SQLITE_OK;
+    int stopped = g_usb_paused;
+    int seen = g_scanned, written = g_written;
+
+    if (stopped || !committed || !closed || seen == 0) {
+        unlink(SCANNER_DB_NEW);
         g_scan_running = 0;
-        slog("[scanner] scan pass done: %d files seen, %d (re)written\n", g_scanned, g_written);
+        slog("[scanner] pass not published (%s): %d files seen, library unchanged\n",
+             stopped ? "stopped for USB" : !committed || !closed ? "write failed" : "no audio found",
+             seen);
+        return;
+    }
+    if (fsync_path(SCANNER_DB_NEW, 0) != 0 || rename(SCANNER_DB_NEW, SCANNER_DB_PATH) != 0) {
+        unlink(SCANNER_DB_NEW);
+        g_scan_running = 0;
+        slog("[scanner] could not publish the new library, keeping the old one\n");
+        return;
+    }
+    fsync_path("/usr/data", 1);   /* the rename itself, not only the data */
+    g_generation++;
+    g_scan_running = 0;
+    slog("[scanner] scan pass published: %d files, %d (re)read\n", seen, written);
+    /* The index is built from this database, so it runs on what was just
+     * published -- kicked from here rather than alongside this pass, which
+     * had it reading the previous generation (and, before, racing this
+     * pass's in-place writes). */
+    index_rescan_now();
+}
 
-        /* Manual only: waits here indefinitely for scanner_rescan_now() (the
-         * Settings row), no periodic re-run -- see index.c's own identical
-         * change for why. Auto-rescanning every 30 minutes made sense back
-         * when this ran quietly alongside hiby_player's own live scanner;
-         * now that this is the sole source of what files exist at all, a
-         * manual "check now" (which the user actually controls, e.g. right
-         * after copying new music onto the card) is both cheaper and more
-         * predictable than a timer neither the UI nor the user can see
-         * coming. */
+static void *scan_worker(void *arg) {
+    (void)arg;
+    set_low_priority();
+    /* Manual only: waits here indefinitely for scanner_rescan_now() (the
+     * Settings row), no periodic re-run -- see index.c's own identical
+     * change for why. Auto-rescanning every 30 minutes made sense back
+     * when this ran quietly alongside hiby_player's own live scanner;
+     * now that this is the sole source of what files exist at all, a
+     * manual "check now" (which the user actually controls, e.g. right
+     * after copying new music onto the card) is both cheaper and more
+     * predictable than a timer neither the UI nor the user can see
+     * coming. The kick that started the thread is the first request; the
+     * thread used to run a pass on starting and then see that same kick
+     * still set, so the first "Scan library" after a boot scanned twice. */
+    for (;;) {
         while (!g_kick) sleep(1);
         g_kick = 0;
+        scan_pass();
     }
     return NULL;
 }
@@ -463,9 +562,8 @@ void scanner_scan_start(void) {
  * is one indexed lookup, not a re-read. */
 void scanner_rescan_now(void) {
     if (g_usb_paused) return;
-    scanner_scan_start();
     g_kick = 1;
-    index_rescan_now();
+    scanner_scan_start();
 }
 
 void scanner_pause_for_usb(int paused) {
