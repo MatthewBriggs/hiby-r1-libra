@@ -2978,7 +2978,7 @@ static int settings_content_rows(void) {
  * pushed by hand, not by CI against a tagged commit), so this stays a
  * literal that a human edits; the discipline is remembering to, not the
  * mechanism. */
-#define LIBRARY_VERSION "0.59"
+#define LIBRARY_VERSION "0.59.1"
 
 /* A custom-built kernel keeps uname()'s own release string exactly
  * "4.4.94+" on purpose -- that string is also the vermagic every one of the
@@ -3746,10 +3746,11 @@ static int  wifi_saved_id[WIFI_SAVED_MAX];
 static int  wifi_saved_n;
 static void wifi_saved_refresh(void) {
     wifi_saved_n = 0;
-    FILE *p = popen("wpa_cli list_networks 2>/dev/null", "r");
-    if (!p) return;
-    char line[256];
-    while (wifi_saved_n < WIFI_SAVED_MAX && fgets(line, sizeof(line), p)) {
+    /* Bounded (st_cmd()): this is the UI thread. */
+    char out[4096];
+    st_cmd("wpa_cli list_networks 2>/dev/null", out, sizeof(out), ST_CMD_QUICK_MS, 0);
+    char *cur = out, *line;
+    while (wifi_saved_n < WIFI_SAVED_MAX && (line = st_nextline(&cur)) != NULL) {
         char *end;
         long id = strtol(line, &end, 10);
         if (end == line || *end != '\t') continue;
@@ -3760,7 +3761,6 @@ static void wifi_saved_refresh(void) {
         wpa_unescape(name, strlen(name), wifi_saved[wifi_saved_n], sizeof(wifi_saved[0]));
         wifi_saved_id[wifi_saved_n++] = (int)id;
     }
-    pclose(p);
 }
 static int wifi_is_saved(const char *ssid) {
     for (int i = 0; i < wifi_saved_n; i++)
@@ -3773,12 +3773,13 @@ static void wifi_remove_saved(const char *ssid) {
     for (int i = 0; i < wifi_saved_n; i++) {
         if (strcmp(wifi_saved[i], ssid)) continue;
         snprintf(cmd, sizeof(cmd), "wpa_cli remove_network %d >/dev/null 2>&1", wifi_saved_id[i]);
-        if (system(cmd) == -1) mlog("[music] wifi: remove_network failed\n");
+        if (st_cmd(cmd, NULL, 0, ST_CMD_QUICK_MS, 0) < 0) mlog("[music] wifi: remove_network failed\n");
     }
 }
 static void wifi_forget(const char *ssid) {
     wifi_remove_saved(ssid);
-    if (system("wpa_cli save_config >/dev/null 2>&1") == -1) mlog("[music] wifi: save_config failed\n");
+    if (st_cmd("wpa_cli save_config >/dev/null 2>&1", NULL, 0, ST_CMD_QUICK_MS, 0) < 0)
+        mlog("[music] wifi: save_config failed\n");
     wifi_saved_refresh();
     mlog("[music] wifi: forgot %s\n", ssid);
 }
@@ -3816,15 +3817,13 @@ typedef struct { char ssid[64]; char pw[128]; } wifi_join_t;
 static void *wifi_connect_worker(void *arg) {
     wifi_join_t *j = arg;
     char id[16] = "";
-    FILE *p = popen("wpa_cli -i wlan0 add_network 2>/dev/null", "r");
-    if (p) {
-        char line[64];
-        while (fgets(line, sizeof(line), p)) {
-            char *e;
-            long v = strtol(line, &e, 10);
-            if (e != line && (*e == '\n' || *e == '\0')) snprintf(id, sizeof(id), "%ld", v);
-        }
-        pclose(p);
+    char out[256];
+    st_cmd("wpa_cli -i wlan0 add_network 2>/dev/null", out, sizeof(out), ST_CMD_QUICK_MS, 0);
+    char *cur = out, *line;
+    while ((line = st_nextline(&cur)) != NULL) {
+        char *e;
+        long v = strtol(line, &e, 10);
+        if (e != line && (*e == '\r' || *e == '\0')) snprintf(id, sizeof(id), "%ld", v);
     }
     if (!id[0]) { mlog("[music] wifi: add_network failed\n"); free(j); return NULL; }
     char hex[160];
@@ -12446,14 +12445,15 @@ static int deep_suspend(long off_due) {
         radios_down = 1;
         if (radios_wifi) {
             mlog("[music] suspend: wifi off\n");
-            if (system("/usr/bin/wifi_off.sh >/dev/null 2>&1") == -1) { }
+            st_cmd("/usr/bin/wifi_off.sh >/dev/null 2>&1", NULL, 0, ST_CMD_SLOW_MS, 0);
         }
         /* Adapter off first so links are dropped properly (an A2DP link
          * alive into suspend reportedly reboots the device), then hci0
          * down: the chip stays powered with its firmware loaded -- see
          * suspend_radios_restore() for why, and for the fallback. */
         mlog("[music] suspend: bluetooth adapter off, hci0 down\n");
-        if (system("bt-adapter --set Powered Off >/dev/null 2>&1; hciconfig hci0 down >/dev/null 2>&1") == -1) { }
+        st_cmd("bt-adapter --set Powered Off >/dev/null 2>&1; hciconfig hci0 down >/dev/null 2>&1",
+               NULL, 0, ST_CMD_QUICK_MS, 0);
     }
     sync();
 

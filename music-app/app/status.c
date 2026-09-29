@@ -28,6 +28,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <poll.h>
 
 /* Milliseconds on the monotonic clock, for the short answer caches below. */
 static long long mono_ms(void) {
@@ -70,6 +71,106 @@ int st_spawn(const char *cmd) {
     int st;
     while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
     return 0;
+}
+
+/* Bounded replacement for popen()/system(). Both of those wait as long as the
+ * command takes, and several commands this app runs can take forever: BlueZ
+ * 5.87's bluetoothctl waits indefinitely for a bluetoothd that is not running
+ * -- the state every full Bluetooth restart passes through -- and a D-Bus
+ * client can hang on a daemon that is wedged. Some of these run on the UI
+ * thread (the Bluetooth rows are drawn from them), where one hang is a frozen
+ * app the supervisor cannot see, since the process is still alive. popen()
+ * also hands the child every open descriptor, the playback PCM included, so a
+ * child that hangs keeps the audio device busy with it. compas-player runs
+ * every subprocess this way, with a 15 s default. */
+static void st_cmd_log(const char *cmd, int ms) {
+    FILE *f = fopen("/usr/data/music.log", "a");
+    if (!f) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    fprintf(f, "[%6ld.%03ld] [status] command timed out after %d ms, killed: %.120s\n",
+            (long)ts.tv_sec, ts.tv_nsec / 1000000L, ms, cmd);
+    fclose(f);
+}
+
+static long st_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+int st_cmd(const char *cmd, char *out, unsigned n, int timeout_ms, int nice_inc) {
+    if (out && n) out[0] = '\0';
+    int pfd[2];
+    if (pipe(pfd) < 0) return -1;
+    pid_t pid = fork();
+    if (pid < 0) { close(pfd[0]); close(pfd[1]); return -1; }
+    if (pid == 0) {
+        setpgid(0, 0);
+        int nul = open("/dev/null", O_RDWR);
+        if (nul >= 0) { dup2(nul, 0); dup2(nul, 2); }
+        dup2(pfd[1], 1);
+        close_inherited_fds();
+        if (nice_inc && nice(nice_inc) == -1) { /* best effort */ }
+        signal(SIGPIPE, SIG_DFL);
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+    setpgid(pid, pid);   /* also from here, so a kill cannot race the child's own */
+    close(pfd[1]);
+
+    long deadline = st_now_ms() + timeout_ms;
+    unsigned used = 0;
+    int timed_out = 0;
+    for (;;) {
+        long left = deadline - st_now_ms();
+        if (left <= 0) { timed_out = 1; break; }
+        struct pollfd pf = { .fd = pfd[0], .events = POLLIN };
+        int r = poll(&pf, 1, (int)left);
+        if (r < 0) { if (errno == EINTR) continue; break; }
+        if (r == 0) { timed_out = 1; break; }
+        char tmp[512];
+        ssize_t k = read(pfd[0], tmp, sizeof(tmp));
+        if (k < 0 && errno == EINTR) continue;
+        if (k <= 0) break;                                   /* EOF */
+        if (out && used + 1 < n) {
+            unsigned take = (unsigned)k;
+            if (used + take >= n) take = n - used - 1;
+            memcpy(out + used, tmp, take);
+            used += take;
+            out[used] = '\0';
+        }
+    }
+    close(pfd[0]);
+
+    int st = 0;
+    while (!timed_out) {
+        pid_t r = waitpid(pid, &st, WNOHANG);
+        if (r == pid) break;
+        if (r < 0 && errno != EINTR) { st = -1; break; }
+        if (st_now_ms() >= deadline) { timed_out = 1; break; }
+        usleep(5000);
+    }
+    /* Kill the whole group before reaping anything: the shell may have exited
+     * already while something it started holds the pipe (that is what ran the
+     * clock out), and reaping the shell first would leave that running. The
+     * group outlives its leader while any member does. */
+    if (timed_out) {
+        kill(-pid, SIGKILL);
+        kill(pid, SIGKILL);
+        while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    }
+    if (timed_out) { st_cmd_log(cmd, timeout_ms); return ST_CMD_TIMEOUT; }
+    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+char *st_nextline(char **cursor) {
+    char *line = *cursor;
+    if (!line || !*line) return NULL;
+    char *nl = strchr(line, '\n');
+    if (nl) { *nl = '\0'; *cursor = nl + 1; }
+    else *cursor = line + strlen(line);
+    return line;
 }
 
 /* The same, for a fixed program and argument list: no shell, so nothing in
@@ -129,20 +230,11 @@ int st_headset(void) {
  * mentions the thing it wants rather than matching a fixed layout, and the raw
  * first line is logged once so it can be checked against reality.
  */
+/* Status reads: bounded (st_cmd()), and niced -- nothing waits on them but a
+ * status row, and several are D-Bus clients of bluealsad, the process doing
+ * the Bluetooth encoding on this single core. */
 static void run_cmd(const char *cmd, char *out, unsigned n) {
-    out[0] = '\0';
-    FILE *p = popen(cmd, "r");
-    if (!p) return;
-    unsigned used = 0;
-    char line[256];
-    while (used + 1 < n && fgets(line, sizeof(line), p)) {
-        unsigned len = (unsigned)strlen(line);
-        if (used + len >= n) len = n - used - 1;
-        memcpy(out + used, line, len);
-        used += len;
-    }
-    out[used] = '\0';
-    pclose(p);
+    st_cmd(cmd, out, n, ST_CMD_QUICK_MS, 10);
 }
 
 /* R-scanwifi: wpa_cli escapes any non-printable/non-ASCII byte in an SSID
@@ -336,8 +428,11 @@ void st_bt_name(char *out, unsigned n) {
                 mac[k++] = (*p == '_') ? ':' : *p;
             mac[k] = '\0';
             char cmd[128], buf[512];
-            snprintf(cmd, sizeof(cmd),
-                     "printf 'info %s\nquit\n' | bluetoothctl 2>/dev/null", mac);
+            /* Command-line form, not commands piped into the interactive
+             * shell: under BlueZ 5.87 the piped form takes 0.4-1 s (it waits
+             * out the session's async announcements), this ~0.2 s, and this
+             * is drawn from the UI thread. */
+            snprintf(cmd, sizeof(cmd), "bluetoothctl info %s 2>/dev/null", mac);
             run_cmd(cmd, buf, sizeof(buf));
             char *nm = strstr(buf, "Name: ");
             if (nm) {
@@ -502,21 +597,28 @@ static int bt_rssi_recall(const char *mac) {
 
 void bt_fill_details(bt_found_dev_t *devs, int n) {
     if (n <= 0) return;
-    FILE *p = popen("dbus-send --system --print-reply --dest=org.bluez / "
-                    "org.freedesktop.DBus.ObjectManager.GetManagedObjects 2>/dev/null", "r");
-    if (!p) {
+    /* Every object bluez has, so it runs to tens of KB with a few devices
+     * known: on the heap, not the caller's stack. */
+    enum { OBJ_MAX = 96 * 1024 };
+    char *objs = malloc(OBJ_MAX);
+    if (objs)
+        st_cmd("dbus-send --system --print-reply --dest=org.bluez / "
+               "org.freedesktop.DBus.ObjectManager.GetManagedObjects 2>/dev/null",
+               objs, OBJ_MAX, ST_CMD_QUICK_MS, 10);
+    if (!objs || !objs[0]) {
+        free(objs);
         for (int i = 0; i < n; i++) {
             devs[i].rssi = bt_rssi_recall(devs[i].mac);
             devs[i].paired = bt_is_paired(devs[i].mac);
         }
         return;
     }
-    char line[512];
+    char *cur = objs, *line;
     char mac[18] = "";
     int want_value = 0;            /* 0 none, 1 expecting RSSI, 2 expecting Paired */
     int saw_paired_property = 0;
     for (int i = 0; i < n; i++) devs[i].paired = 0;
-    while (fgets(line, sizeof(line), p)) {
+    while ((line = st_nextline(&cur)) != NULL) {
         const char *dev = strstr(line, "/org/bluez/");
         if (dev) {
             /* ".../dev_XX_XX_XX_XX_XX_XX" -> "XX:XX:XX:XX:XX:XX". Anything
@@ -561,7 +663,7 @@ void bt_fill_details(bt_found_dev_t *devs, int n) {
             want_value = 0;
         }
     }
-    pclose(p);
+    free(objs);
     /* Applied from the cache rather than straight from the parse, so a device
      * bluez reported a moment ago but has since dropped the property for keeps
      * its last reading instead of reverting to unknown. */
@@ -659,7 +761,7 @@ static void bt_ctl(const char *verb, const char *mac) {
     if (!bt_mac_ok(mac)) return;
     char cmd[160];
     snprintf(cmd, sizeof(cmd), "printf '%s %s\\nquit\\n' | bluetoothctl >/dev/null 2>&1", verb, mac);
-    if (system(cmd) == -1) return;
+    st_cmd(cmd, NULL, 0, ST_CMD_SLOW_MS, 0);
 }
 void bt_forget(const char *mac)     { bt_ctl("remove", mac); }
 void bt_disconnect(const char *mac) { bt_ctl("disconnect", mac); }
@@ -693,7 +795,7 @@ int bt_pair_result(const char *mac) {
  * seconds; the caller polls wifi_scan_results() same as the Bluetooth
  * screen already polls bt_scan_devices(). */
 void wifi_scan_start(void) {
-    if (system("wpa_cli -i wlan0 scan >/dev/null 2>&1") == -1) return;
+    st_cmd("wpa_cli -i wlan0 scan >/dev/null 2>&1", NULL, 0, ST_CMD_QUICK_MS, 0);
 }
 
 /* One row per SSID, strongest signal first -- `wpa_cli scan_results` lists
@@ -842,13 +944,9 @@ static int bt_on_cached = -1;
 int st_bt_on(void) {
     long long now = mono_ms();
     if (bt_on_cached >= 0 && now - bt_on_when < EMPTY_TTL_MS) return bt_on_cached;
-    FILE *p = popen("hciconfig hci0 2>/dev/null", "r");
-    if (!p) return 0;
-    char line[256];
-    int up = 0;
-    while (fgets(line, sizeof(line), p))
-        if (strstr(line, "UP RUNNING")) { up = 1; break; }
-    pclose(p);
+    char out[512];
+    run_cmd("hciconfig hci0 2>/dev/null", out, sizeof(out));
+    int up = strstr(out, "UP RUNNING") != NULL;
     bt_on_cached = up;
     bt_on_when = now;
     return up;

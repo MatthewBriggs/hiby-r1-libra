@@ -5,6 +5,22 @@
  * open files; and run a program with an argument list, no shell involved. */
 int  st_spawn(const char *cmd);
 int  st_run_argv(char *const argv[]);
+/* Runs a short shell command with a deadline, capturing its stdout into out
+ * (NULL/0 to discard). The child gets none of this app's open files, stdin
+ * and stderr on /dev/null, its own process group, and `nice` added to its
+ * priority. Past timeout_ms -- counted over output and exit together, so a
+ * tool that keeps printing while stuck still times out -- the whole group
+ * is killed. Returns the exit status, ST_CMD_TIMEOUT, or -1 if it could not
+ * run. out is always NUL-terminated, holding whatever arrived in time. */
+#define ST_CMD_TIMEOUT (-2)
+int  st_cmd(const char *cmd, char *out, unsigned n, int timeout_ms, int nice);
+/* Timeouts for the two kinds of caller: a status read, and something that
+ * waits on a device (a codec switch, Wi-Fi going down). */
+#define ST_CMD_QUICK_MS 5000
+#define ST_CMD_SLOW_MS  15000
+/* Walks captured output a line at a time, in place: returns the next line
+ * with its newline removed, or NULL at the end. *cursor starts at the buffer. */
+char *st_nextline(char **cursor);
 int st_battery_pct(void);    /* 0-100, -1 unknown */
 int st_charging(void);
 int st_headset(void);        /* jack occupied */

@@ -1453,9 +1453,170 @@ static uint32_t isqrt64(uint64_t v) {
     return (uint32_t)r;
 }
 
+/* Slices to columns. More slices than columns (every real track): the column
+ * is the mean power of the slices it covers. Fewer (a clip of a few seconds):
+ * each column repeats the slice under it. */
+static void env_bin(const uint64_t *pw, const uint32_t *cnt, int slices,
+                    uint32_t *level, int n) {
+    for (int b = 0; b < n; b++) {
+        int s0 = (int)((int64_t)b * slices / n);
+        int s1 = (int)((int64_t)(b + 1) * slices / n);
+        if (s1 <= s0) s1 = s0 + 1;
+        uint64_t p = 0, c = 0;
+        for (int i = s0; i < s1 && i < slices; i++) { p += pw[i]; c += cnt[i]; }
+        level[b] = c ? isqrt64(p / c) : 0;
+    }
+}
+
+/* An hour-long MP3 -- a podcast episode, near enough every time -- measured by
+ * sampling rather than decoding all of it.
+ *
+ * Reported live: a podcast's waveform never appeared while it played over
+ * Bluetooth. The worker runs at SCHED_IDLE, and that episode at 1.4x (WSOLA)
+ * plus the 48 -> 44.1 kHz conversion to the headset's link took 48% of the core,
+ * bluealsa's encoder another 14%: the worker was measured at ~4% of the CPU,
+ * against a full decode of an hour of audio. It would have finished hours
+ * after the episode.
+ *
+ * A column of a one-hour waveform covers 25 seconds; it does not need every
+ * frame in it. So one frame in every ENV_MP3_PERIOD is decoded and measured,
+ * and the rest are only parsed -- drmp3dec_decode_frame() with no output
+ * buffer reads the header and side info and keeps the bit reservoir in step,
+ * but skips dequantisation and synthesis, which is where the time goes.
+ *
+ * Chosen by measurement, on a real one-hour episode (speech, the hard case:
+ * its level moves far faster than music's), against a full decode of the
+ * same file, 144 columns on the 0-235 scale:
+ *
+ *     1 in 4   3.9x faster   correlation 0.987   mean diff 2.5  worst 10
+ *     1 in 5   4.8x          0.984               4.2            16
+ *     1 in 8   7.3x          0.93                6.2            19
+ *     2 in 16  7.2x          0.86                9.5            33
+ *
+ * Spread single frames beat clusters at the same cost. Throwing away the
+ * first frame after a skipped run (its synthesis history is stale) was tried
+ * and measured worse: the transient is smaller than the sample it costs.
+ *
+ * Layer III only (the parse-only shortcut is Layer III's); anything else is
+ * left to the full decode. Returns as audio_envelope() does. */
+#define ENV_MP3_PERIOD 5
+#define ENV_MP3_BUF    16384
+
+static int mp3_envelope_sampled(const char *path, uint32_t *level, int n,
+                                int (*keep_going)(void *), void *ctx) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    unsigned char *buf = malloc(ENV_MP3_BUF);
+    short *pcm = malloc(DRMP3_MAX_SAMPLES_PER_FRAME * sizeof(short));
+    uint64_t *pw = calloc(ENV_SLICES, sizeof(uint64_t));
+    uint32_t *cnt = calloc(ENV_SLICES, sizeof(uint32_t));
+    drmp3dec *dec = malloc(sizeof(drmp3dec));
+    int rc = 0;
+    if (!buf || !pcm || !pw || !cnt || !dec) goto out;
+    drmp3dec_init(dec);
+
+    /* Past an ID3v2 tag: cover art can make it hundreds of KB, all of which
+     * the frame search below would otherwise scan byte by byte. */
+    unsigned char hdr[10];
+    if (fread(hdr, 1, 10, f) == 10 && !memcmp(hdr, "ID3", 3)) {
+        long sz = ((long)(hdr[6] & 0x7F) << 21) | ((long)(hdr[7] & 0x7F) << 14) |
+                  ((long)(hdr[8] & 0x7F) << 7) | (hdr[9] & 0x7F);
+        fseek(f, 10 + sz, SEEK_SET);
+    } else {
+        fseek(f, 0, SEEK_SET);
+    }
+
+    size_t have = 0, pos = 0;
+    int eof = 0;
+    uint32_t slice_len = 0, in_slice = 0;
+    int cur = 0;
+    unsigned long frame = 0;
+    int layer3 = -1;
+    rc = 1;
+    for (;;) {
+        if ((frame & 63) == 0 && keep_going && !keep_going(ctx)) { rc = -1; break; }
+        if (have - pos < 4096 && !eof) {
+            memmove(buf, buf + pos, have - pos);
+            have -= pos; pos = 0;
+            size_t k = fread(buf + have, 1, ENV_MP3_BUF - have, f);
+            if (k == 0) eof = 1;
+            have += k;
+        }
+        if (pos >= have) break;
+        unsigned phase = (unsigned)(frame % ENV_MP3_PERIOD);
+        int decode = phase == 0;
+        drmp3dec_frame_info info;
+        memset(&info, 0, sizeof(info));
+        int ns = drmp3dec_decode_frame(dec, buf + pos, (int)(have - pos),
+                                       decode ? pcm : NULL, &info);
+        if (info.frame_bytes == 0) break;                /* nothing more here */
+        pos += (size_t)info.frame_bytes;
+        if (ns <= 0) continue;                           /* skipped junk, or a frame it could not use */
+        if (layer3 < 0) {
+            layer3 = info.layer == 3;
+            if (!layer3) { rc = 0; break; }              /* see above: full decode instead */
+            slice_len = (uint32_t)info.sample_rate / 20;
+            if (slice_len == 0) slice_len = 1;
+        }
+        if (decode) {
+            uint32_t samples = (uint32_t)ns * (uint32_t)info.channels;
+            uint64_t sum = 0;
+            for (uint32_t i = 0; i < samples; i++) { int32_t v = pcm[i]; sum += (uint32_t)(v * v); }
+            pw[cur] += sum;
+            cnt[cur] += samples;
+        }
+        frame++;
+        /* Every frame, measured or not, moves the position on. */
+        in_slice += (uint32_t)ns;
+        while (in_slice >= slice_len) {
+            in_slice -= slice_len;
+            if (++cur == ENV_SLICES) {
+                for (int i = 0; i < ENV_SLICES / 2; i++) {
+                    pw[i]  = pw[2 * i]  + pw[2 * i + 1];
+                    cnt[i] = cnt[2 * i] + cnt[2 * i + 1];
+                }
+                memset(pw  + ENV_SLICES / 2, 0, (ENV_SLICES / 2) * sizeof(*pw));
+                memset(cnt + ENV_SLICES / 2, 0, (ENV_SLICES / 2) * sizeof(*cnt));
+                cur = ENV_SLICES / 2;
+                slice_len *= 2;
+            }
+        }
+    }
+    if (rc == 1) {
+        int slices = cur + (in_slice ? 1 : 0);
+        if (slices == 0 || layer3 != 1) rc = 0;
+        else env_bin(pw, cnt, slices, level, n);
+    }
+out:
+    fclose(f);
+    free(buf); free(pcm); free(pw); free(cnt); free(dec);
+    return rc;
+}
+
+static int mp3_probe(const char *path, int *rate_out, int *bitrate_bps_out);
+
+/* An MP3's length without decoding it, from its size and first frame's
+ * bitrate -- close for VBR, exact for CBR, and all a "is this long?" needs.
+ * 0 when it cannot tell. */
+static long mp3_est_seconds(const char *path) {
+    int rate = 0, bps = 0;
+    struct stat st;
+    if (mp3_probe(path, &rate, &bps) != 0 || bps <= 0 || stat(path, &st) != 0) return 0;
+    return (long)((int64_t)st.st_size * 8 / bps);
+}
+
 int audio_envelope(const char *path, uint32_t *level, int n,
                    int (*keep_going)(void *), void *ctx) {
     if (!path || !path[0] || !level || n <= 0) return 0;
+
+    /* Long MP3s are sampled, not decoded end to end -- see
+     * mp3_envelope_sampled(). A 0 back (not Layer III, or unreadable) falls
+     * through to the full decode, which gives the real answer either way. */
+    long mp3_secs = sniff(path) == DEC_MP3 ? mp3_est_seconds(path) : -1;
+    if (mp3_secs > ENV_LONG_SEC) {
+        int r = mp3_envelope_sampled(path, level, n, keep_going, ctx);
+        if (r != 0) return r;
+    }
 
     short    *pcm = malloc((size_t)DEC_MAX_FRAMES * 8 * sizeof(short));
     short    *buf = malloc((size_t)ENV_CHUNK * ENV_MAX_CH * sizeof(short));
@@ -1473,7 +1634,12 @@ int audio_envelope(const char *path, uint32_t *level, int n,
     /* See the note above: only the high-data-rate sources are held back. */
     uint64_t src_bps = (uint64_t)d.rate * ch * (uint64_t)(d.bits > 16 ? 3 : 2);
     int throttle = src_bps > ENV_THROTTLE_BPS;
-    int long_file = d.frames == 0 || d.frames > (uint64_t)d.rate * ENV_LONG_SEC;
+    /* MP3 does not know its length (d.frames == 0), which used to count as
+     * long -- so every four-minute MP3 song got the long-file duty cycle
+     * below. Its estimate from size and bitrate decides instead. */
+    int long_file = d.frames ? d.frames > (uint64_t)d.rate * ENV_LONG_SEC
+                  : mp3_secs >= 0 ? mp3_secs == 0 || mp3_secs > ENV_LONG_SEC
+                  : 1;
     uint32_t slice_len = d.rate / 20;          /* 50 ms to start with */
     if (slice_len == 0) slice_len = 1;
     int cur = 0;
@@ -1533,17 +1699,7 @@ int audio_envelope(const char *path, uint32_t *level, int n,
 
     int slices = cur + (in_slice ? 1 : 0);
     if (slices == 0) { rc = 0; goto out; }
-    for (int b = 0; b < n; b++) {
-        /* More slices than columns (every real track): the column is the
-         * mean power of the slices it covers. Fewer (a clip of a few
-         * seconds): each column repeats the slice under it. */
-        int s0 = (int)((int64_t)b * slices / n);
-        int s1 = (int)((int64_t)(b + 1) * slices / n);
-        if (s1 <= s0) s1 = s0 + 1;
-        uint64_t p = 0, c = 0;
-        for (int i = s0; i < s1 && i < slices; i++) { p += pw[i]; c += cnt[i]; }
-        level[b] = c ? isqrt64(p / c) : 0;
-    }
+    env_bin(pw, cnt, slices, level, n);
 
 out:
     if (opened) dec_close(&d);
@@ -1556,14 +1712,14 @@ out:
 static int bt_sink_connected(void) {
     char cmd[64];
     snprintf(cmd, sizeof(cmd), "%s list-pcms 2>/dev/null", st_ba_ctl());
-    FILE *p = popen(cmd, "r");
-    if (!p) return 0;
-    char line[256];
-    int found = 0;
-    while (fgets(line, sizeof(line), p))
-        if (strstr(line, "a2dp") && strstr(line, "/sink")) { found = 1; break; }
-    pclose(p);
-    return found;
+    /* Bounded (st_cmd()): this runs on the playback thread, which a hung
+     * D-Bus client would otherwise stop dead. */
+    char out[1024];
+    st_cmd(cmd, out, sizeof(out), ST_CMD_QUICK_MS, 0);
+    char *cur = out, *line;
+    while ((line = st_nextline(&cur)) != NULL)
+        if (strstr(line, "a2dp") && strstr(line, "/sink")) return 1;
+    return 0;
 }
 
 /* A USB DAC enumerates as its own ALSA card, so plughw:0,0 — the internal
@@ -1665,6 +1821,13 @@ static char bt_mixer[64];
  * name built for it could have run anything. Single-quoted, with each ' as
  * '\''. Refreshed whenever bt_mixer is found. */
 static char bt_mixer_q[64 * 4 + 3];
+/* Ran to completion (whatever its exit status), within the deadline -- what
+ * `system(cmd) != -1` used to mean, minus the unbounded wait. */
+static int cmd_ran(const char *cmd, int timeout_ms) {
+    int r = st_cmd(cmd, NULL, 0, timeout_ms, 0);
+    return r != -1 && r != ST_CMD_TIMEOUT;
+}
+
 static void shell_quote(const char *in, char *out, size_t n) {
     size_t o = 0;
     if (n < 3) { if (n) out[0] = '\0'; return; }
@@ -1816,10 +1979,10 @@ static void find_bt_mixer(void) {
     bt_vol_raw = -1;
     bt_vol_synced = 0;
     bt_softvol_set = 0;
-    FILE *p = popen("amixer -D bluealsa scontrols 2>/dev/null", "r");
-    if (!p) return;
-    char line[256];
-    while (fgets(line, sizeof(line), p)) {
+    char out[1024];
+    st_cmd("amixer -D bluealsa scontrols 2>/dev/null", out, sizeof(out), ST_CMD_QUICK_MS, 0);
+    char *cur = out, *line;
+    while ((line = st_nextline(&cur)) != NULL) {
         char *q1 = strchr(line, '\'');
         char *q2 = q1 ? strchr(q1 + 1, '\'') : NULL;
         if (q1 && q2 && q2 > q1 + 1) {
@@ -1831,7 +1994,6 @@ static void find_bt_mixer(void) {
             break;
         }
     }
-    pclose(p);
     /* BG59: silent before this -- a headset that never negotiates AVRCP
      * absolute volume left no trace anywhere that this ever ran, let alone
      * that it found nothing. Logged once per attempt (this only runs when
@@ -1850,11 +2012,11 @@ static int bt_read_raw(int *max_out) {
     if (!bt_mixer[0]) return -1;
     char cmd[384];
     snprintf(cmd, sizeof(cmd), "amixer -D bluealsa sget %s 2>/dev/null", bt_mixer_q);
-    FILE *p = popen(cmd, "r");
-    if (!p) return -1;
-    char line[256];
+    char out[1024];
+    st_cmd(cmd, out, sizeof(out), ST_CMD_QUICK_MS, 0);
+    char *cur = out, *line;
     int raw = -1, max = -1;
-    while (fgets(line, sizeof(line), p)) {
+    while ((line = st_nextline(&cur)) != NULL) {
         int lo, hi;
         if (sscanf(line, " Limits: Playback %d - %d", &lo, &hi) == 2 && hi > 0) {
             max = hi;
@@ -1888,7 +2050,6 @@ static int bt_read_raw(int *max_out) {
             }
         }
     }
-    pclose(p);
     if (max_out && max > 0) *max_out = max;
     return raw;
 }
@@ -2079,16 +2240,16 @@ static void bt_enable_softvol(void) {
      * audible jump to full scale. bt_pin_pcm() normally has it on already. */
     if (st_ba_v5()) {
         snprintf(cmd, sizeof(cmd), "%s soft-volume %s 2>/dev/null", st_ba_ctl(), qpath);
-        FILE *p = popen(cmd, "r");
-        char line[64] = "";
-        if (p) { if (!fgets(line, sizeof(line), p)) line[0] = '\0'; pclose(p); }
+        char line[128];
+        st_cmd(cmd, line, sizeof(line), ST_CMD_QUICK_MS, 0);
         if (strstr(line, "true")) {
             alog("[audio] bt: SoftVolume already on for %s\n", path);
             return;
         }
     }
     snprintf(cmd, sizeof(cmd), "%s soft-volume %s true >/dev/null 2>&1", st_ba_ctl(), qpath);
-    if (system(cmd) == -1) { bt_softvol_set = 0; return; }
+    int src = st_cmd(cmd, NULL, 0, ST_CMD_QUICK_MS, 0);
+    if (src == -1 || src == ST_CMD_TIMEOUT) { bt_softvol_set = 0; return; }
 
     int max = bt_vol_max;
     int now = bt_read_raw(&max);
@@ -2098,7 +2259,7 @@ static void bt_enable_softvol(void) {
         int floor_raw = (BT_SOFTVOL_FLOOR_PCT * bt_vol_max + 50) / 100;
         snprintf(cmd, sizeof(cmd), "amixer -D bluealsa sset %s %d >/dev/null 2>&1",
                  bt_mixer_q, floor_raw);
-        if (system(cmd) != -1) {
+        if (cmd_ran(cmd, ST_CMD_QUICK_MS)) {
             bt_vol_raw = floor_raw;
             pthread_mutex_lock(&g_lock);
             g_vol = bt_raw_to_pct(floor_raw);
@@ -2130,12 +2291,13 @@ static void bt_log_info(void) {
     char cmd[640], qpath[520];
     shell_quote(path, qpath, sizeof(qpath));
     snprintf(cmd, sizeof(cmd), "%s info %s 2>/dev/null", st_ba_ctl(), qpath);
-    FILE *p = popen(cmd, "r");
-    if (!p) return;
+    char out[2048];
+    st_cmd(cmd, out, sizeof(out), ST_CMD_QUICK_MS, 10);
+    if (!out[0]) return;
     char codec[24] = "?", rate[16] = "?", ch[8] = "?", soft[8] = "?",
-         vol[32] = "?", mute[32] = "?", line[256];
-    while (fgets(line, sizeof(line), p)) {
-        line[strcspn(line, "\n")] = '\0';
+         vol[32] = "?", mute[32] = "?";
+    char *cur = out, *line;
+    while ((line = st_nextline(&cur)) != NULL) {
         char *v = strchr(line, ':');
         if (!v) continue;
         v++;
@@ -2149,7 +2311,6 @@ static void bt_log_info(void) {
         else if (!strncmp(line, "Volume:", 7))          snprintf(vol, sizeof(vol), "%s", v);
         else if (!strncmp(line, "Muted:", 6) || !strncmp(line, "Mute:", 5)) snprintf(mute, sizeof(mute), "%s", v);
     }
-    pclose(p);
     /* The device is the dev_XX_XX.. component of the path. */
     const char *dev = strstr(path, "dev_");
     char devs[24] = "?";
@@ -2245,7 +2406,7 @@ void audio_bt_volume_service(void) {
                     char wcmd[384];
                     snprintf(wcmd, sizeof(wcmd), "amixer -D bluealsa sset %s %d >/dev/null 2>&1",
                              bt_mixer_q, want);
-                    if (system(wcmd) != -1) fresh = want;
+                    if (cmd_ran(wcmd, ST_CMD_QUICK_MS)) fresh = want;
                 }
                 if (fresh >= 0) {
                     bt_vol_raw = fresh;
@@ -2329,7 +2490,7 @@ void audio_bt_volume_service(void) {
          * section's own top comment for why. */
         snprintf(cmd, sizeof(cmd), "amixer -D bluealsa sset %s %d >/dev/null 2>&1",
                  bt_mixer_q, raw_val);
-        if (system(cmd) == -1) return;
+        if (!cmd_ran(cmd, ST_CMD_QUICK_MS)) return;
     }
 
     int max = bt_vol_max;
@@ -2406,13 +2567,14 @@ typedef struct {
 } bt_link_t;
 
 static int bt_link_read(const char *qpath, bt_link_t *l) {
-    char cmd[640], line[256];
+    char cmd[640], out[2048];
     snprintf(cmd, sizeof(cmd), "%s info %s 2>/dev/null", st_ba_ctl(), qpath);
-    FILE *p = popen(cmd, "r");
-    if (!p) return 0;
     memset(l, 0, sizeof(*l));
-    while (fgets(line, sizeof(line), p)) {
-        line[strcspn(line, "\r\n")] = '\0';
+    /* Playback thread, just before opening: bounded (st_cmd()). */
+    st_cmd(cmd, out, sizeof(out), ST_CMD_QUICK_MS, 0);
+    char *cur = out, *line;
+    while ((line = st_nextline(&cur)) != NULL) {
+        line[strcspn(line, "\r")] = '\0';
         if (!strncmp(line, "Rate:", 5)) l->rate = (unsigned)strtoul(line + 5, NULL, 10);
         else if (!strncmp(line, "Channels:", 9)) l->ch = (unsigned)strtoul(line + 9, NULL, 10);
         else if (!strncmp(line, "Running:", 8)) l->running = strstr(line, "true") != NULL;
@@ -2425,7 +2587,6 @@ static int bt_link_read(const char *qpath, bt_link_t *l) {
         } else if (!strncmp(line, "Available codecs:", 17))
             snprintf(l->available, sizeof(l->available), " %s ", line + 17);
     }
-    pclose(p);
     return l->rate != 0;
 }
 
@@ -2447,7 +2608,7 @@ static void bt_pick_codec(const char *qpath, const char *dev, bt_link_t *l) {
     if (!best || !strcasecmp(best, l->selected)) return;
     char cmd[640];
     snprintf(cmd, sizeof(cmd), "%s codec %s %s >/dev/null 2>&1", st_ba_ctl(), qpath, best);
-    int rc = system(cmd);
+    int rc = st_cmd(cmd, NULL, 0, ST_CMD_SLOW_MS, 0);
     char was[24];
     snprintf(was, sizeof(was), "%s", l->selected);
     if (!bt_link_read(qpath, l) || strcasecmp(l->selected, best) != 0 || rc != 0) {
@@ -2495,7 +2656,7 @@ static int bt_pin_pcm(void) {
         char cmd[640];
         snprintf(cmd, sizeof(cmd), "%s soft-volume %s on >/dev/null 2>&1 && %s volume %s %d %d >/dev/null 2>&1",
                  st_ba_ctl(), qpath, st_ba_ctl(), qpath, raw, raw);
-        if (system(cmd) == 0) {
+        if (st_cmd(cmd, NULL, 0, ST_CMD_QUICK_MS, 0) == 0) {
             if (bt_last_pct < 0) bt_last_pct = pct;
             alog("[audio] bt: SoftVolume on before opening, level %d/127 (%d%%)\n", raw, pct);
         }
