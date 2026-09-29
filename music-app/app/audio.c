@@ -2046,12 +2046,29 @@ static int bt_read_raw(int *max_out) {
                  * apart from a line shaped like the Limits one above,
                  * regardless of exactly how either is phrased. */
                 if (sscanf(b, "Playback %d %c", &v, &bracket) == 2 && bracket == '[')
-                    raw = v;
+                    raw = strstr(b, "[off]") ? 0 : v;   /* 0% is 1 + mute, see bt_level_args() */
             }
         }
     }
     if (max_out && max > 0) *max_out = max;
     return raw;
+}
+
+/* The amixer arguments for a raw level: "N unmute", or "1 mute" for 0.
+ *
+ * BlueALSA 5 must never be sent 0. It turns the level into dB as
+ * 10*log2(0/127)*100 and stores that in an int: minus infinity, which is
+ * undefined in C. On x86 it comes out hugely negative and clamps to silence;
+ * the R1 is MIPS, whose FPU answers an invalid conversion with INT_MAX, and
+ * bluealsa clamps that to +96 dB. The level reads back as 127 and every
+ * sample is multiplied by 63,000 -- loud static in both ears until any other
+ * level is written. Reported twice in an hour from the quick-settings slider,
+ * whose quick tap applied 0%; confirmed on the device (`bluealsactl volume
+ * PATH 0 0` reads back 127, 1 reads back 1). Level 1 is -70 dB and muted on
+ * top, so 0% is still silence. */
+static void bt_level_args(int raw, char *out, size_t n) {
+    if (raw <= 0) snprintf(out, n, "1 mute");
+    else          snprintf(out, n, "%d unmute", raw);
 }
 
 /* One entry point for a volume change, so the caller does not have to know
@@ -2257,8 +2274,10 @@ static void bt_enable_softvol(void) {
     /* Zero, or so low it is indistinguishable from silence. */
     if (now >= 0 && now <= bt_vol_max / 20) {
         int floor_raw = (BT_SOFTVOL_FLOOR_PCT * bt_vol_max + 50) / 100;
-        snprintf(cmd, sizeof(cmd), "amixer -D bluealsa sset %s %d >/dev/null 2>&1",
-                 bt_mixer_q, floor_raw);
+        char lv[24];
+        bt_level_args(floor_raw, lv, sizeof(lv));
+        snprintf(cmd, sizeof(cmd), "amixer -D bluealsa sset %s %s >/dev/null 2>&1",
+                 bt_mixer_q, lv);
         if (cmd_ran(cmd, ST_CMD_QUICK_MS)) {
             bt_vol_raw = floor_raw;
             pthread_mutex_lock(&g_lock);
@@ -2404,8 +2423,10 @@ void audio_bt_volume_service(void) {
                     int want = bt_pct_to_raw(bt_last_pct);
                     if (want < 0) want = 0; if (want > bt_vol_max) want = bt_vol_max;
                     char wcmd[384];
-                    snprintf(wcmd, sizeof(wcmd), "amixer -D bluealsa sset %s %d >/dev/null 2>&1",
-                             bt_mixer_q, want);
+                    char lv[24];
+                    bt_level_args(want, lv, sizeof(lv));
+                    snprintf(wcmd, sizeof(wcmd), "amixer -D bluealsa sset %s %s >/dev/null 2>&1",
+                             bt_mixer_q, lv);
                     if (cmd_ran(wcmd, ST_CMD_QUICK_MS)) fresh = want;
                 }
                 if (fresh >= 0) {
@@ -2488,9 +2509,14 @@ void audio_bt_volume_service(void) {
          * against the mixer's own current value could disagree with g_vol
          * by tens of percent. Plain integer, not "N%" -- see this
          * section's own top comment for why. */
-        snprintf(cmd, sizeof(cmd), "amixer -D bluealsa sset %s %d >/dev/null 2>&1",
-                 bt_mixer_q, raw_val);
+        char lv[24];
+        bt_level_args(raw_val, lv, sizeof(lv));
+        snprintf(cmd, sizeof(cmd), "amixer -D bluealsa sset %s %s >/dev/null 2>&1",
+                 bt_mixer_q, lv);
         if (!cmd_ran(cmd, ST_CMD_QUICK_MS)) return;
+        /* Every level this player sets, so a jump in the log can be told
+         * apart from one it did not make. */
+        alog("[audio] bt volume set to %s (%d/%d)\n", lv, raw_val, bt_vol_max);
     }
 
     int max = bt_vol_max;
@@ -2653,9 +2679,13 @@ static int bt_pin_pcm(void) {
         int pct = bt_last_pct >= 0 ? bt_last_pct : bt_pct_load();
         if (pct < 0) pct = BT_PCT_FIRST;
         int raw = (pct * 127 + 50) / 100;
-        char cmd[640];
-        snprintf(cmd, sizeof(cmd), "%s soft-volume %s on >/dev/null 2>&1 && %s volume %s %d %d >/dev/null 2>&1",
-                 st_ba_ctl(), qpath, st_ba_ctl(), qpath, raw, raw);
+        /* Never 0 -- see bt_level_args(). */
+        int lvl = raw > 0 ? raw : 1;
+        char cmd[900];
+        snprintf(cmd, sizeof(cmd), "%s soft-volume %s on >/dev/null 2>&1 && %s volume %s %d %d >/dev/null 2>&1"
+                                   " && %s mute %s %s >/dev/null 2>&1",
+                 st_ba_ctl(), qpath, st_ba_ctl(), qpath, lvl, lvl,
+                 st_ba_ctl(), qpath, raw > 0 ? "off" : "on");
         if (st_cmd(cmd, NULL, 0, ST_CMD_QUICK_MS, 0) == 0) {
             if (bt_last_pct < 0) bt_last_pct = pct;
             alog("[audio] bt: SoftVolume on before opening, level %d/127 (%d%%)\n", raw, pct);

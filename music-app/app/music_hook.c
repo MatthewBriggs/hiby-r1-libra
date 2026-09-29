@@ -2978,7 +2978,7 @@ static int settings_content_rows(void) {
  * pushed by hand, not by CI against a tagged commit), so this stays a
  * literal that a human edits; the discipline is remembering to, not the
  * mechanism. */
-#define LIBRARY_VERSION "0.59.1"
+#define LIBRARY_VERSION "0.59.2"
 
 /* A custom-built kernel keeps uname()'s own release string exactly
  * "4.4.94+" on purpose -- that string is also the vermagic every one of the
@@ -10725,6 +10725,18 @@ static int vol_bar_y(void)   { return vol_pop_top() + vol_pop_h() / 2 - 4; }
 static int qs_bar_icon_x(void) { return 24; }
 static int qs_bar_x(void)      { return qs_bar_icon_x() + VOL_ICON_W + VOL_ICON_GAP; }
 static int qs_bar_w(void)      { return FB_W - 24 - qs_bar_x(); }
+/* The volume a touch at x on the panel's volume bar means. It has to use the
+ * bar as drawn: it used to borrow the floating popup's geometry (74..440
+ * against 58..456 here), so with 16 steps everything right of x=429 rounded
+ * to 100% -- including the spot where the bar showed 94%. Turning it up a
+ * notch short of the top gave the top. */
+static int qs_vol_pct_at(int x) {
+    int bw = qs_bar_w();
+    int v = (x - qs_bar_x()) * 100 / (bw > 0 ? bw : 1);
+    if (v < 0) v = 0;
+    if (v > 100) v = 100;
+    return audio_volume_snap(v);
+}
 /* R-qsvol: a second slider, volume, added below brightness -- explicit
  * request, same icon-left-of-bar shape. QS_SLIDER_ROW_H is shorter than
  * QS_ROW_H: a slider is one line of content (icon + bar), not two lines of
@@ -15298,11 +15310,7 @@ int music_entry(void *a0, void *a1) {
          * Locked the same way the floating popup's own drag is while USB
          * Transport Mode pins volume: not entered at all. */
         if (qs_open && vol_dragging && touch_down) {
-            int bw = vol_bar_w();
-            int v = (live_x - vol_bar_x()) * 100 / (bw > 0 ? bw : 1);
-            if (v < 0) v = 0;
-            if (v > 100) v = 100;
-            v = audio_volume_snap(v);
+            int v = qs_vol_pct_at(live_x);
             if (v != vol_drag_pct) { vol_drag_pct = v; dirty = 1; }
             if (++vol_apply_tick >= 6) {
                 vol_apply_tick = 0;
@@ -15314,6 +15322,9 @@ int music_entry(void *a0, void *a1) {
             idle = 0;
         } else if (vol_dragging && qs_open && !touch_down) {
             vol_dragging = 0;
+            /* A tap lifted before the block above ever ran (the drag starts
+             * further down this loop) left -1 here, which applied as 0%. */
+            if (vol_drag_pct < 0) vol_drag_pct = qs_vol_pct_at(live_x);
             if (vol_drag_pct != vol_applied) {
                 audio_volume_set(vol_drag_pct);
                 vol_applied = vol_drag_pct;
