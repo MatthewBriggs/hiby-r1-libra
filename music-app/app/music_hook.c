@@ -87,6 +87,7 @@ typedef struct {
 #include "radio.h"
 #include "radio_buffer.h"
 #include "playlist.h"
+#include "crash.h"
 
 /* ---- device geometry ----------------------------------------------------- */
 #define FB_W 480
@@ -4384,6 +4385,10 @@ static char artist_page_name[LIB_NAME_LEN];
 #define ARTIST_ALBUMS_MAX (PAGE_MAX * 4)
 static lib_row_t artist_page_albums[ARTIST_ALBUMS_MAX];
 static int artist_page_album_n;
+/* The query that filled artist_page_albums, so back history can run it again
+ * (the Artists list and an album's artist line ask it differently). */
+static const char *artist_page_col;
+static char artist_page_val[LIB_NAME_LEN];
 /* Where "back" from the artist page should land -- the album/artist it was
  * opened from, so backing out returns to browsing that album rather than
  * always falling to the same generic spot regardless of entry point. */
@@ -10096,6 +10101,246 @@ static int read_gesture(int fd, int *ox, int *oy) {
     return out;
 }
 
+/* Back history.
+ *
+ * "Back" used to be a fixed parent for each screen, with flags (pod_list,
+ * recent_mode, tracks_from_artist_page...) deciding the parent of the screens
+ * several places share. Reported live as inconsistent: back from Now Playing
+ * went to the *playing* album whatever screen it was opened from, so Podcasts
+ * -> mini player -> back -> back landed in Albums; and a flag one path forgot
+ * to clear sent back somewhere unrelated, Albums being the fallback.
+ *
+ * Now back returns to the screen you were actually on. Rather than a push at
+ * each of the ~45 places a screen is opened (and every one added later), the
+ * main loop watches: nav_cur is a snapshot of what identifies the current
+ * screen, refreshed every frame (scroll included), and when the screen
+ * changes by any route other than back itself, the snapshot from the frame
+ * before -- the screen as it was left -- goes on the stack. Back pops it and
+ * rebuilds that screen from it: the list is read again, so it is current, and
+ * put back where it was scrolled to.
+ *
+ * The main menu is the root: reaching it by any route (the home swipe, or
+ * backing out to it) clears the history. The queue drawer and the keyboard
+ * are overlays with their own back (close, cancel) and are not history. With
+ * no history -- after a restart that resumed onto Now Playing -- back falls
+ * to the old parent map below. */
+typedef struct {
+    screen_t    screen;
+    int         scroll, scroll_px;
+    const char *facet, *facet_label;
+    int         recent, pod_list, ab_list, is_playlist;
+    char        artist[LIB_NAME_LEN], album[LIB_NAME_LEN], albums_artist[LIB_NAME_LEN];
+    char        feed[POD_NAME_LEN];
+    char        ap_name[LIB_NAME_LEN], ap_val[LIB_NAME_LEN];
+    const char *ap_col;
+    char        ab_dir[AB_PATH_LEN];
+    int         eq_band;
+} nav_t;
+
+#define NAV_MAX 24
+static nav_t nav_stack[NAV_MAX];
+static int   nav_n;
+static nav_t nav_cur;
+static int   nav_have_cur;
+static int   nav_by_back;   /* this frame's screen change was go_back()'s */
+
+static void nav_capture(nav_t *e) {
+    e->screen = screen;
+    e->scroll = scroll;
+    e->scroll_px = scroll_px;
+    e->facet = cur_facet;
+    e->facet_label = cur_facet_label;
+    e->recent = recent_mode;
+    e->pod_list = pod_list;
+    e->ab_list = ab_list;
+    e->is_playlist = browsing_is_playlist;
+    snprintf(e->artist, sizeof(e->artist), "%s", cur_artist);
+    snprintf(e->album, sizeof(e->album), "%s", cur_album);
+    snprintf(e->albums_artist, sizeof(e->albums_artist), "%s", albums_artist);
+    snprintf(e->feed, sizeof(e->feed), "%s", cur_feed);
+    snprintf(e->ap_name, sizeof(e->ap_name), "%s", artist_page_name);
+    snprintf(e->ap_val, sizeof(e->ap_val), "%s", artist_page_val);
+    e->ap_col = artist_page_col;
+    snprintf(e->ab_dir, sizeof(e->ab_dir), "%s", ab_book.dir);
+    e->eq_band = eq_editing_band;
+}
+
+static int nav_overlay(void) {
+    return (screen == SC_QUEUE && qd_is_drawer) || screen == SC_KEYBOARD;
+}
+
+/* Once per main-loop pass, after input. */
+static void nav_track(void) {
+    int by_back = nav_by_back;
+    nav_by_back = 0;
+    if (nav_overlay()) return;
+    if (nav_have_cur && screen != nav_cur.screen) {
+        if (screen == SC_MENU) {
+            nav_n = 0;
+        } else if (!by_back) {
+            if (nav_n == NAV_MAX) {
+                memmove(nav_stack, nav_stack + 1, sizeof(nav_stack[0]) * (NAV_MAX - 1));
+                nav_n--;
+            }
+            nav_stack[nav_n++] = nav_cur;
+        }
+    }
+    nav_capture(&nav_cur);
+    nav_have_cur = 1;
+}
+
+/* Rebuild a screen from its snapshot. 0 when it no longer makes sense (the
+ * queue it showed is gone, the book is no longer the one loaded, the playlist
+ * was deleted), and back goes one further. */
+static int nav_restore(const nav_t *e) {
+    switch (e->screen) {
+        case SC_KEYBOARD:
+            return 0;
+        case SC_PLAYING:
+            if (queue_n <= 0 && !radio_mode) return 0;
+            break;
+        case SC_QUEUE:
+            if (queue_n <= 0) return 0;
+            queue_via_back = 0;
+            break;
+        case SC_ARTISTS:
+            recent_mode = 0;
+            cur_facet = e->facet;
+            cur_facet_label = e->facet_label;
+            total = lib_group_count(cur_facet);
+            break;
+        case SC_ALBUMS:
+            cur_facet = e->facet;
+            cur_facet_label = e->facet_label;
+            recent_mode = e->recent;
+            snprintf(albums_artist, sizeof(albums_artist), "%s", e->albums_artist);
+            snprintf(cur_artist, sizeof(cur_artist), "%s", e->albums_artist);
+            break;
+        case SC_ARTIST_PAGE:
+            if (!e->ap_col) return 0;
+            snprintf(artist_page_name, sizeof(artist_page_name), "%s", e->ap_name);
+            artist_page_col = e->ap_col;
+            snprintf(artist_page_val, sizeof(artist_page_val), "%s", e->ap_val);
+            artist_page_album_n = lib_albums(artist_page_col, artist_page_val,
+                                             artist_page_albums, ARTIST_ALBUMS_MAX, 0);
+            artist_art_request(artist_page_name);
+            break;
+        case SC_TRACKS:
+            tracks_from_artist_page = 0;
+            if (e->pod_list) {
+                snprintf(cur_feed, sizeof(cur_feed), "%s", e->feed);
+                pod_ep_n = pod_load_episodes(cur_feed, pod_eps, POD_MAX_ITEMS);
+                pod_rebuild_tracks();
+                snprintf(cur_album, sizeof(cur_album), "%s", cur_feed);
+                cur_artist[0] = '\0';
+                browsing_is_playlist = 0;
+            } else if (e->ab_list) {
+                /* The chapter list is the loaded book's queue; a different
+                 * book since means there is nothing to show for this one. */
+                if (!audiobook_mode || strcmp(ab_book.dir, e->ab_dir) != 0) return 0;
+                memcpy(tracks, queue, sizeof(queue[0]) * (size_t)queue_n);
+                track_n = queue_n;
+                snprintf(cur_album, sizeof(cur_album), "%s", e->album);
+                snprintf(cur_artist, sizeof(cur_artist), "%s", e->artist);
+                browsing_is_playlist = 0;
+            } else if (e->is_playlist) {
+                playlist_n = pl_list(playlists, PL_MAX);
+                int pi = -1;
+                for (int i = 0; i < playlist_n; i++)
+                    if (!strcmp(playlists[i].name, e->album)) { pi = i; break; }
+                if (pi < 0) return 0;
+                pl_path_t *paths = pl_scratch_get("back to playlist");
+                track_n = 0;
+                if (paths) {
+                    int got = pl_read(playlists[pi].path, paths, PL_SCRATCH_N);
+                    for (int k = 0; k < got; k++)
+                        if (lib_track_by_path(paths[k], &tracks[track_n]) == 0) track_n++;
+                    free(paths);
+                }
+                snprintf(cur_album, sizeof(cur_album), "%s", playlists[pi].name);
+                cur_artist[0] = '\0';
+                view_art_clear();
+                browsing_is_playlist = 1;
+            } else {
+                snprintf(cur_artist, sizeof(cur_artist), "%s", e->artist);
+                snprintf(cur_album, sizeof(cur_album), "%s", e->album);
+                track_n = lib_tracks_for_album(cur_artist, cur_album, tracks,
+                                               (int)(sizeof(tracks) / sizeof(tracks[0])), 0);
+                if (track_n > 0) view_art_request(tracks[0].path, cur_artist, cur_album);
+                browsing_is_playlist = 0;
+            }
+            pod_list = e->pod_list;
+            ab_list = e->ab_list;
+            break;
+        case SC_PODCASTS:
+            pod_feed_n = pod_scan_feeds(pod_feeds, POD_MAX_FEEDS);
+            pod_rebuild_rows();
+            total = pod_feed_n;
+            break;
+        case SC_AUDIOBOOKS:
+            ab_book_n = ab_scan_books(ab_books, AB_MAX_BOOKS);
+            ab_rebuild_rows();
+            total = ab_book_n;
+            break;
+        case SC_PLAYLISTS:
+            recent_mode = 0;
+            playlist_n = pl_list(playlists, PL_MAX);
+            break;
+        case SC_RADIO:
+            station_n = radio_load(stations, RADIO_MAX);
+            break;
+        case SC_RADIO_RECORDINGS:
+            radio_recording_n = radio_recordings_load(radio_recordings, RADIO_REC_MAX);
+            break;
+        case SC_EQ:
+            eq_profile_n = ep_scan(eq_profiles, EP_MAX_PROFILES);
+            break;
+        case SC_EQ_BANDS:
+            total = eq_cur.band_n;
+            break;
+        case SC_EQ_BAND:
+            if (e->eq_band < 0 || e->eq_band >= eq_cur.band_n) return 0;
+            eq_editing_band = e->eq_band;
+            break;
+        case SC_STATS_STORAGE:
+            stor_request();
+            break;
+        default:
+            break;
+    }
+    screen = e->screen;
+    reset_scroll();
+    /* Albums' count and rows after reset_scroll(), which empties rows[]. */
+    if (screen == SC_ALBUMS) {
+        if (recent_mode) {
+            row_n = (recent_mode == RECENT_ADDED)
+                  ? lib_albums_recent_added(rows, RECENT_ALBUMS_N)
+                  : lib_albums_recent_heard(recent_heard_ts, rows, RECENT_ALBUMS_N);
+            row_base = 0;
+            total = row_n;
+        } else {
+            total = lib_albums_count(cur_facet, cur_artist[0] ? cur_artist : NULL);
+        }
+    }
+    scroll = e->scroll;
+    scroll_px = e->scroll_px;
+    /* The paged lists, clamped in case a scan changed their length since. */
+    if (screen == SC_ARTISTS || (screen == SC_ALBUMS && !recent_mode)) {
+        if (scroll > total - 1) scroll = total > 0 ? total - 1 : 0;
+        if (scroll < 0) scroll = 0;
+        load_page();
+    }
+    return 1;
+}
+
+static int nav_back(void) {
+    while (nav_n > 0) {
+        nav_t e = nav_stack[--nav_n];
+        if (nav_restore(&e)) return 1;
+    }
+    return 0;
+}
+
 /* Each screen returns early once it has drawn, so the mini player goes on
  * afterwards rather than being repeated at the foot of every branch. */
 /* One definition of "back", so the header control and the edge swipe cannot
@@ -10119,6 +10364,11 @@ static int go_back(void) {
      * for an episode. */
     ab_save_current_pos();
     pod_save_current_pos();
+    /* The drawer closes rather than going anywhere (it is not history). */
+    if (screen == SC_QUEUE && qd_is_drawer) { qd_begin_close(); return 1; }
+    /* Whatever happens below is back's, not a new screen to remember. */
+    nav_by_back = 1;
+    if (screen != SC_KEYBOARD && nav_back()) return 1;
     switch (screen) {
         case SC_MENU:
             /* Standalone: nowhere to go -- see g_is_standalone's own
@@ -11910,6 +12160,83 @@ static void save_conf(void) {
  * once per process, so there is nothing to gain from it being automatic. */
 static uint16_t rs_thumb[RS_W * RS_H];
 
+/* The card, clean before power goes, after compas-player's supervisor.
+ *
+ * poweroff's own shutdown sequence (inittab: rcK, then `umount -a -r`) runs
+ * while every process is still alive. Ordinarily that is fine: nothing holds
+ * a card file open for writing, the read-only remount goes through, and the
+ * card comes back clean (checked: exFAT VolumeFlags 0, no warning at mount,
+ * after a power-button shutdown). But a podcast download (curl) or a radio
+ * recording in progress is a writer, and with one open the card can neither
+ * be unmounted nor remounted read-only -- it goes down dirty, with the card
+ * mounted delayed_meta, so recent directory entries can be lost. So: stop the
+ * downloads, then remount it read-only here, which flushes it and marks the
+ * volume clean, and name whatever still refuses. Everything Libra saves to
+ * the card (podcast positions, recent list) must already be written. */
+#define CARD_MNT "/data/mnt/sd_0"
+
+/* Who still has a card file open for writing, for the log when the remount
+ * is refused. */
+static void card_log_writers(void) {
+    DIR *pd = opendir("/proc");
+    if (!pd) return;
+    struct dirent *pe;
+    int found = 0;
+    while ((pe = readdir(pd)) != NULL) {
+        if (pe->d_name[0] < '0' || pe->d_name[0] > '9') continue;
+        char fdd[64];
+        snprintf(fdd, sizeof(fdd), "/proc/%s/fd", pe->d_name);
+        DIR *fd = opendir(fdd);
+        if (!fd) continue;
+        struct dirent *fe;
+        while ((fe = readdir(fd)) != NULL) {
+            if (fe->d_name[0] == '.') continue;
+            char lp[96], target[256], info[96];
+            snprintf(lp, sizeof(lp), "%s/%s", fdd, fe->d_name);
+            ssize_t n = readlink(lp, target, sizeof(target) - 1);
+            if (n <= 0) continue;
+            target[n] = '\0';
+            if (!strstr(target, "/mnt/sd_0/")) continue;
+            /* fdinfo's flags are octal; O_WRONLY/O_RDWR make it a writer. */
+            snprintf(info, sizeof(info), "/proc/%s/fdinfo/%s", pe->d_name, fe->d_name);
+            unsigned flags = 0;
+            FILE *fi = fopen(info, "r");
+            if (fi) {
+                char l[64];
+                while (fgets(l, sizeof(l), fi)) if (sscanf(l, "flags: %o", &flags) == 1) break;
+                fclose(fi);
+            }
+            if (!(flags & (O_WRONLY | O_RDWR))) continue;
+            char comm[32] = "?", cp[64];
+            snprintf(cp, sizeof(cp), "/proc/%s/comm", pe->d_name);
+            FILE *cf = fopen(cp, "r");
+            if (cf) { if (fgets(comm, sizeof(comm), cf)) comm[strcspn(comm, "\n")] = '\0'; fclose(cf); }
+            mlog("[music] card: %s (%s) still writing %s\n", comm, pe->d_name, target);
+            found++;
+        }
+        closedir(fd);
+    }
+    closedir(pd);
+    if (!found) mlog("[music] card: no writer found\n");
+}
+
+static void card_quiesce(void) {
+    /* curl only ever runs for Libra's downloads, whose half-written files
+     * are thrown away and fetched again anyway. */
+    st_cmd("killall curl 2>/dev/null", NULL, 0, ST_CMD_QUICK_MS, 0);
+    sync();
+    for (int attempt = 0; attempt < 5; attempt++) {
+        if (mount(NULL, CARD_MNT, NULL, MS_REMOUNT | MS_RDONLY, NULL) == 0) {
+            mlog("[music] card: remounted read-only for power-off\n");
+            return;
+        }
+        if (errno != EBUSY) break;
+        usleep(200000);   /* a killed writer takes a moment to close */
+    }
+    mlog("[music] card: could not remount read-only (%s)\n", strerror(errno));
+    card_log_writers();
+}
+
 static void resume_save(const uint16_t *front) {
     if (front) {
         for (int ty = 0; ty < RS_H; ty++) {
@@ -13077,6 +13404,7 @@ int music_entry(void *a0, void *a1) {
     (void)a0; (void)a1;
     g_is_standalone = !is_hiby_player();
     mlog("[music] entering app\n");
+    crash_note_phase(&g_phase);   /* the watchdog's phase, in a crash report too */
     /* R66 put the framebuffer before lib_open() so the resume splash covers
      * the slow part, and the log shows that working: on a resume, 4.3 s pass
      * between here and the touch node opening, all of it behind a splash. The
@@ -13134,6 +13462,10 @@ int music_entry(void *a0, void *a1) {
      * way the loop's own dirty-frame flip does -- one shared variable, not
      * a second copy that could drift from what is actually on screen. */
     int page = 0;
+    /* A different SD card: the library moves aside (lib_card_check()), and a
+     * resume saved on the last card would point at its files. */
+    int card_changed = lib_card_check();
+    if (card_changed) { unlink(RESUME_STATE); unlink(RESUME_THUMB); }
     int resuming = resume_pending();
     if (resuming) {
         resume_splash(base);
@@ -13144,7 +13476,8 @@ int music_entry(void *a0, void *a1) {
     }
 
     ent_fb = us_now();
-    if (lib_open() != 0) mlog("[music] library open failed\n");
+    if (lib_open() != 0 && !card_changed) mlog("[music] library open failed\n");
+    if (card_changed) scanner_rescan_now();
     ent_lib = us_now();
     /* Whether the frame loop should hold the bridge splash up rather than
      * paint the real (still cover-less) Now Playing screen on its first
@@ -13302,6 +13635,7 @@ int music_entry(void *a0, void *a1) {
             int gen = scanner_generation();
             if (gen != lib_gen) {
                 lib_gen = gen;
+                lib_card_commit();   /* a new card's library is now built */
                 if (lib_reopen() != 0) mlog("[music] library reopen failed\n");
                 else mlog("[music] library reopened on scan %d\n", gen);
                 dirty = 1;
@@ -14430,6 +14764,8 @@ int music_entry(void *a0, void *a1) {
                     snprintf(artist_page_back_artist, sizeof(artist_page_back_artist), "%s", cur_artist);
                     snprintf(artist_page_name, sizeof(artist_page_name), "%s", cur_artist);
                     artist_page_from_list = 0;   /* back -> this album */
+                    artist_page_col = "album_artist";
+                    snprintf(artist_page_val, sizeof(artist_page_val), "%s", artist_page_name);
                     artist_page_album_n = lib_albums("album_artist", artist_page_name,
                                                      artist_page_albums, ARTIST_ALBUMS_MAX, 0);
                     screen = SC_ARTIST_PAGE;
@@ -14651,6 +14987,8 @@ int music_entry(void *a0, void *a1) {
                      * match whichever one actually got tapped. */
                     snprintf(artist_page_name, sizeof(artist_page_name), "%s", row->name);
                     artist_page_from_list = 1;   /* back -> the Artists list */
+                    artist_page_col = cur_facet;
+                    snprintf(artist_page_val, sizeof(artist_page_val), "%s", cur_artist);
                     artist_page_album_n = lib_albums(cur_facet, cur_artist,
                                                      artist_page_albums, ARTIST_ALBUMS_MAX, 0);
                     screen = SC_ARTIST_PAGE; reset_scroll();
@@ -14938,6 +15276,7 @@ int music_entry(void *a0, void *a1) {
              * clean copy taken the instant before the overlay first
              * appeared is what a resume should actually show. */
             resume_save(power_pre_hold_fb);
+            card_quiesce();          /* last: everything above writes to the card */
             power_shutdown_kind = 1;
             dirty = 1;
             if (system("/sbin/poweroff") == -1) { }
@@ -16377,6 +16716,7 @@ int music_entry(void *a0, void *a1) {
                  * and the mirror below the draw block keeps both identical
                  * whenever a drag isn't in progress, which locked guarantees. */
                 resume_save(base + (size_t)(page ^ 1) * page_px);
+                card_quiesce();      /* last: everything above writes to the card */
                 if (system("/sbin/poweroff") == -1) { }
                 /* poweroff is not instant; keep the loop from re-firing this
                  * every tick while the shutdown sequence runs. */
@@ -16415,6 +16755,8 @@ int music_entry(void *a0, void *a1) {
                 st_brightness_set(last_lit_bright > 0 ? last_lit_bright : DEFAULT_BRIGHTNESS);
             }
         }
+
+        nav_track();   /* back history: remember the screen just left, if any */
 
         /* Nothing is drawn while the panel is dark; the frame is produced on
          * wake instead. */

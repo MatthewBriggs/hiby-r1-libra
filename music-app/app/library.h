@@ -46,6 +46,17 @@ int  lib_reopen(void);
  * moved it aside; the caller reopens and starts a rescan. */
 int  lib_take_damaged(void);
 
+/* A different SD card, told apart by its hardware ID (the CID). Called once
+ * at startup, before lib_open(): 1 when the card is not the one the library
+ * was built from, in which case the library and track index have been moved
+ * aside (to *.prevcard) and the caller starts a scan. 0 for the same card, a
+ * first run (the ID is only recorded), or no readable card. */
+int  lib_card_check(void);
+/* After a scan publishes: the new card's ID is recorded only now, so a scan
+ * cut short (power lost, or a card with no music) is simply run again on the
+ * next start rather than leaving an empty library marked as up to date. */
+void lib_card_commit(void);
+
 /* `expected`: the album row's own track count, from the same Albums list
  * the caller just tapped (lib_row_t.count) -- lets the folder-recovery
  * sweep below be skipped once the SQL result already accounts for every

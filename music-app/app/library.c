@@ -144,6 +144,82 @@ int lib_reopen(void) {
     return lib_open();
 }
 
+/* Card swaps, after compas-player's CID tracking.
+ *
+ * The library is built by a manual scan and lives on /usr/data, not the
+ * card, so a different card showed the old card's library -- albums that were
+ * not there, and nothing of what was -- until the user thought to scan. The
+ * card's CID (manufacturer, serial, date; unique per card and unchanged by
+ * formatting or copying) says which card the library was built from. On a
+ * different one the library and track index are moved aside and a scan
+ * starts; the stock database lib_open() falls back to is skipped too, since
+ * it describes whatever card the stock player last saw. */
+#define CARD_CID_PATH "/sys/block/mmcblk0/device/cid"
+#define CARD_ID_FILE  "/usr/data/card_id"
+
+static char g_card_new[48];     /* set while the library is being rebuilt for this card */
+
+static int read_word(const char *path, char *out, size_t n) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    int ok = fgets(out, (int)n, f) != NULL;
+    fclose(f);
+    if (!ok) return 0;
+    out[strcspn(out, " \t\r\n")] = '\0';
+    return out[0] != '\0';
+}
+
+static void card_log(const char *fmt, const char *a, const char *b) {
+    FILE *f = fopen("/usr/data/music.log", "a");
+    if (!f) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    fprintf(f, "[%6ld.%03ld] [library] ", (long)ts.tv_sec, ts.tv_nsec / 1000000L);
+    fprintf(f, fmt, a, b);
+    fputc('\n', f);
+    fclose(f);
+}
+
+static void card_record(const char *cid) {
+    char tmp[sizeof(CARD_ID_FILE) + 8];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", CARD_ID_FILE);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    fprintf(f, "%s\n", cid);
+    int ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
+    ok = fclose(f) == 0 && ok;
+    if (!ok || rename(tmp, CARD_ID_FILE) != 0) unlink(tmp);
+}
+
+int lib_card_check(void) {
+    char cid[48], saved[48];
+    if (!read_word(CARD_CID_PATH, cid, sizeof(cid))) return 0;   /* no card: change nothing */
+    if (!read_word(CARD_ID_FILE, saved, sizeof(saved))) {
+        /* First run with this: whatever library there is was built from the
+         * card that is in now, as far as anything can tell. */
+        card_record(cid);
+        card_log("card %s recorded%s", cid, "");
+        return 0;
+    }
+    if (!strcmp(cid, saved)) return 0;
+    /* Moved, not deleted, so going back to the old card is one rename away.
+     * One generation: a third card replaces the first's copy. A rebuild
+     * interrupted before is simply moved again -- rename() fails harmlessly
+     * on files already gone. */
+    rename(SCANNER_DB_PATH, SCANNER_DB_PATH ".prevcard");
+    rename(INDEX_DB_PATH, INDEX_DB_PATH ".prevcard");
+    snprintf(g_card_new, sizeof(g_card_new), "%s", cid);
+    card_log("a different card (%s, library was %s): library moved aside, rebuilding", cid, saved);
+    return 1;
+}
+
+void lib_card_commit(void) {
+    if (!g_card_new[0]) return;
+    card_record(g_card_new);
+    card_log("card %s recorded%s", g_card_new, " after its first scan");
+    g_card_new[0] = '\0';
+}
+
 int lib_open(void) {
     static int verify_started;
     if (!verify_started) {
@@ -157,6 +233,7 @@ int lib_open(void) {
                              SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, NULL);
     if (rc == SQLITE_OK && has_rows(g_db)) return 0;
     if (g_db) { sqlite3_close(g_db); g_db = NULL; }
+    if (g_card_new[0]) return -1;   /* a new card: the stock database is the old one's */
 
     rc = sqlite3_open_v2(DB_PATH, &g_db,
                          SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, NULL);

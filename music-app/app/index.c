@@ -56,7 +56,8 @@
  * locking and journaling, the reason a database lives here at all rather
  * than a flat file like this app's other SD-card state. Only ~1.3 MB for
  * the full library, comfortably inside the ~22 MB this partition has free. */
-#define INDEX_DB_PATH "/usr/data/music_index.db"
+/* INDEX_DB_PATH itself is in index.h: library.c moves the file aside when
+ * a different card goes in. */
 
 /* Same exclusions library.c's tracks_query() applies -- Podcasts/Audiobooks
  * are indexed by the stock scanner too, but have no business in a music

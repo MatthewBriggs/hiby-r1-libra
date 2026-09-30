@@ -7,6 +7,9 @@
 #include <time.h>
 #include "library.h"   /* lib_row_t, for index_albums() below */
 
+/* On /usr/data (UBIFS), not the card -- see index.c. */
+#define INDEX_DB_PATH "/usr/data/music_index.db"
+
 /* Starts the background scanner once (idempotent — a second call is a
  * no-op). Safe to call before lib_open(): the scanner opens its own
  * connections, entirely separate from library.c's g_db. */

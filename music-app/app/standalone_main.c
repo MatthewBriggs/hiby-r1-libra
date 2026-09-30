@@ -9,6 +9,8 @@
  */
 #include <stdio.h>
 
+#include "crash.h"
+
 extern int music_entry(void *a0, void *a1);
 
 /* music_entry() returns when go_back() hits the top of the navigation stack
@@ -19,6 +21,7 @@ extern int music_entry(void *a0, void *a1);
  * standalone equivalent of "hand control back to the launcher": it's the
  * same menu you'd land on either way. */
 int main(void) {
+    crash_install();
     for (;;) {
         int rc = music_entry(0, 0);
         printf("[standalone] music_entry returned %d -- re-entering\n", rc);

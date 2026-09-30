@@ -109,6 +109,7 @@ static unsigned g_radio_rate;       /* sample rate of the current radio stream/r
 #include "hls.h"
 #include "status.h"
 #include "vorbis_dec.h"
+#include "crash.h"
 #include "opus_dec.h"
 
 typedef enum { DEC_NONE = 0, DEC_FLAC, DEC_MP3, DEC_WAV, DEC_M4A,
@@ -2929,6 +2930,7 @@ static int open_any(dec_t *d, const char *path) {
     /* Look for the extension in the path, not at the end of the whole URL:
      * NRK's playlist ends "...muxed.m3u8?adap=audio&aco=aac", so a check for a
      * trailing .m3u8 sent it down the MP3 path and it decoded to nothing. */
+    crash_note_track(path);   /* named in a crash report, if this one crashes */
     int is_hls = 0;
     if (is_url) {
         const char *q = strchr(path, '?');

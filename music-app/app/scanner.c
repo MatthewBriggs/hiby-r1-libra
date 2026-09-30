@@ -71,6 +71,7 @@
 #include "tags.h"
 #include "audio.h"
 #include "index.h"
+#include "crash.h"
 
 /* Same volume this app's own tracks live under -- see library.c's
  * real_path()/SD_ROOT comment. Duplicated rather than exported for the
@@ -400,6 +401,7 @@ static void scan_dir(sqlite3 *widb, const char *dir, int *batch, int depth) {
         }
         if (!S_ISREG(st.st_mode) || !is_audio_ext(e->d_name)) continue;
 
+        crash_note_scan(full);   /* a tag parser crashing names its file */
         g_written += scan_one(widb, full, &st);
         g_scanned++;
 
@@ -489,6 +491,7 @@ static void scan_pass(void) {
      * subsystems' own files out of this table regardless of where they
      * sit. */
     scan_dir(widb, SD_ROOT, &batch, 0);
+    crash_note_scan(NULL);
     int committed = sqlite3_exec(widb, "commit", NULL, NULL, NULL) == SQLITE_OK;
     if (g_have_old) sqlite3_exec(widb, "detach database old", NULL, NULL, NULL);
     g_have_old = 0;
