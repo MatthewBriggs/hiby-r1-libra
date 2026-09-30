@@ -11584,6 +11584,9 @@ static int      power_key_down;
 static uint64_t power_key_down_us;
 static int      power_key_pending_lock;   /* screen was lit at press time; lock deferred */
 static int      power_hold_ui_shown;
+/* The hold's countdown woke a button-locked screen to draw on (see the main
+ * loop), so a hold let go of early has that to undo. */
+static int      power_hold_woke_locked;
 static int      power_hard_fired;
 /* 0 = nothing pending, 1 = graceful shutdown to run once `base` (the real
  * framebuffer, only in scope in the main loop) is reachable, set from
@@ -13050,6 +13053,19 @@ static int handle_keys(int fd, key_src_t src) {
                  * would leave a bare instant of the ordinary screen showing
                  * again in between. */
                 if (!graceful && !power_hard_fired) power_hold_ui_shown = 0;
+                /* A hold that woke a button-locked screen for its countdown
+                 * and was let go of short of shutting down did nothing, so
+                 * the screen goes back to how it was: dark, and locked.
+                 * Reported live as "the power button stopped working": a
+                 * slightly long press to wake from sleep (783 ms) left the
+                 * screen lit and usable by touch while button lock went on
+                 * swallowing every press, until a double press happened to
+                 * turn it off. */
+                if (power_hold_woke_locked && !graceful && !power_hard_fired && button_locked) {
+                    set_locked(1);
+                    mlog("[music] hold let go under button lock: screen off again\n");
+                }
+                power_hold_woke_locked = 0;
                 power_key_pending_lock = 0;
                 mlog("[music] power released after %ldms\n", elapsed_ms);
                 acted = 1;
@@ -15251,6 +15267,7 @@ int music_entry(void *a0, void *a1) {
                 if (button_locked && read_int_file(BACKLIGHT) <= 0) {
                     if (last_lit_bright > 0) saved_brightness = last_lit_bright;
                     locked = 1; set_locked(0);
+                    power_hold_woke_locked = 1;
                 }
             }
             if (power_hold_ui_shown) dirty = 1;   /* redraw every tick so the bar animates */
