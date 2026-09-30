@@ -2979,7 +2979,7 @@ static int settings_content_rows(void) {
  * pushed by hand, not by CI against a tagged commit), so this stays a
  * literal that a human edits; the discipline is remembering to, not the
  * mechanism. */
-#define LIBRARY_VERSION "0.60"
+#define LIBRARY_VERSION "0.60.1"
 
 /* A custom-built kernel keeps uname()'s own release string exactly
  * "4.4.94+" on purpose -- that string is also the vermagic every one of the
@@ -13403,6 +13403,7 @@ static void scan_inputs(void) {
             snprintf(kfd_name[kfd_n], sizeof(kfd_name[0]), "%s", node);
             kfd_n++;
             mlog("[music] headset controls on %s\n", node);
+            audio_bt_retry_now();   /* a headset just (re)connected: no backoff */
         }
     }
     fclose(f);
@@ -13873,6 +13874,7 @@ int music_entry(void *a0, void *a1) {
                     if (x < FB_W / 2) {
                         qs_wifi = !qs_wifi;
                         st_wifi_set(qs_wifi);
+                        mlog("[music] wifi: %s from the dropdown\n", qs_wifi ? "on" : "off");
                         wifi_pref = qs_wifi;
                         wifi_bt_parked = 0;
                         if (qs_wifi && net_held()) wifi_bt_override = 1;
@@ -14643,6 +14645,7 @@ int music_entry(void *a0, void *a1) {
                 if (row == 0) {
                     int on = !st_wifi_on();
                     st_wifi_set(on);
+                    mlog("[music] wifi: %s from Settings\n", on ? "on" : "off");
                     wifi_pref = on;
                     wifi_bt_parked = 0;
                     if (on && net_held()) wifi_bt_override = 1;   /* on by hand: stays on */

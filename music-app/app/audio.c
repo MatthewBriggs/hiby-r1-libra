@@ -1313,6 +1313,7 @@ static void (*x_swp_free)(void *);
 static int (*x_swp_current)(void *, void *);
 static int (*x_swp_set_start_threshold)(void *, void *, snd_pcm_uframes_t);
 static int (*x_swp_apply)(void *, void *);
+static const char *(*x_strerror)(int);   /* optional: failures still log a number */
 
 #define SYM(h, p, name) do { \
     *(void **)(&p) = dlsym(h, name); \
@@ -1333,6 +1334,7 @@ static int load_libs(void) {
         /* Optional: without it a format change clips the tail, which is a
          * great deal better than failing to load. */
         *(void **)(&x_drain) = dlsym(g_alsa, "snd_pcm_drain");
+        *(void **)(&x_strerror) = dlsym(g_alsa, "snd_strerror");
         SYM(g_alsa, x_writei,"snd_pcm_writei");
         SYM(g_alsa, x_recover,"snd_pcm_recover");
         SYM(g_alsa, x_hwp_malloc,"snd_pcm_hw_params_malloc");
@@ -2731,6 +2733,24 @@ static int bt_pin_pcm(void) {
  * Bluetooth is the exception: the A2DP transport is S16_LE whatever is asked,
  * so it goes through the plug device as before.
  */
+/* Why a Bluetooth candidate did not open. Silent before: reported live as a
+ * BTR17 that was connected but whose every device failed, 62 times in under
+ * a minute, and the log could not say at which step or with what error. */
+static void bt_open_failed(const char *name, const char *step, int rc) {
+    if (x_strerror) alog("[audio] %s: %s failed (%s)\n", name, step, x_strerror(rc));
+    else            alog("[audio] %s: %s failed (rc=%d)\n", name, step, rc);
+}
+
+/* Bluetooth connected but not opening: how long to leave it before trying
+ * again. Each failed attempt fell back to the jack, the output watcher saw a
+ * connected headset on the jack and reopened, and that failed the same way --
+ * a loop, once every ~0.85 s, each pass resetting the internal DAC too. Now
+ * a failure falls back once and waits 10 s, then 30 s, then a minute. */
+static time_t bt_retry_at;
+static int    bt_fail_streak;
+
+void audio_bt_retry_now(void) { bt_retry_at = 0; bt_fail_streak = 0; }
+
 static void *pcm_open(unsigned rate, int channels, int deep, int want_fmt) {
     void *pcm = NULL;
     char exact[24], plug[24];
@@ -2749,6 +2769,7 @@ static void *pcm_open(unsigned rate, int channels, int deep, int want_fmt) {
      * of whenever neither of the other two applies. */
     int ucard  = usb_card();
     int use_bt = (ucard <= 0) ? bt_sink_connected() : 0;
+    if (use_bt && bt_retry_at && time(NULL) < bt_retry_at) use_bt = 0;   /* backing off */
     g_out_kind = ucard > 0 ? 1 : (use_bt ? 2 : 0);
     g_out_card = ucard;
     if (use_bt) rate = bt_target_rate(rate);   /* BG41 -- see bt_target_rate() */
@@ -2789,7 +2810,13 @@ static void *pcm_open(unsigned rate, int channels, int deep, int want_fmt) {
     }
 
     for (unsigned i = 0; i < count; i++) {
-        if (x_open(&pcm, names[i], SND_PCM_STREAM_PLAYBACK, 0) < 0 || !pcm) {
+        /* Only the Bluetooth candidates log a failure: the local ones fail
+         * by design (the exact open at a rate the DAC moves, S24 on a DAC
+         * that wants S32) on every other track. */
+        int log_fail = use_bt && names[i] != plug;
+        int rc = x_open(&pcm, names[i], SND_PCM_STREAM_PLAYBACK, 0);
+        if (rc < 0 || !pcm) {
+            if (log_fail) bt_open_failed(names[i], "open", rc);
             pcm = NULL;
             continue;
         }
@@ -2797,18 +2824,22 @@ static void *pcm_open(unsigned rate, int channels, int deep, int want_fmt) {
         if (x_hwp_malloc(&hw) < 0 || !hw) { x_close(pcm); pcm = NULL; continue; }
         x_hwp_any(pcm, hw);
         x_hwp_set_access(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED);
-        int ok = x_hwp_set_format(pcm, hw, fmts[i]) >= 0;
-        if (ok) ok = x_hwp_set_channels(pcm, hw, (unsigned)channels) >= 0;
+        const char *step = "format";
+        int ok = (rc = x_hwp_set_format(pcm, hw, fmts[i])) >= 0;
+        if (ok) { step = "channels"; ok = (rc = x_hwp_set_channels(pcm, hw, (unsigned)channels)) >= 0; }
         unsigned r = rate;
-        if (ok) ok = x_hwp_set_rate_near(pcm, hw, &r, NULL) >= 0;
+        if (ok) { step = "rate"; ok = (rc = x_hwp_set_rate_near(pcm, hw, &r, NULL)) >= 0; }
         /* An exact open that had to move the rate is not exact. */
         if (ok && i == 0 && !use_bt && r != rate) ok = 0;
         unsigned buf_us = deep ? 2000000 : 500000;
         unsigned per_us = deep ?  250000 : 100000;
         if (ok) x_hwp_set_buffer_time_near(pcm, hw, &buf_us, NULL);
         if (ok) x_hwp_set_period_time_near(pcm, hw, &per_us, NULL);
-        if (ok) ok = x_hwp_apply(pcm, hw) >= 0;
-        if (!ok) { x_hwp_free(hw); x_close(pcm); pcm = NULL; continue; }
+        if (ok) { step = "hw_params"; ok = (rc = x_hwp_apply(pcm, hw)) >= 0; }
+        if (!ok) {
+            if (log_fail && rc < 0) bt_open_failed(names[i], step, rc);
+            x_hwp_free(hw); x_close(pcm); pcm = NULL; continue;
+        }
         /* Read while `hw` is still alive -- it is freed below, and the
          * start-threshold sizing after the loop needs the real granted buffer
          * rather than the buffer_time that was asked for. */
@@ -2823,7 +2854,17 @@ static void *pcm_open(unsigned rate, int channels, int deep, int want_fmt) {
         /* Fell back to the jack. Keyed on the device, not the index: every
          * candidate before plughw is still Bluetooth, and the pinned device
          * sits in front of them under BlueALSA 5. */
-        if (use_bt && names[i] == plug) g_out_kind = 0;
+        if (use_bt && names[i] == plug) {
+            g_out_kind = 0;
+            int wait = bt_fail_streak == 0 ? 10 : bt_fail_streak == 1 ? 30 : 60;
+            if (bt_fail_streak < 100) bt_fail_streak++;
+            bt_retry_at = time(NULL) + wait;
+            alog("[audio] Bluetooth is connected but will not open: on the 3.5 mm output, "
+                 "trying Bluetooth again in %d s\n", wait);
+        } else if (use_bt) {
+            bt_fail_streak = 0;
+            bt_retry_at = 0;
+        }
         alog("[audio] %s %u Hz %d ch %s%s\n", names[i], r, channels,
              fmts[i] == FMT_S32_LE ? "S32_LE" :
              fmts[i] == FMT_S24_LE ? "S24_LE" : "S16_LE",
@@ -3496,7 +3537,7 @@ static void *worker(void *arg) {
                      (t1.tv_nsec - t0.tv_nsec) / 1000000L);
             }
             if ((g_out_kind != 2 && now != g_out_card) ||
-                (g_out_kind == 0 && bt_now)) {
+                (g_out_kind == 0 && bt_now && !(bt_retry_at && time(NULL) < bt_retry_at))) {
                 alog("[audio] output changed, reopening\n");
                 x_drop(pcm); x_close(pcm);
                 pcm = pcm_open(rate, ch, d->is_stream, want_fmt);

@@ -132,6 +132,9 @@ void audio_bt_volume_service(void);
 const char *audio_codec(void);        /* of the stream now playing */
 int  audio_is_exact(void);            /* output opened with no conversion layer */
 int  audio_output_lost(void);         /* playback stopped because the device went away */
+/* A headset has just (re)connected: try Bluetooth on the next open rather
+ * than waiting out the backoff a failed open set (see pcm_open()). */
+void audio_bt_retry_now(void);
 const char *audio_output(void);   /* "3.5 mm", "USB" or "Bluetooth" */
 /* Radio only: sample rate of the current stream/recording in Hz, and the
  * real measured bitrate of the live fetch in kbps (not a nominal figure --
