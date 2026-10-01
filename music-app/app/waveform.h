@@ -44,6 +44,10 @@ void waveform_prefetch(const char *first, const char *second);
  * card with a local reader. waveform_busy() is 1 until the job that was
  * running when the pause landed has actually let go. */
 void waveform_pause(int on);
+/* No waveform work for the next `seconds`: a job in progress waits where it
+ * is rather than being thrown away. For the start of a Bluetooth stream --
+ * see audio.c's caller for why. */
+void waveform_hold(int seconds);
 int waveform_busy(void);
 
 #endif

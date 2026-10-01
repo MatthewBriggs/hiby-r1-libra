@@ -158,6 +158,65 @@ void pod_delete_download(const char *path) {
     pod_resume_store(path, 0, 0);
 }
 
+/* ---- per-feed intro/outro skip ------------------------------------------- */
+
+/* Seconds to skip at the start and the end of every episode of a feed, set
+ * from that podcast's own settings page. "intro<TAB>outro<TAB>feed", one line
+ * per feed that has either; a feed with neither has no line. */
+#define SKIP_FILE "/usr/data/podcast_skip.txt"
+
+void pod_skip_lookup(const char *feed, int *intro_s, int *outro_s) {
+    *intro_s = *outro_s = 0;
+    if (!feed || !feed[0]) return;
+    FILE *f = fopen(SKIP_FILE, "r");
+    if (!f) return;
+    char line[POD_NAME_LEN + 48];
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\n")] = '\0';
+        char *t1 = strchr(line, '\t');
+        char *t2 = t1 ? strchr(t1 + 1, '\t') : NULL;
+        if (!t2 || strcmp(t2 + 1, feed) != 0) continue;
+        *intro_s = atoi(line);
+        *outro_s = atoi(t1 + 1);
+        break;
+    }
+    fclose(f);
+}
+
+void pod_skip_store(const char *feed, int intro_s, int outro_s) {
+    if (!feed || !feed[0]) return;
+    /* Rewritten whole, by rename, like the speed file below: a write cut
+     * short must not cost every other feed its setting. */
+    char (*keep)[POD_NAME_LEN + 48] = malloc(sizeof(*keep) * 128);
+    if (!keep) return;
+    int n = 0;
+    FILE *f = fopen(SKIP_FILE, "r");
+    if (f) {
+        char line[POD_NAME_LEN + 48];
+        while (n < 127 && fgets(line, sizeof(line), f)) {
+            char probe[POD_NAME_LEN + 48];
+            snprintf(probe, sizeof(probe), "%s", line);
+            probe[strcspn(probe, "\n")] = '\0';
+            char *t1 = strchr(probe, '\t');
+            char *t2 = t1 ? strchr(t1 + 1, '\t') : NULL;
+            if (t2 && strcmp(t2 + 1, feed) == 0) continue;   /* replaced below */
+            snprintf(keep[n++], POD_NAME_LEN + 48, "%s", line);
+        }
+        fclose(f);
+    }
+    char tmp[sizeof(SKIP_FILE) + 8];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", SKIP_FILE);
+    f = fopen(tmp, "w");
+    if (f) {
+        if (intro_s > 0 || outro_s > 0) fprintf(f, "%d\t%d\t%s\n", intro_s, outro_s, feed);
+        for (int i = 0; i < n; i++) fputs(keep[i], f);
+        int ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
+        ok = fclose(f) == 0 && ok;
+        if (!ok || rename(tmp, SKIP_FILE) != 0) unlink(tmp);
+    }
+    free(keep);
+}
+
 /* ---- per-feed playback speed -------------------------------------------- */
 
 #define SPEED_FILE "/usr/data/podcast_speed.txt"
@@ -326,8 +385,105 @@ static void sort_episodes(pod_episode_t *items, int n) {
     }
 }
 
+/* Opening a feed looked up each downloaded episode's resume position by
+ * reopening RESUME_FILE once per episode, and measured each one's length by
+ * reading the start of the file -- every time, since a length was only kept
+ * once the episode had been played. Together most of a feed's opening time
+ * (289 of 386 ms, measured). Now the resume file is read once per opening,
+ * and lengths are measured once ever and kept here, "ms<TAB>path". */
+#define DUR_FILE "/usr/data/podcast_durations.txt"
+
+typedef struct { char path[POD_PATH_LEN]; int a, b; } pod_kv_t;
+
+static pod_kv_t *g_durs;
+static int g_durs_n, g_durs_cap, g_durs_loaded;
+
+static int kv_push(pod_kv_t **arr, int *n, int *cap, const char *path, int a, int b) {
+    if (*n == *cap) {
+        int nc = *cap ? *cap * 2 : 64;
+        pod_kv_t *na = realloc(*arr, sizeof(**arr) * (size_t)nc);
+        if (!na) return -1;
+        *arr = na;
+        *cap = nc;
+    }
+    snprintf((*arr)[*n].path, POD_PATH_LEN, "%s", path);
+    (*arr)[*n].a = a;
+    (*arr)[*n].b = b;
+    (*n)++;
+    return 0;
+}
+
+static int kv_find(const pod_kv_t *arr, int n, const char *path) {
+    for (int i = n - 1; i >= 0; i--)       /* newest wins: appended last */
+        if (!strcmp(arr[i].path, path)) return i;
+    return -1;
+}
+
+static void durs_load(void) {
+    if (g_durs_loaded) return;
+    g_durs_loaded = 1;
+    FILE *f = fopen(DUR_FILE, "r");
+    if (!f) return;
+    char line[POD_PATH_LEN + 32];
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\n")] = '\0';
+        char *tab = strchr(line, '\t');
+        if (!tab) continue;
+        *tab = '\0';
+        int ms = atoi(line);
+        if (ms > 0) kv_push(&g_durs, &g_durs_n, &g_durs_cap, tab + 1, ms, 0);
+    }
+    fclose(f);
+}
+
+static void durs_add(const char *path, int ms) {
+    if (ms <= 0) return;
+    kv_push(&g_durs, &g_durs_n, &g_durs_cap, path, ms, 0);
+    FILE *f = fopen(DUR_FILE, "a");
+    if (!f) return;
+    fprintf(f, "%d\t%s\n", ms, path);
+    fclose(f);
+}
+
+/* RESUME_FILE in memory, for one feed opening: path, ms, dur -- the same
+ * fields pod_resume_lookup() reads, read once instead of per episode. */
+static int resume_table(pod_kv_t **out, int *cap) {
+    int n = 0;
+    FILE *f = fopen(RESUME_FILE, "r");
+    if (!f) return 0;
+    char line[POD_PATH_LEN + 48];
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\n")] = '\0';
+        char *t1 = strchr(line, '\t');
+        if (!t1) continue;
+        *t1 = '\0';
+        char *rest = t1 + 1;
+        char *t2 = strchr(rest, '\t');
+        int dur = 0;
+        char *pathp = rest;
+        if (t2) { *t2 = '\0'; dur = atoi(rest); pathp = t2 + 1; }
+        kv_push(out, &n, cap, pathp, atoi(line), dur);
+    }
+    fclose(f);
+    return n;
+}
+
+/* How long the last pod_load_episodes() spent in each step, in ms: the folder
+ * listing, the manifest, the sort, and the per-episode resume and length
+ * lookups. Reported live as a feed taking seconds to open; these say where. */
+static int g_load_ms[4];
+void pod_load_timing(int out[4]) { memcpy(out, g_load_ms, sizeof(g_load_ms)); }
+
+static long pod_ms_since(const struct timespec *t0) {
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    return (t1.tv_sec - t0->tv_sec) * 1000L + (t1.tv_nsec - t0->tv_nsec) / 1000000L;
+}
+
 int pod_load_episodes(const char *feed, pod_episode_t *out, int max) {
     int n = 0;
+    struct timespec tl;
+    clock_gettime(CLOCK_MONOTONIC, &tl);
     snprintf(g_feed_dir, sizeof(g_feed_dir), "%s/%s", PODCAST_DIR, feed);
     snprintf(g_feed, sizeof(g_feed), "%s", feed);
     DIR *d = opendir(g_feed_dir);
@@ -366,6 +522,8 @@ int pod_load_episodes(const char *feed, pod_episode_t *out, int max) {
         out[slot].url[0] = '\0';
     }
     closedir(d);
+    g_load_ms[0] = (int)pod_ms_since(&tl);
+    clock_gettime(CLOCK_MONOTONIC, &tl);
 
     /* R18: fold in episodes.tsv, the manifest podsync_once.sh writes of
      * every episode currently in the feed's recent window, not just the
@@ -403,11 +561,35 @@ int pod_load_episodes(const char *feed, pod_episode_t *out, int max) {
         fclose(mf);
     }
 
+    g_load_ms[1] = (int)pod_ms_since(&tl);
+    clock_gettime(CLOCK_MONOTONIC, &tl);
     sort_episodes(out, n);
+    g_load_ms[2] = (int)pod_ms_since(&tl);
+    clock_gettime(CLOCK_MONOTONIC, &tl);
+    pod_kv_t *res = NULL;
+    int res_cap = 0;
+    int res_n = resume_table(&res, &res_cap);
+    durs_load();
     for (int i = 0; i < n; i++) {
         if (out[i].downloaded) {
-            out[i].resume_ms = pod_resume_lookup(out[i].path, &out[i].dur_ms);
-            pod_probe_dur(&out[i]);
+            /* Same answer pod_resume_lookup() gives -- the first matching
+             * line -- from the table read once above. */
+            out[i].resume_ms = 0;
+            out[i].dur_ms = 0;
+            for (int k = 0; k < res_n; k++)
+                if (!strcmp(res[k].path, out[i].path)) {
+                    out[i].resume_ms = res[k].a;
+                    out[i].dur_ms = res[k].b;
+                    break;
+                }
+            if (out[i].dur_ms <= 0) {
+                int d = kv_find(g_durs, g_durs_n, out[i].path);
+                if (d >= 0) out[i].dur_ms = g_durs[d].a;
+            }
+            if (out[i].dur_ms <= 0) {
+                pod_probe_dur(&out[i]);
+                durs_add(out[i].path, out[i].dur_ms);
+            }
         } else {
             out[i].resume_ms = 0; out[i].dur_ms = 0;
         }
@@ -416,6 +598,8 @@ int pod_load_episodes(const char *feed, pod_episode_t *out, int max) {
         snprintf(g_ep_url[i], POD_PATH_LEN, "%s", out[i].url);
         g_ep_mtime[i] = out[i].mtime;
     }
+    free(res);
+    g_load_ms[3] = (int)pod_ms_since(&tl);
     g_ep_n = n;
     return n;
 }

@@ -64,6 +64,12 @@ int  audio_dur_ms(void);
 int audio_envelope(const char *path, uint32_t *level, int n,
                    int (*keep_going)(void *), void *ctx);
 
+/* The loudness of the first `max_ms` of a file: one value per 50 ms, in dB
+ * of the mono mix's mean square, into `db` (up to `max_blocks`). Returns how
+ * many it filled; 0 if the file will not decode. For working out a podcast's
+ * intro (music_hook.c). Its own decoder and buffers: safe on any thread. */
+int audio_head_envelope(const char *path, int max_ms, float *db, int max_blocks);
+
 /* Radio time-shift seeking (radio streams only -- audio_dur_ms()/
  * audio_pos_ms() do not apply to a live stream). See radio_buffer.h for the
  * buffer these operate on. Negative ms rewinds, positive moves toward live

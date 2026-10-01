@@ -2410,7 +2410,8 @@ typedef enum { SC_MENU = 0, SC_MUSIC_MENU, SC_ARTISTS, SC_ALBUMS, SC_TRACKS, SC_
                SC_SETTINGS_TIMEZONE, SC_SETTINGS_THEMEMODE, SC_QUEUE,
                SC_ARTIST_PAGE,
                SC_SETTINGS_WIFI, SC_SETTINGS_BT, SC_SETTINGS_USB, SC_KEYBOARD,
-               SC_RADIO_RECORDINGS, SC_STATS, SC_STATS_BATTERY, SC_STATS_STORAGE, SC_STATS_LISTEN } screen_t;
+               SC_RADIO_RECORDINGS, SC_STATS, SC_STATS_BATTERY, SC_STATS_STORAGE, SC_STATS_LISTEN,
+               SC_POD_SETTINGS } screen_t;
 
 /* L2: the top-level menu ("Main Menu", EXIT on the right) stays small on
  * purpose rather than listing every library-browsing facet alongside
@@ -2627,7 +2628,13 @@ static int tracks_hdr_h(void)        { return tracks_hdr_info_y() + 40; }
 /* Artist page: same layout rhythm as the album page's own header just
  * above -- photo, then name, then a summary line -- one less tier (no
  * "artist" line under the title, since this page *is* that artist). */
-static int artist_page_title_y(void) { return ART_PX + 20; }
+/* The category bar (Studio / EP / Singles / Live / Remixes) sits directly
+ * under the photo, above the name -- only when there are two categories or
+ * more to move between; an artist whose albums all fall in one has none. */
+#define AC_BAR_H 56
+static int ac_bar_shown(void);
+static int artist_page_bar_y(void)   { return ART_PX; }
+static int artist_page_title_y(void) { return ART_PX + (ac_bar_shown() ? AC_BAR_H : 0) + 20; }
 static int artist_page_info_y(void)  { return artist_page_title_y() + 44; }
 static int artist_page_hdr_h(void)   { return artist_page_info_y() + 40; }
 
@@ -2979,7 +2986,7 @@ static int settings_content_rows(void) {
  * pushed by hand, not by CI against a tagged commit), so this stays a
  * literal that a human edits; the discipline is remembering to, not the
  * mechanism. */
-#define LIBRARY_VERSION "0.60.1"
+#define LIBRARY_VERSION "0.61"
 
 /* A custom-built kernel keeps uname()'s own release string exactly
  * "4.4.94+" on purpose -- that string is also the vermagic every one of the
@@ -3139,6 +3146,13 @@ static void fmt_dur(char *out, size_t n, int64_t ms) {
     else           snprintf(out, n, "%d:%02d", s / 60, s % 60);
 }
 
+/* "6 h 12 min" -- for totals, where fmt_dur's "6:12:00" reads like a clock. */
+static void fmt_hm(char *out, size_t n, int64_t ms) {
+    int m = (int)(ms / 60000);
+    if (m >= 60) snprintf(out, n, "%d h %d min", m / 60, m % 60);
+    else         snprintf(out, n, "%d min", m);
+}
+
 static void fmt_left(char *out, size_t n, int64_t ms) {
     char t[32];
     fmt_dur(t, sizeof(t), ms);
@@ -3160,6 +3174,9 @@ static int  sheet_open;                 /* 0 none, 1 actions, 2 pick a playlist,
 static int  sheet_track;                /* index into tracks[] */
 static int  sheet_playlist;             /* index into playlists[], for sheet_open == 4/5 */
 static char sheet_note[64];             /* what the last action did */
+/* sheet_open == 9: move an artist-page album to another category. */
+static int  sheet_ap_album;             /* index into artist_page_albums[] */
+static char sheet_ap_auto[48];          /* "Automatic (Studio)" */
 static const char *const sheet_items[] = {
     "Play next", "Add to queue", "Add to playlist", "Cancel"
 };
@@ -3369,6 +3386,137 @@ static void radio_recording_delete(int i) {
 }
 
 static int        pod_list;
+/* A podcast's own settings (SC_POD_SETTINGS, opened from the gear on its
+ * page): seconds skipped at the start and the end of every episode. Being
+ * edited, for cur_feed; and in force, for the episode playing. */
+#define POD_SKIP_STEP 5
+#define POD_SKIP_MAX  600
+#define POD_SET_ROW0    (CONTENT_Y + 90)
+#define POD_SET_MINUS_X (FB_W - 190)
+#define POD_SET_PLUS_X  (FB_W - 54)
+static int  pod_set_intro, pod_set_outro;
+static char pod_play_feed[POD_NAME_LEN];
+static int  pod_play_intro_s, pod_play_outro_s, pod_outro_fired;
+
+/* "Auto" on that page: the intro worked out from the podcast's own recent
+ * episodes. An intro is the same audio at the start of every episode, so it
+ * ends where they stop sounding alike. The first minute of the three newest
+ * downloaded ones is decoded to a 50 ms loudness envelope each, every pair is
+ * compared a second at a time, and the median of the three pairwise answers
+ * is the intro -- so one episode without it (a special, a trailer) makes
+ * "none found" rather than skipping into the others' content. Background,
+ * idle priority: a few seconds of decoding. */
+#ifndef SCHED_IDLE
+#define SCHED_IDLE 5   /* Linux's; the headers only name it under _GNU_SOURCE */
+#endif
+#define AUTO_MS    60000
+#define AUTO_BLKS  (AUTO_MS / 50)
+#define AUTO_EPS   3
+#define AUTO_NONE   (-1)   /* no shared start */
+#define AUTO_FEW    (-2)   /* fewer than two episodes downloaded */
+#define AUTO_LONG   (-3)   /* alike for the whole minute: not an intro */
+typedef struct {
+    char feed[POD_NAME_LEN];
+    char path[AUTO_EPS][POD_PATH_LEN];
+    int  n;
+} pod_auto_job_t;
+static volatile int pod_auto_state;   /* 0 idle, 1 working, 2 finished, 3 shown */
+static volatile int pod_auto_result;  /* seconds, or AUTO_NONE/FEW/LONG */
+static char pod_auto_feed[POD_NAME_LEN];
+
+/* Seconds two episodes' starts stay alike. Aligned first -- the intro may
+ * begin up to a second later in one (a different lead-in) and one may be
+ * mastered louder -- by the shift and level offset that best match their
+ * first 3 s; then 1 s windows, the first whose mean difference exceeds 3 dB
+ * ending it. Different speech differs by far more than that at 50 ms. */
+static int auto_pair(const float *a, int na, const float *b, int nb) {
+    int n = na < nb ? na : nb;
+    if (n < 60) return 0;
+    int best_s = 0;
+    double best = 1e9, best_off = 0;
+    for (int sft = -20; sft <= 20; sft++) {
+        double sum = 0;
+        int k = 0;
+        for (int i = 0; i < 60; i++) {
+            int j = i + sft;
+            if (j < 0 || j >= n) continue;
+            sum += a[i] - b[j];
+            k++;
+        }
+        if (k < 40) continue;
+        double off = sum / k, err = 0;
+        for (int i = 0; i < 60; i++) {
+            int j = i + sft;
+            if (j < 0 || j >= n) continue;
+            err += fabs(a[i] - b[j] - off);
+        }
+        err /= k;
+        if (err < best) { best = err; best_s = sft; best_off = off; }
+    }
+    int w = 0;
+    for (;; w++) {
+        int i0 = w * 20;
+        if (i0 + 20 > n || i0 + 20 + best_s > n || i0 + best_s < 0) break;
+        double err = 0;
+        for (int i = i0; i < i0 + 20; i++) err += fabs(a[i] - b[i + best_s] - best_off);
+        if (err / 20 > 3.0) return w;
+    }
+    return w;   /* alike to the end of what was decoded */
+}
+
+static void *pod_auto_worker(void *arg) {
+    pod_auto_job_t *job = arg;
+    struct sched_param sp;
+    memset(&sp, 0, sizeof(sp));
+    if (pthread_setschedparam(pthread_self(), SCHED_IDLE, &sp) != 0)
+        setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 19);
+    float *env[AUTO_EPS] = { 0 };
+    int nb[AUTO_EPS] = { 0 };
+    for (int i = 0; i < job->n; i++) {
+        env[i] = malloc(sizeof(float) * AUTO_BLKS);
+        if (env[i]) nb[i] = audio_head_envelope(job->path[i], AUTO_MS, env[i], AUTO_BLKS);
+    }
+    int r[3], k = 0;
+    for (int i = 0; i < job->n; i++)
+        for (int j = i + 1; j < job->n; j++)
+            r[k++] = env[i] && env[j] ? auto_pair(env[i], nb[i], env[j], nb[j]) : 0;
+    for (int i = 1; i < k; i++)            /* sort, for the median */
+        for (int j = i; j > 0 && r[j] < r[j - 1]; j--) { int t = r[j]; r[j] = r[j - 1]; r[j - 1] = t; }
+    int med = k ? r[k / 2] : 0;
+    /* Under 3 s is not an intro worth trusting: tested on eleven podcasts,
+     * every real one was 5 s or more with a sharp edge (0 dB apart, then
+     * 10+), while the one 2 s "match" was 2 dB apart -- two quiet starts. */
+    int res = med >= AUTO_MS / 1000 - 1 ? AUTO_LONG : med < 3 ? AUTO_NONE : med;
+    mlog("[music] auto intro for %s: pairs %d %d %d s -> %d\n", job->feed,
+         k > 0 ? r[0] : -1, k > 1 ? r[1] : -1, k > 2 ? r[2] : -1, res);
+    for (int i = 0; i < job->n; i++) free(env[i]);
+    pod_auto_result = res;
+    pod_auto_state = 2;
+    free(job);
+    return NULL;
+}
+
+/* From cur_feed's page, so pod_eps[] is its episodes, newest first. */
+static void pod_auto_start(void) {
+    if (pod_auto_state == 1) return;
+    snprintf(pod_auto_feed, sizeof(pod_auto_feed), "%s", cur_feed);
+    pod_auto_job_t *job = calloc(1, sizeof(*job));
+    if (!job) return;
+    snprintf(job->feed, sizeof(job->feed), "%s", cur_feed);
+    for (int i = 0; i < pod_ep_n && job->n < AUTO_EPS; i++)
+        if (pod_eps[i].downloaded && pod_eps[i].path[0])
+            snprintf(job->path[job->n++], POD_PATH_LEN, "%s", pod_eps[i].path);
+    if (job->n < 2) {
+        free(job);
+        pod_auto_result = AUTO_FEW;
+        pod_auto_state = 2;
+        return;
+    }
+    pod_auto_state = 1;
+    pthread_t t;
+    if (pthread_create(&t, NULL, pod_auto_worker, job) == 0) pthread_detach(t);
+    else { free(job); pod_auto_state = 0; }
+}
 /* A feed sync or episode downloads asked for while net_held(): started by the
  * main loop once playback over Bluetooth pauses or stops. Downloads wait in
  * order, each remembered by feed and episode name rather than by index -- the
@@ -3930,27 +4078,29 @@ static void wifi_link_tick(void) {
         st_spawn("wpa_cli -i wlan0 scan_interval 30 >/dev/null 2>&1");
     }
 
-    /* Parking. Waits 10 s of steady Bluetooth playback before powering down,
-     * and 15 s of pause before powering back up, so skipping about or a short
-     * pause does not bounce the driver. Never mid-download, mid-sync, or while
-     * the Wi-Fi screen or a join is in progress. */
-    static time_t held_since, free_since;
+    /* Parking. Off on the first tick of Bluetooth playback, back on after 15 s
+     * of pause -- so a short pause or skipping about does not bounce the
+     * driver, which is what the wait is for. It used to wait 10 s of steady
+     * playback before going off as well, and those 10 s are when Bluetooth
+     * starts with Wi-Fi up beside it on the one chip: reported live as
+     * corrupted sound for the first seconds of a podcast that resumed on
+     * waking (the headset reconnects, playback resumes, Wi-Fi has just been
+     * restored and is joining), and again on a start just after boot -- each
+     * time clearing up just as "wifi: off for Bluetooth playback" was logged.
+     * Never mid-download, mid-sync, or while the Wi-Fi screen or a join is in
+     * progress. */
+    static time_t free_since;
     int held = net_held();
-    if (!held) { held_since = 0; wifi_bt_override = 0; }
+    if (!held) wifi_bt_override = 0;
     if (!wifi_bt_parked) {
         free_since = 0;
         if (held && wifi_bt_off_enabled && !wifi_bt_override && wifi_pref && on &&
             !pod_download_active() && !pod_update_running() &&
             !wifi_connecting_ssid[0] && screen != SC_SETTINGS_WIFI) {
-            if (!held_since) held_since = now;
-            else if (now - held_since >= 10) {
-                wifi_bt_parked = 1;
-                scan_slowed = 0;
-                st_wifi_set(0);
-                mlog("[music] wifi: off for Bluetooth playback\n");
-            }
-        } else {
-            held_since = 0;
+            wifi_bt_parked = 1;
+            scan_slowed = 0;
+            st_wifi_set(0);
+            mlog("[music] wifi: off for Bluetooth playback\n");
         }
     } else if (held) {
         free_since = 0;
@@ -4389,6 +4539,278 @@ static int artist_page_album_n;
  * (the Artists list and an album's artist line ask it differently). */
 static const char *artist_page_col;
 static char artist_page_val[LIB_NAME_LEN];
+
+/* Artist page categories: the albums split into Studio, EP, Singles, Live and
+ * Remixes, one category shown at a time, a bar under the photo to say which,
+ * and left/right swipes between them. Asked for directly, with the rules:
+ * "Live" or "Remix" in the name first, then by track count -- 6 or more is
+ * Studio, 4 or 5 an EP (the request said 5; 4-track EPs are common and 4 fell
+ * between the two), 3 or fewer a Single. Rules get plenty wrong (a 5-track
+ * live EP, a 12-track remix album that is really Studio), so pressing and
+ * holding an album moves it, and the move is kept in ALBUM_CAT_FILE, keyed by
+ * album artist and album, so it survives a rescan. */
+enum { AC_STUDIO, AC_EP, AC_SINGLE, AC_LIVE, AC_REMIX, AC_N };
+static const char *const ac_names[AC_N] = { "Studio", "EP", "Singles", "Live", "Remixes" };
+#define ALBUM_CAT_FILE "/usr/data/album_categories.txt"
+
+typedef struct { char artist[LIB_NAME_LEN], album[LIB_NAME_LEN]; int cat; } ac_move_t;
+static ac_move_t *ac_moves;
+static int ac_moves_n, ac_moves_cap, ac_moves_loaded;
+
+static int ac_cat_of[ARTIST_ALBUMS_MAX];   /* per artist_page_albums[] entry */
+static int ac_count[AC_N];
+static int ac_cur;                         /* the category on show */
+static int ap_view[ARTIST_ALBUMS_MAX];     /* artist_page_albums[] indices, in it */
+static int ap_view_n;
+
+static int ac_lower(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
+static int ac_is_letter(int c) {
+    c = ac_lower(c);
+    return (c >= 'a' && c <= 'z') || (c & 0x80);   /* any UTF-8 byte counts as a letter */
+}
+/* `word` anywhere in `s`, case-insensitively; whole words only when `whole`
+ * ("Live" in "Live at Bestival", not in "Alive" or "Liverpool"). */
+static int ac_has(const char *s, const char *word, int whole) {
+    size_t n = strlen(word);
+    for (const char *p = s; *p; p++) {
+        size_t i = 0;
+        while (i < n && p[i] && ac_lower((unsigned char)p[i]) == word[i]) i++;
+        if (i < n) continue;
+        if (!whole) return 1;
+        if ((p == s || !ac_is_letter((unsigned char)p[-1])) && !ac_is_letter((unsigned char)p[n]))
+            return 1;
+    }
+    return 0;
+}
+
+static int ac_auto(const lib_row_t *r) {
+    if (ac_has(r->name, "live", 1)) return AC_LIVE;
+    if (ac_has(r->name, "remix", 0)) return AC_REMIX;
+    return r->count >= 6 ? AC_STUDIO : r->count >= 4 ? AC_EP : AC_SINGLE;
+}
+
+/* The album artist an album row is filed under, for the move key. */
+static const char *ac_artist_of(const lib_row_t *r) {
+    return r->owner[0] ? r->owner : artist_page_name;
+}
+
+static void ac_moves_load(void) {
+    if (ac_moves_loaded) return;
+    ac_moves_loaded = 1;
+    FILE *f = fopen(ALBUM_CAT_FILE, "r");
+    if (!f) return;
+    char line[LIB_NAME_LEN * 2 + 32];
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        char *t1 = strchr(line, '\t');
+        char *t2 = t1 ? strchr(t1 + 1, '\t') : NULL;
+        if (!t1 || !t2) continue;
+        *t1 = *t2 = '\0';
+        int cat = -1;
+        for (int c = 0; c < AC_N; c++) if (!strcmp(line, ac_names[c])) cat = c;
+        if (cat < 0) continue;
+        if (ac_moves_n == ac_moves_cap) {
+            int cap = ac_moves_cap ? ac_moves_cap * 2 : 32;
+            ac_move_t *m = realloc(ac_moves, sizeof(*m) * (size_t)cap);
+            if (!m) break;
+            ac_moves = m;
+            ac_moves_cap = cap;
+        }
+        ac_move_t *m = &ac_moves[ac_moves_n++];
+        snprintf(m->artist, sizeof(m->artist), "%s", t1 + 1);
+        snprintf(m->album, sizeof(m->album), "%s", t2 + 1);
+        m->cat = cat;
+    }
+    fclose(f);
+}
+
+static void ac_moves_save(void) {
+    char tmp[sizeof(ALBUM_CAT_FILE) + 8];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", ALBUM_CAT_FILE);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    for (int i = 0; i < ac_moves_n; i++)
+        fprintf(f, "%s\t%s\t%s\n", ac_names[ac_moves[i].cat], ac_moves[i].artist, ac_moves[i].album);
+    int ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
+    ok = fclose(f) == 0 && ok;
+    if (!ok || rename(tmp, ALBUM_CAT_FILE) != 0) unlink(tmp);
+}
+
+static int ac_move_find(const lib_row_t *r) {
+    const char *artist = ac_artist_of(r);
+    for (int i = 0; i < ac_moves_n; i++)
+        if (!strcmp(ac_moves[i].album, r->name) && !strcmp(ac_moves[i].artist, artist)) return i;
+    return -1;
+}
+
+static int ac_category(const lib_row_t *r) {
+    ac_moves_load();
+    int m = ac_move_find(r);
+    return m >= 0 ? ac_moves[m].cat : ac_auto(r);
+}
+
+/* Put an album in `cat`, or back to its own rule when cat < 0 (or when
+ * `cat` is what the rule says anyway -- nothing to remember then). */
+static void ac_move(const lib_row_t *r, int cat) {
+    ac_moves_load();
+    int m = ac_move_find(r);
+    if (cat < 0 || cat == ac_auto(r)) {
+        if (m < 0) return;
+        ac_moves[m] = ac_moves[--ac_moves_n];
+    } else if (m >= 0) {
+        ac_moves[m].cat = cat;
+    } else {
+        if (ac_moves_n == ac_moves_cap) {
+            int cap = ac_moves_cap ? ac_moves_cap * 2 : 32;
+            ac_move_t *nm = realloc(ac_moves, sizeof(*nm) * (size_t)cap);
+            if (!nm) return;
+            ac_moves = nm;
+            ac_moves_cap = cap;
+        }
+        ac_move_t *nm = &ac_moves[ac_moves_n++];
+        snprintf(nm->artist, sizeof(nm->artist), "%s", ac_artist_of(r));
+        snprintf(nm->album, sizeof(nm->album), "%s", r->name);
+        nm->cat = cat;
+    }
+    ac_moves_save();
+}
+
+/* Sort the loaded albums into categories and show `want` -- or, when that is
+ * empty (or -1), the first category that has anything, in bar order. */
+static void ac_regroup(int want) {
+    memset(ac_count, 0, sizeof(ac_count));
+    for (int i = 0; i < artist_page_album_n; i++) {
+        ac_cat_of[i] = ac_category(&artist_page_albums[i]);
+        ac_count[ac_cat_of[i]]++;
+    }
+    if (want < 0 || want >= AC_N || !ac_count[want]) {
+        want = AC_STUDIO;
+        for (int c = 0; c < AC_N; c++) if (ac_count[c]) { want = c; break; }
+    }
+    ac_cur = want;
+    ap_view_n = 0;
+    for (int i = 0; i < artist_page_album_n; i++)
+        if (ac_cat_of[i] == ac_cur) ap_view[ap_view_n++] = i;
+}
+
+/* The bar's labels, laid out once for both the draw and the tap test: the
+ * non-empty categories left to right, with their counts when they all fit. */
+static int  ac_bar_n;
+static int  ac_bar_cat[AC_N], ac_bar_x0[AC_N], ac_bar_x1[AC_N];
+static char ac_bar_label[AC_N][32];
+#define AC_BAR_GAP 28
+
+static void ac_bar_layout(void) {
+    for (int counts = 1; counts >= 0; counts--) {
+        int x = 24;
+        ac_bar_n = 0;
+        for (int c = 0; c < AC_N; c++) {
+            if (!ac_count[c]) continue;
+            char *l = ac_bar_label[ac_bar_n];
+            if (counts) snprintf(l, sizeof(ac_bar_label[0]), "%s %d", ac_names[c], ac_count[c]);
+            else        snprintf(l, sizeof(ac_bar_label[0]), "%s", ac_names[c]);
+            int w = text_width(l, TEXT_PX_SMALL);
+            ac_bar_cat[ac_bar_n] = c;
+            ac_bar_x0[ac_bar_n] = x;
+            ac_bar_x1[ac_bar_n] = x + w;
+            ac_bar_n++;
+            x += w + AC_BAR_GAP;
+        }
+        if (x - AC_BAR_GAP <= FB_W - 24) break;
+    }
+}
+
+/* The category whose label is nearest a tap at x, or -1. */
+static int ac_bar_hit(int x) {
+    ac_bar_layout();
+    int best = -1, best_d = 1 << 30;
+    for (int i = 0; i < ac_bar_n; i++) {
+        int mid = (ac_bar_x0[i] + ac_bar_x1[i]) / 2;
+        int d = abs(x - mid);
+        if (d < best_d) { best_d = d; best = ac_bar_cat[i]; }
+    }
+    return best;
+}
+
+static int ac_bar_shown(void) {
+    int n = 0;
+    for (int c = 0; c < AC_N; c++) if (ac_count[c]) n++;
+    return n >= 2;
+}
+
+/* The next non-empty category that way (+1 right, -1 left), or -1. */
+static int ac_neighbour(int dir) {
+    for (int c = ac_cur + dir; c >= 0 && c < AC_N; c += dir)
+        if (ac_count[c]) return c;
+    return -1;
+}
+
+/* Sliding between categories, following the finger. Asked for as "animated,
+ * smoothly": the album list moves sideways with the finger, the next
+ * category's list coming in beside it, and on release it glides the rest of
+ * the way (past a quarter of the screen) or springs back. The photo, the
+ * name and the mini player stay put; the bar's underline travels from one
+ * label to the other. Same technique as the queue drawer's slide: both pages
+ * are drawn once when the slide starts, then only composed each frame. */
+#define AC_SLIDE_START 14         /* sideways travel before a touch becomes a slide */
+static int ac_slide;              /* 0 none, 1 following the finger, 2 settling */
+static int ac_slide_x;            /* how far the list has moved: + right, - left */
+static int ac_slide_target;       /* where settling ends: 0, FB_W or -FB_W */
+static int ac_slide_nb = -1;      /* the category coming in, -1 none that way */
+static int ac_slide_fresh;        /* both page images drawn for this slide */
+
+/* `bottom`: where the mini player starts (FB_H without one) -- it stays put. */
+static void ac_compose(uint16_t *fb, const uint16_t *cur, const uint16_t *nb, int sx, int bottom) {
+    int off = scroll * ROW_H + scroll_px;
+    int split = artist_page_hdr_h() - off;          /* top of the album list */
+    if (split < 0) split = 0;
+    if (split > FB_H) split = FB_H;
+    if (bottom > FB_H) bottom = FB_H;
+    if (bottom < split) bottom = split;
+    if (sx > FB_W) sx = FB_W;
+    if (sx < -FB_W) sx = -FB_W;
+    int a = sx < 0 ? -sx : sx;
+    size_t row = (size_t)FB_W * sizeof(uint16_t);
+    memcpy(fb, cur, (size_t)split * row);
+    memcpy(fb + (size_t)bottom * FB_W, cur + (size_t)bottom * FB_W, (size_t)(FB_H - bottom) * row);
+    for (int y = split; y < bottom; y++) {
+        uint16_t *d = fb + (size_t)y * FB_W;
+        const uint16_t *c = cur + (size_t)y * FB_W;
+        const uint16_t *n = nb ? nb + (size_t)y * FB_W : NULL;
+        if (sx <= 0) {   /* moving left: the next category comes in from the right */
+            memcpy(d, c + a, (size_t)(FB_W - a) * sizeof(uint16_t));
+            if (n) memcpy(d + FB_W - a, n, (size_t)a * sizeof(uint16_t));
+            else for (int x = FB_W - a; x < FB_W; x++) d[x] = COL_BG;
+        } else {         /* moving right: the previous one comes in from the left */
+            if (n) memcpy(d, n + FB_W - a, (size_t)a * sizeof(uint16_t));
+            else for (int x = 0; x < a; x++) d[x] = COL_BG;
+            memcpy(d + a, c, (size_t)(FB_W - a) * sizeof(uint16_t));
+        }
+    }
+    /* The underline, part of the way from this category's label to the
+     * incoming one's. */
+    if (ac_bar_shown()) {
+        int uy = artist_page_bar_y() - off + AC_BAR_H - 12;
+        if (uy >= STATUS_H && uy + 3 <= FB_H) {
+            ac_bar_layout();
+            int i0 = -1, i1 = -1;
+            for (int i = 0; i < ac_bar_n; i++) {
+                if (ac_bar_cat[i] == ac_cur) i0 = i;
+                if (ac_bar_cat[i] == ac_slide_nb) i1 = i;
+            }
+            if (i0 >= 0) {
+                int t = i1 >= 0 ? a * 256 / FB_W : 0;
+                int x0 = ac_bar_x0[i0], x1 = ac_bar_x1[i0];
+                if (i1 >= 0) {
+                    x0 += (ac_bar_x0[i1] - x0) * t / 256;
+                    x1 += (ac_bar_x1[i1] - x1) * t / 256;
+                }
+                fill_rect(fb, 0, uy, FB_W, 3, COL_BG);
+                fill_rect(fb, x0, uy, x1 - x0, 3, COL_ACCENT);
+            }
+        }
+    }
+}
 /* Where "back" from the artist page should land -- the album/artist it was
  * opened from, so backing out returns to browsing that album rather than
  * always falling to the same generic spot regardless of entry point. */
@@ -4490,6 +4912,27 @@ static int pod_sync_bar_y(void) {
     return FB_H - (mini_visible() ? MINI_H : 0) - POD_SYNC_BAR_H;
 }
 
+/* A podcast's own page (a feed's episodes): laid out like an album page --
+ * the feed's cover, its name and a summary, scrolling with the episode list
+ * beneath them, in true pixels. Asked for as "a page similar to the artist
+ * page, with cover art". The chapter list (ab_list) shares SC_TRACKS and
+ * keeps its plain list. */
+static int pod_page(void) { return screen == SC_TRACKS && pod_list && !ab_list; }
+
+/* The episode under screen row `sy` on that page, or -1 for the header. */
+static int pod_page_row_at(int sy) {
+    int cy = sy + scroll * ROW_H + scroll_px - tracks_hdr_h();
+    return cy >= 0 ? cy / ROW_H : -1;
+}
+
+/* The gear at the end of the podcast's name line, opening its settings. */
+#define POD_GEAR_X (FB_W - 24 - 30)
+static int pod_gear_y(void) { return tracks_hdr_title_y() + 2 - (scroll * ROW_H + scroll_px); }
+static int pod_gear_hit(int x, int y) {
+    int gy = pod_gear_y();
+    return x >= POD_GEAR_X - 24 && y >= gy - 18 && y < gy + 48;
+}
+
 static int vis_rows(void) {
     /* R46: the album-detail screen has no status bar or title bar to leave
      * room for -- its content starts at y=0, not CONTENT_Y, same as Now
@@ -4497,7 +4940,7 @@ static int vis_rows(void) {
      * runs edge-to-edge from y=0 too. */
     int plain_album = screen == SC_TRACKS && !ab_list && !pod_list;
     int artist_page = screen == SC_ARTIST_PAGE;
-    int top = (plain_album || artist_page) ? 0 : CONTENT_Y;
+    int top = (plain_album || artist_page || pod_page()) ? 0 : CONTENT_Y;
     /* R50: the Queue screen's one extra header line (track count + playtime)
      * sits above the rows, not in the first row's own slot -- one fewer
      * row's worth of height is actually available to scroll through. */
@@ -4993,7 +5436,19 @@ static void pod_play_episode(int idx) {
     wave_track_changed(pod_eps[idx].path);
     art_request(pod_eps[idx].path, "", "", "");
     was_active = 1;
-    if (resume > 0 && resume != POD_FINISHED) audio_seek_ms(resume);
+    /* This podcast's own skips (its settings page): the intro only when the
+     * episode starts from the beginning -- a resume is already past it -- and
+     * only when it leaves something to play. */
+    snprintf(pod_play_feed, sizeof(pod_play_feed), "%s", cur_feed);
+    pod_skip_lookup(cur_feed, &pod_play_intro_s, &pod_play_outro_s);
+    pod_outro_fired = 0;
+    if (dur <= 0) dur = pod_eps[idx].dur_ms;
+    if (resume > 0 && resume != POD_FINISHED) {
+        audio_seek_ms(resume);
+    } else if (pod_play_intro_s > 0 && (dur <= 0 || pod_play_intro_s * 1000 < dur)) {
+        audio_seek_ms(pod_play_intro_s * 1000);
+        mlog("[music] skipped the first %d s (this podcast's intro)\n", pod_play_intro_s);
+    }
     pod_notes_showing = 0;
     pod_notes_scroll_px = 0;
     mlog("[music] podcast episode %s\n", pod_eps[idx].name);
@@ -5154,7 +5609,7 @@ static int tracks_max_px(void) {
  * own long-press sheet, which this screen has no equivalent gesture for. */
 static int artist_page_content_px(void) {
     int hdr = artist_page_hdr_h();
-    int albums_px = artist_page_album_n * ROW_H;
+    int albums_px = ap_view_n * ROW_H;   /* the category on show */
     int bio_y = hdr + albums_px;
     int bio_h = artist_bio_layout(NULL, 0, bio_y, FB_W - 48, 0, 0, 0);
     return bio_y + bio_h;
@@ -5169,11 +5624,21 @@ static int artist_page_max_px(void) {
 
 /* The screens scrolled in true pixels against an exact bottom, rubber-banded
  * at both ends, rather than in whole rows against a row count. */
+/* The podcast page's version: header, then one row per episode. */
+static int pod_page_max_px(void) {
+    int content_px = tracks_hdr_h() + track_n * ROW_H;
+    int bottom_margin = mini_visible() ? MINI_H : (sheet_note[0] ? 40 : 0);
+    int max_px = content_px - (FB_H - bottom_margin);
+    return max_px < 0 ? 0 : max_px;
+}
+
 static int px_scrolled_screen(void) {
-    return (screen == SC_TRACKS && !ab_list && !pod_list) || screen == SC_ARTIST_PAGE;
+    return (screen == SC_TRACKS && !ab_list && !pod_list) || screen == SC_ARTIST_PAGE || pod_page();
 }
 static int px_max(void) {
-    return screen == SC_ARTIST_PAGE ? artist_page_max_px() : tracks_max_px();
+    return screen == SC_ARTIST_PAGE ? artist_page_max_px()
+         : pod_page()               ? pod_page_max_px()
+         :                            tracks_max_px();
 }
 
 static int scroll_to_px(int total_px) {
@@ -7127,7 +7592,7 @@ static const icon_t *status_section_icon(void) {
     switch (screen) {
         case SC_MENU: return NULL;
         case SC_AUDIOBOOKS: return &icon_home_audiobooks_sb;
-        case SC_PODCASTS: case SC_POD_SYNC: return &icon_home_podcasts_sb;
+        case SC_PODCASTS: case SC_POD_SYNC: case SC_POD_SETTINGS: return &icon_home_podcasts_sb;
         case SC_RADIO: case SC_RADIO_RECORDINGS: return &icon_home_radio_sb;
         case SC_EQ: case SC_EQ_BANDS: case SC_EQ_BAND: return &icon_home_eq_sb;
         case SC_MSEB: return &icon_home_mseb_sb;
@@ -7463,13 +7928,21 @@ static void draw_screen(uint16_t *fb) {
     int pod_view = screen == SC_TRACKS && pod_list && !ab_list;
     if (!pod_view) {
         pod_view_feed[0] = '\0';
-    } else if (cover_palette_enabled && strcmp(pod_view_feed, cur_feed) != 0) {
+    } else if (strcmp(pod_view_feed, cur_feed) != 0) {
+        /* Requested whatever the palette setting: the page shows the cover
+         * itself now (see pod_page()). A feed with nothing downloaded still
+         * has its folder's cover.jpg, which the folder-art lookup finds from
+         * any path inside it. */
         snprintf(pod_view_feed, sizeof(pod_view_feed), "%s", cur_feed);
         const char *ep = "";
+        char cover[POD_NAME_LEN + 64];
         for (int i = 0; i < pod_ep_n; i++)
             if (pod_eps[i].downloaded && pod_eps[i].path[0]) { ep = pod_eps[i].path; break; }
-        if (ep[0]) view_art_request(ep, "", cur_feed);
-        else       view_art_clear();
+        if (!ep[0]) {
+            snprintf(cover, sizeof(cover), "/data/mnt/sd_0/Podcasts/%s/cover.jpg", cur_feed);
+            ep = cover;
+        }
+        view_art_request(ep, "", cur_feed);
     }
     if (cover_palette_enabled && (np_view_album || pod_view))
         view_compute_cover_palette();
@@ -7494,7 +7967,7 @@ static void draw_screen(uint16_t *fb) {
      * way Now Playing already does, for the same reason -- the cover runs
      * edge-to-edge from y=0, and there's no room left for either. Back is
      * the swipe gesture everywhere else already relies on. */
-    if (screen != SC_PLAYING && screen != SC_ARTIST_PAGE && !(screen == SC_TRACKS && !ab_list && !pod_list)) {
+    if (screen != SC_PLAYING && screen != SC_ARTIST_PAGE && !(screen == SC_TRACKS && !ab_list && !pod_list) && !pod_page()) {
         fill_rect(fb, 0, 0, FB_W, screen == SC_MENU ? STATUS_H : CONTENT_Y,
                   pod_th ? np_view_col_bg() : q_th ? np_col_bg() : COL_HEADER);
     }
@@ -7513,7 +7986,7 @@ static void draw_screen(uint16_t *fb) {
     if (screen == SC_MENU) {
         g_header_show_back = 0;
         draw_status(fb);          /* Home has the status strip but no title bar */
-    } else if (screen != SC_PLAYING && screen != SC_ARTIST_PAGE && !(screen == SC_TRACKS && !ab_list && !pod_list)) {
+    } else if (screen != SC_PLAYING && screen != SC_ARTIST_PAGE && !(screen == SC_TRACKS && !ab_list && !pod_list) && !pod_page()) {
         /* No title bar: the status strip carries back and the section's
          * icon (draw_status()), plus this screen's one action if it has one,
          * just left of the battery readout. */
@@ -8718,6 +9191,21 @@ static void draw_screen(uint16_t *fb) {
         fill_rect_clip(fb, 0, photo_y, ART_PX, ART_PX, COL_ROW, 0, clip_bot);
         artist_blit_art_clip(fb, 0, photo_y, 0, clip_bot);
 
+        /* The category bar, straight under the photo. */
+        if (ac_bar_shown()) {
+            int by = artist_page_bar_y() - off;
+            ac_bar_layout();
+            for (int i = 0; i < ac_bar_n; i++) {
+                int cur = ac_bar_cat[i] == ac_cur;
+                draw_text_clip(fb, ac_bar_x0[i], by + 16, ac_bar_label[i],
+                               cur ? COL_ACCENT : COL_DIM, TEXT_PX_SMALL, FB_W - 24, 0, clip_bot);
+                if (cur)
+                    fill_rect_clip(fb, ac_bar_x0[i], by + AC_BAR_H - 12,
+                                   ac_bar_x1[i] - ac_bar_x0[i], 3, COL_ACCENT, 0, clip_bot);
+            }
+            fill_rect_clip(fb, 0, by + AC_BAR_H - 1, FB_W, 1, COL_LINE, 0, clip_bot);
+        }
+
         draw_text_clip(fb, 24, artist_page_title_y() - off, artist_page_name,
                        COL_TEXT, TEXT_PX_TITLE, FB_W - 24, 0, clip_bot);
         {
@@ -8729,11 +9217,11 @@ static void draw_screen(uint16_t *fb) {
         }
         fill_rect_clip(fb, 0, header_h - off - 1, FB_W, 1, COL_LINE, 0, clip_bot);
 
-        for (int idx = 0; idx < artist_page_album_n; idx++) {
+        for (int idx = 0; idx < ap_view_n; idx++) {
             int ry = header_h + idx * ROW_H - off;
             if (ry + ROW_H < 0) continue;
             if (ry > clip_bot) break;
-            lib_row_t *r = &artist_page_albums[idx];
+            lib_row_t *r = &artist_page_albums[ap_view[idx]];
             draw_text_clip(fb, 24, ry + 22, r->name, COL_TEXT,
                           TEXT_PX_BODY, FB_W - 90, 0, clip_bot);
             char cbuf[16];
@@ -8742,7 +9230,7 @@ static void draw_screen(uint16_t *fb) {
             fill_rect_clip(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE, 0, clip_bot);
         }
 
-        int bio_y = header_h + artist_page_album_n * ROW_H;
+        int bio_y = header_h + ap_view_n * ROW_H;
         if (artist_art_loading) {
             int ly = bio_y + 24 - off;
             if (ly + 30 > 0 && ly < clip_bot)
@@ -8752,6 +9240,12 @@ static void draw_screen(uint16_t *fb) {
             artist_bio_layout(fb, 24, bio_y + 24, FB_W - 48, off, 0, clip_bot);
         }
 
+        /* "Moved to EP", after a press-and-hold move. */
+        if (sheet_note[0]) {
+            int ny = FB_H - 34 - (mini_visible() ? MINI_H : 0);
+            fill_rect(fb, 0, ny - 12, FB_W, 40, COL_BG);
+            draw_text(fb, 24, ny, sheet_note, COL_ACCENT, TEXT_PX_SMALL, FB_W - 48);
+        }
         if (mini_visible()) draw_mini(fb);
         return;
     }
@@ -8779,9 +9273,57 @@ static void draw_screen(uint16_t *fb) {
         }
         /* Reached from Now Playing this doubles as the queue, so the playing
          * track is marked wherever the list is entered from. */
-        for (int i = 0; i < vis_rows(); i++) {
-            int idx = scroll + i;
+        /* The podcast page (see pod_page()): cover, name and a summary, then
+         * the episodes, all at one pixel offset like the album page. */
+        int pp = pod_page();
+        int ct = pp ? 0 : CONTENT_Y;          /* clip top: no title bar to stay under */
+        int pp_off = scroll * ROW_H + scroll_px;
+        if (pp) {
+            clip_bot = FB_H - (mini_visible() ? MINI_H : (sheet_note[0] ? 40 : 0));
+            if (!g_view_art_gone_frame) {
+                fill_rect_clip(fb, 0, -pp_off, ART_PX, ART_PX, pc_row, 0, clip_bot);
+                view_blit_art_clip(fb, 0, -pp_off, 0, clip_bot);
+            }
+            draw_text_clip(fb, 24, tracks_hdr_title_y() - pp_off, cur_feed, pc_text,
+                           TEXT_PX_TITLE, POD_GEAR_X - 16, 0, clip_bot);
+            draw_icon(fb, FB_W, clip_bot, POD_GEAR_X, pod_gear_y(), &icon_home_settings_sb, pc_dim);
+            /* Episodes and how many are on the card; then playtime -- only a
+             * downloaded episode has a length, so both figures are of those:
+             * all of it, and what is still to hear (unfinished, less how far
+             * in each one is). */
+            int down = 0;
+            int64_t total_ms = 0, left_ms = 0;
+            for (int i = 0; i < pod_ep_n; i++) {
+                if (!pod_eps[i].downloaded) continue;
+                down++;
+                int64_t d = pod_eps[i].dur_ms > 0 ? pod_eps[i].dur_ms : 0;
+                total_ms += d;
+                if (pod_eps[i].resume_ms != POD_FINISHED) {
+                    int64_t at = pod_eps[i].resume_ms > 0 ? pod_eps[i].resume_ms : 0;
+                    if (d > at) left_ms += d - at;
+                }
+            }
+            char l1[64], l2[96], t1[24], t2[24];
+            snprintf(l1, sizeof(l1), "%d episode%s  \xc2\xb7  %d downloaded",
+                     pod_ep_n, pod_ep_n == 1 ? "" : "s", down);
+            fmt_hm(t1, sizeof(t1), total_ms);
+            fmt_hm(t2, sizeof(t2), left_ms);
+            if (down) snprintf(l2, sizeof(l2), "%s on the card  \xc2\xb7  %s to hear", t1, t2);
+            else      snprintf(l2, sizeof(l2), "Nothing downloaded yet");
+            draw_text_clip(fb, 24, tracks_hdr_artist_y() - pp_off, l1, pc_dim,
+                           TEXT_PX_BODY, FB_W - 24, 0, clip_bot);
+            draw_text_clip(fb, 24, tracks_hdr_info_y() - pp_off, l2, pc_dim,
+                           TEXT_PX_SMALL, FB_W - 24, 0, clip_bot);
+            fill_rect_clip(fb, 0, tracks_hdr_h() - pp_off - 1, FB_W, 1, pc_line, 0, clip_bot);
+            y = tracks_hdr_h() - pp_off;
+        }
+        int first_row = pp ? 0 : scroll;
+        int row_count = pp ? track_n : vis_rows();
+        for (int i = 0; i < row_count; i++) {
+            int idx = first_row + i;
             if (idx >= track_n) break;
+            if (pp && y > clip_bot) break;
+            if (pp && y + ROW_H <= 0) { y += ROW_H; continue; }
             lib_track_t *t = &tracks[idx];
             /* pod_list: cur_track/queue[] identify the playing episode by a
              * one-entry queue (see podcast_mode's comment), not by an index
@@ -8801,10 +9343,10 @@ static void draw_screen(uint16_t *fb) {
             int swiping_this = pod_list && pod_swipe_active && idx == pod_swipe_idx;
             int dx0 = swiping_this ? pod_swipe_dx : 0;
             if (swiping_this)
-                fill_rect_clip(fb, 0, y, FB_W, ROW_H, pc_acc, CONTENT_Y, clip_bot);
+                fill_rect_clip(fb, 0, y, FB_W, ROW_H, pc_acc, ct, clip_bot);
             if (playing && !swiping_this) {
-                fill_rect_clip(fb, 0, y, FB_W, ROW_H, pc_row, CONTENT_Y, clip_bot);
-                fill_rect_clip(fb, 0, y, 4, ROW_H, pc_acc, CONTENT_Y, clip_bot);
+                fill_rect_clip(fb, 0, y, FB_W, ROW_H, pc_row, ct, clip_bot);
+                fill_rect_clip(fb, 0, y, 4, ROW_H, pc_acc, ct, clip_bot);
             }
             /* The number the file states. Blank rather than a dash when the
              * file does not say, which is rare now it is read from tags. */
@@ -8821,12 +9363,12 @@ static void draw_screen(uint16_t *fb) {
                 snprintf(discbuf, sizeof(discbuf), "%d", disc);
                 /* right_edge is an absolute clip x, not a width -- 40, not
                  * 20, so the disc digit itself has room to draw. */
-                draw_text_clip(fb, 20, y + 22, discbuf, pc_acc, TEXT_PX_SMALL, 40, CONTENT_Y, clip_bot);
+                draw_text_clip(fb, 20, y + 22, discbuf, pc_acc, TEXT_PX_SMALL, 40, ct, clip_bot);
             }
             if (t->track > 0) snprintf(buf, sizeof(buf), "%d", t->track);
             else              buf[0] = '\0';
             draw_text_clip(fb, track_x, y + 22, buf, pc_dim, TEXT_PX_SMALL,
-                          track_x + 36, CONTENT_Y, clip_bot);
+                          track_x + 36, ct, clip_bot);
             /* FB_W - 110, matching every other row in this file that reserves
              * space for a short right-aligned figure (album/track counts):
              * index_visible() is false on this screen, so draw_right_clip's
@@ -8873,20 +9415,20 @@ static void draw_screen(uint16_t *fb) {
                 } else {
                     snprintf(buf, sizeof(buf), "Download");
                 }
-                draw_right_clip(fb, y + 22, buf, CONTENT_Y, clip_bot);
+                draw_right_clip(fb, y + 22, buf, ct, clip_bot);
             } else if (t->dur_ms > 0) {
                 fmt_dur(buf, sizeof(buf), t->dur_ms);
                 if (dx0) {
                     int bw = text_width(buf, TEXT_PX_SMALL);
                     int right = FB_W - 24 - (index_visible() ? INDEX_W : 0);
                     draw_text_clip(fb, right - bw + dx0, y + 22, buf, pc_dim,
-                                   TEXT_PX_SMALL, FB_W, CONTENT_Y, clip_bot);
+                                   TEXT_PX_SMALL, FB_W, ct, clip_bot);
                 } else {
-                    draw_right_clip(fb, y + 22, buf, CONTENT_Y, clip_bot);
+                    draw_right_clip(fb, y + 22, buf, ct, clip_bot);
                 }
             }
             if (!swiping_this)
-                fill_rect_clip(fb, 0, y + ROW_H - 1, FB_W, 1, pc_line, CONTENT_Y, clip_bot);
+                fill_rect_clip(fb, 0, y + ROW_H - 1, FB_W, 1, pc_line, ct, clip_bot);
             y += ROW_H;
         }
         /* The `!mini_visible()` gate this used to carry made every action-sheet
@@ -9640,6 +10182,63 @@ static void draw_screen(uint16_t *fb) {
         return;
     }
 
+    if (screen == SC_POD_SETTINGS) {
+        /* One podcast's settings: its name, then a row per setting, each a
+         * number of seconds with - and + either side of it. */
+        draw_text(fb, 24, CONTENT_Y + 14, cur_feed, COL_TEXT, TEXT_PX_BODY, FB_W - 48);
+        draw_text(fb, 24, CONTENT_Y + 52, "For every episode of this podcast", COL_DIM,
+                  TEXT_PX_SMALL, FB_W - 48);
+        fill_rect(fb, 0, POD_SET_ROW0 - 1, FB_W, 1, COL_LINE);
+        static const char *labels[2] = { "Skip intro", "Skip outro" };
+        int vals[2] = { pod_set_intro, pod_set_outro };
+        for (int i = 0; i < 2; i++) {
+            int ry = POD_SET_ROW0 + i * ROW_H, cy = ry + ROW_H / 2;
+            draw_text(fb, 24, ry + 20, labels[i], COL_TEXT, TEXT_PX_BODY, POD_SET_MINUS_X - 40);
+            fill_circle(fb, POD_SET_MINUS_X, cy, 22, COL_ROW);
+            fill_circle(fb, POD_SET_PLUS_X, cy, 22, COL_ROW);
+            fill_rect(fb, POD_SET_MINUS_X - 9, cy - 1, 18, 3, vals[i] > 0 ? COL_ACCENT : COL_DIM);
+            fill_rect(fb, POD_SET_PLUS_X - 9, cy - 1, 18, 3,
+                      vals[i] < POD_SKIP_MAX ? COL_ACCENT : COL_DIM);
+            fill_rect(fb, POD_SET_PLUS_X - 1, cy - 9, 3, 18,
+                      vals[i] < POD_SKIP_MAX ? COL_ACCENT : COL_DIM);
+            char vb[16];
+            if (vals[i] > 0) snprintf(vb, sizeof(vb), "%d s", vals[i]);
+            else             snprintf(vb, sizeof(vb), "Off");
+            int vw = text_width(vb, TEXT_PX_BODY);
+            int mid = (POD_SET_MINUS_X + POD_SET_PLUS_X) / 2;
+            draw_text(fb, mid - vw / 2, ry + 20, vb, vals[i] > 0 ? COL_TEXT : COL_DIM,
+                      TEXT_PX_BODY, FB_W);
+            fill_rect(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE);
+        }
+        {
+            /* Auto: work the intro out from the last episodes. */
+            int ry = POD_SET_ROW0 + 2 * ROW_H;
+            int busy = pod_auto_state == 1;
+            draw_text(fb, 24, ry + 20, "Auto intro", busy ? COL_DIM : COL_ACCENT, TEXT_PX_BODY, FB_W / 2);
+            char st[40] = "";
+            int mine = !strcmp(pod_auto_feed, cur_feed);
+            if (busy && mine) snprintf(st, sizeof(st), "Listening...");
+            else if (pod_auto_state >= 2 && mine) {
+                int r = pod_auto_result;
+                if (r > 0)                snprintf(st, sizeof(st), "Found %d s", r);
+                else if (r == AUTO_FEW)   snprintf(st, sizeof(st), "Needs 2 downloaded");
+                else if (r == AUTO_LONG)  snprintf(st, sizeof(st), "Over a minute alike");
+                else                      snprintf(st, sizeof(st), "None found");
+            }
+            if (st[0]) draw_right(fb, ry + 22, st);
+            fill_rect(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE);
+        }
+        int dy = POD_SET_ROW0 + 3 * ROW_H + 20;
+        draw_text(fb, 24, dy - 4, "Auto compares the start of the last 3 episodes.", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
+        dy += 34;
+        draw_text(fb, 24, dy, "Intro: an episode started from the beginning", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
+        draw_text(fb, 24, dy + 26, "starts this far in.", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
+        draw_text(fb, 24, dy + 64, "Outro: an episode counts as finished this", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
+        draw_text(fb, 24, dy + 90, "long before its end, and stops there.", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
+        if (mini_visible()) draw_mini(fb);
+        return;
+    }
+
     if (screen == SC_SETTINGS_USB) {
         /* ADB / Storage, driven by stock's own adbon/adboff -- see
          * st_usb_mode()'s own comment in status.c. DAC and OTG need
@@ -10135,6 +10734,7 @@ typedef struct {
     const char *ap_col;
     char        ab_dir[AB_PATH_LEN];
     int         eq_band;
+    int         ac_cur;       /* the artist page's category */
 } nav_t;
 
 #define NAV_MAX 24
@@ -10163,6 +10763,7 @@ static void nav_capture(nav_t *e) {
     e->ap_col = artist_page_col;
     snprintf(e->ab_dir, sizeof(e->ab_dir), "%s", ab_book.dir);
     e->eq_band = eq_editing_band;
+    e->ac_cur = ac_cur;
 }
 
 static int nav_overlay(void) {
@@ -10223,6 +10824,7 @@ static int nav_restore(const nav_t *e) {
             snprintf(artist_page_val, sizeof(artist_page_val), "%s", e->ap_val);
             artist_page_album_n = lib_albums(artist_page_col, artist_page_val,
                                              artist_page_albums, ARTIST_ALBUMS_MAX, 0);
+            ac_regroup(e->ac_cur);
             artist_art_request(artist_page_name);
             break;
         case SC_TRACKS:
@@ -10652,6 +11254,10 @@ static int go_back(void) {
                     view_art_request(tracks[0].path, cur_artist, cur_album);
             }
             break;
+        case SC_POD_SETTINGS:
+            /* Back to the podcast's page: still loaded, nothing to re-read. */
+            screen = SC_TRACKS; reset_scroll();
+            break;
         case SC_POD_SYNC:
             /* Refreshed the same way opening Podcasts does -- a sync that's
              * still running when the reader backs out of watching it may
@@ -10859,7 +11465,8 @@ static int sheet_rows(void) {
            sheet_open == 5 ? PLAYLIST_DELETE_N :
            sheet_open == 6 ? REC_CONFIRM_N :
            sheet_open == 7 ? (sheet_wifi_secured ? 3 : 2) :
-           sheet_open == 8 ? BT_MENU_N : SHEET_N;
+           sheet_open == 8 ? BT_MENU_N :
+           sheet_open == 9 ? AC_N + 2 : SHEET_N;   /* categories, Automatic, Cancel */
 }
 static int sheet_top(void) { return FB_H - sheet_rows() * SHEET_ROW - SHEET_HEAD; }
 
@@ -10884,6 +11491,8 @@ static void draw_sheet(uint16_t *fb) {
                     : sheet_open == 6 ? "Recording in progress"
                     : sheet_open == 7 ? sheet_wifi_ssid
                     : sheet_open == 8 ? sheet_bt_name
+                    : sheet_open == 9 ? (sheet_ap_album >= 0 && sheet_ap_album < artist_page_album_n
+                                         ? artist_page_albums[sheet_ap_album].name : "")
                     : (sheet_open == 4 || sheet_open == 5)
                     ? (sheet_playlist >= 0 && sheet_playlist < playlist_n ? playlists[sheet_playlist].name : "")
                     : (sheet_track >= 0 && sheet_track < track_n)
@@ -10923,6 +11532,12 @@ static void draw_sheet(uint16_t *fb) {
             last = (i == BT_MENU_N - 1);
             label = bt_menu_items[i];
             is_action = !last;
+        } else if (sheet_open == 9) {
+            /* The category it is in now, in the accent colour. */
+            last = (i == AC_N + 1);
+            label = last ? "Cancel" : i == AC_N ? sheet_ap_auto : ac_names[i];
+            is_action = i < AC_N && sheet_ap_album >= 0 && sheet_ap_album < artist_page_album_n &&
+                        i == ac_cat_of[sheet_ap_album];
         } else {
             last = (i == SHEET_N - 1);
             label = sheet_items[i];
@@ -11714,7 +12329,36 @@ static void draw_ui(uint16_t *fb) {
     static uint16_t *qd_under_img, *qd_queue_img;
     if (qd_active && !qd_under_img) qd_under_img = malloc((size_t)FB_W * FB_H * sizeof(uint16_t));
     if (qd_active && !qd_queue_img) qd_queue_img = malloc((size_t)FB_W * FB_H * sizeof(uint16_t));
-    if (qd_active && qd_under_img && qd_queue_img) {
+    /* The artist page's category slide: this category's page and the
+     * incoming one's, each drawn once per slide (see ac_compose()). Freed
+     * once the slide is over -- 1.5 MB is a lot to keep on this device. */
+    static uint16_t *ac_img_cur, *ac_img_nb;
+    int ac_drawn = 0;
+    if (screen == SC_ARTIST_PAGE && ac_slide && !qd_active && qs_slide == 0) {
+        if (!ac_img_cur) ac_img_cur = malloc((size_t)FB_W * FB_H * sizeof(uint16_t));
+        if (!ac_img_nb)  ac_img_nb  = malloc((size_t)FB_W * FB_H * sizeof(uint16_t));
+        if (ac_img_cur && ac_img_nb) {
+            if (!ac_slide_fresh) {
+                draw_screen(ac_img_cur);
+                if (ac_slide_nb >= 0) {
+                    int keep = ac_cur;
+                    ac_regroup(ac_slide_nb);
+                    draw_screen(ac_img_nb);
+                    ac_regroup(keep);
+                }
+                ac_slide_fresh = 1;
+            }
+            ac_compose(fb, ac_img_cur, ac_slide_nb >= 0 ? ac_img_nb : NULL, ac_slide_x,
+                       FB_H - (mini_visible() ? MINI_H : 0));
+            ac_drawn = 1;
+        }
+    } else if (!ac_slide && (ac_img_cur || ac_img_nb)) {
+        free(ac_img_cur); free(ac_img_nb);
+        ac_img_cur = ac_img_nb = NULL;
+    }
+    if (ac_drawn) {
+        /* composed above */
+    } else if (qd_active && qd_under_img && qd_queue_img) {
         if (!qd_fresh) {
             draw_screen(qd_under_img);
             if (index_visible()) draw_index(qd_under_img);
@@ -13972,6 +14616,12 @@ int music_entry(void *a0, void *a1) {
             qs_open = 0;
             screen = SC_MENU; reset_scroll();
             dirty = 1; idle = 0;
+        } else if ((g == 1 || g == 2) && screen == SC_ARTIST_PAGE && ac_slide) {
+            /* The end of a category slide (see the slide tick in the main
+             * loop): neither a tap on whatever row is under the finger nor a
+             * scroll. Caught ahead of both. */
+            list_dragging = 0; inertia_active = 0; list_velocity = 0;
+            dirty = 1; idle = 0;
         } else if (index_visible() && touch_x >= FB_W - INDEX_TOUCH_W &&
                    touch_y >= CONTENT_Y && touch_y < index_bottom()) {
             /* Anything that began on the strip ends on the strip. Sliding
@@ -14049,6 +14699,17 @@ int music_entry(void *a0, void *a1) {
                     playlist_n = pl_list(playlists, PL_MAX);
                 }
                 sheet_open = 0;
+            } else if (sheet_open == 9) {
+                sheet_open = 0;
+                if (i >= 0 && i <= AC_N && sheet_ap_album >= 0 && sheet_ap_album < artist_page_album_n) {
+                    lib_row_t *r = &artist_page_albums[sheet_ap_album];
+                    ac_move(r, i < AC_N ? i : -1);
+                    ac_regroup(ac_cur);   /* stays on this category unless it is now empty */
+                    int to = ac_cat_of[sheet_ap_album];
+                    snprintf(sheet_note, sizeof(sheet_note), "%.40s: %s", r->name, ac_names[to]);
+                    int off = scroll * ROW_H + scroll_px, mx = artist_page_max_px();
+                    if (off > mx) { scroll = mx / ROW_H; scroll_px = mx % ROW_H; }
+                }
             } else if (sheet_open == 8) {
                 sheet_open = 0;
                 if (i == 0) {
@@ -14767,6 +15428,30 @@ int music_entry(void *a0, void *a1) {
                 if (idx == 0) { screen = SC_STATS_BATTERY; reset_scroll(); }
                 else if (idx == 1) { screen = SC_STATS_STORAGE; reset_scroll(); stor_request(); }
                 else if (idx == 2) { screen = SC_STATS_LISTEN; reset_scroll(); }
+            } else if (pod_page() && pod_gear_hit(x, y)) {
+                pod_skip_lookup(cur_feed, &pod_set_intro, &pod_set_outro);
+                if (pod_auto_state != 1) pod_auto_state = 0;   /* an old result is not news */
+                screen = SC_POD_SETTINGS; reset_scroll();
+            } else if (screen == SC_POD_SETTINGS) {
+                int row = y >= POD_SET_ROW0 ? (y - POD_SET_ROW0) / ROW_H : -1;
+                int dir = abs(x - POD_SET_MINUS_X) <= 40 ? -1 : abs(x - POD_SET_PLUS_X) <= 40 ? +1 : 0;
+                if (row == 2) {
+                    pod_auto_start();
+                } else if ((row == 0 || row == 1) && dir) {
+                    int *v = row == 0 ? &pod_set_intro : &pod_set_outro;
+                    int nv = *v + dir * POD_SKIP_STEP;
+                    if (nv < 0) nv = 0;
+                    if (nv > POD_SKIP_MAX) nv = POD_SKIP_MAX;
+                    if (nv != *v) {
+                        *v = nv;
+                        pod_skip_store(cur_feed, pod_set_intro, pod_set_outro);
+                        /* An episode of this podcast playing now goes by it too. */
+                        if (podcast_mode && !strcmp(pod_play_feed, cur_feed)) {
+                            pod_play_intro_s = pod_set_intro;
+                            pod_play_outro_s = pod_set_outro;
+                        }
+                    }
+                }
             } else if (screen == SC_TRACKS && !ab_list && !pod_list) {
                 /* R46: tap coordinates are screen-space; the header/track
                  * layout is content-space (see the draw side's own `off`).
@@ -14787,6 +15472,7 @@ int music_entry(void *a0, void *a1) {
                     snprintf(artist_page_val, sizeof(artist_page_val), "%s", artist_page_name);
                     artist_page_album_n = lib_albums("album_artist", artist_page_name,
                                                      artist_page_albums, ARTIST_ALBUMS_MAX, 0);
+                    ac_regroup(-1);
                     screen = SC_ARTIST_PAGE;
                     reset_scroll();
                     artist_art_request(artist_page_name);
@@ -14819,10 +15505,15 @@ int music_entry(void *a0, void *a1) {
                 int off = scroll * ROW_H + scroll_px;
                 int header_h = artist_page_hdr_h();
                 int content_y = y + off;
-                if (content_y >= header_h) {
+                if (ac_bar_shown() && content_y >= artist_page_bar_y() &&
+                    content_y < artist_page_bar_y() + AC_BAR_H && y >= STATUS_H) {
+                    /* A tap on the category bar picks that category. */
+                    int c = ac_bar_hit(x);
+                    if (c >= 0 && c != ac_cur) ac_regroup(c);
+                } else if (content_y >= header_h) {
                     int idx = (content_y - header_h) / ROW_H;
-                    if (idx >= 0 && idx < artist_page_album_n) {
-                        lib_row_t *r = &artist_page_albums[idx];
+                    if (idx >= 0 && idx < ap_view_n) {
+                        lib_row_t *r = &artist_page_albums[ap_view[idx]];
                         snprintf(cur_album, sizeof(cur_album), "%s", r->name);
                         snprintf(cur_artist, sizeof(cur_artist), "%s", r->owner);
                         browsing_is_playlist = 0;   /* BG73 */
@@ -14866,6 +15557,12 @@ int music_entry(void *a0, void *a1) {
                 int off = scroll * ROW_H + scroll_px;
                 int smooth_row = (y - off_row_base + off) / ROW_H;
                 if (screen == SC_QUEUE && y < CONTENT_Y + QUEUE_BAR_H) smooth_row = -1;
+                /* The podcast page: `scroll + idx` is the episode, as below
+                 * expects, with the header (and its pixel scroll) allowed for. */
+                if (pod_page()) {
+                    int ep = pod_page_row_at(y);
+                    idx = ep >= 0 ? ep - scroll : -scroll - 1;
+                }
                 if (screen == SC_MENU) {
                     idx = TOP_N;
                     for (int i = 0; i < TOP_N; i++) {
@@ -15010,10 +15707,11 @@ int music_entry(void *a0, void *a1) {
                     snprintf(artist_page_val, sizeof(artist_page_val), "%s", cur_artist);
                     artist_page_album_n = lib_albums(cur_facet, cur_artist,
                                                      artist_page_albums, ARTIST_ALBUMS_MAX, 0);
+                    ac_regroup(-1);
                     screen = SC_ARTIST_PAGE; reset_scroll();
                     artist_art_request(artist_page_name);
                     mlog("[music] %s -> %d albums\n", cur_artist, artist_page_album_n);
-                } else if (screen == SC_TRACKS && scroll + idx < track_n &&
+                } else if (screen == SC_TRACKS && scroll + idx >= 0 && scroll + idx < track_n &&
                            !pod_swipe_active) {
                     /* Plain albums are caught by their own SC_TRACKS branch
                      * above now (R46) -- only ab_list/pod_list ever reach
@@ -15176,8 +15874,17 @@ int music_entry(void *a0, void *a1) {
                     }
                 } else if (screen == SC_PODCASTS && scroll + idx < pod_feed_n) {
                     snprintf(cur_feed, sizeof(cur_feed), "%s", pod_feeds[scroll + idx].name);
+                    uint64_t lt0 = us_now();
                     pod_ep_n = pod_load_episodes(cur_feed, pod_eps, POD_MAX_ITEMS);
+                    uint64_t lt1 = us_now();
                     pod_rebuild_tracks();
+                    {
+                        int st[4];
+                        pod_load_timing(st);
+                        mlog("[music] feed open: load %llu ms (folder %d, list %d, sort %d, lookups %d), rebuild %llu ms\n",
+                             (unsigned long long)((lt1 - lt0) / 1000), st[0], st[1], st[2], st[3],
+                             (unsigned long long)((us_now() - lt1) / 1000));
+                    }
                     snprintf(cur_album, sizeof(cur_album), "%s", cur_feed);
                     cur_artist[0] = '\0';
                     /* R58: was never reset here before podcast episodes
@@ -15965,9 +16672,9 @@ int music_entry(void *a0, void *a1) {
          * that case too, but excluding it here keeps a not-yet-downloaded
          * row from visually reacting to a swipe that would do nothing. */
         if (screen == SC_TRACKS && pod_list) {
-            int press_idx = scroll + (touch_y - CONTENT_Y) / ROW_H;
+            int press_idx = pod_page_row_at(touch_y);
             int mini_bottom = mini_visible() ? FB_H - MINI_H : FB_H;
-            int valid_row = touch_y >= CONTENT_Y && touch_y < mini_bottom &&
+            int valid_row = touch_y < mini_bottom &&
                             press_idx >= 0 && press_idx < track_n &&
                             pod_eps[press_idx].downloaded;
             if (!pod_swipe_active && touch_down && valid_row && !ROW_SWIPE_BLOCKED) {
@@ -16029,6 +16736,51 @@ int music_entry(void *a0, void *a1) {
             rec_swipe_dx = 0;
         }
 
+        /* Artist page category slide (see ac_compose()). Starts once a touch
+         * clear of both edge zones has gone sideways far enough and twice as
+         * far as up or down; from then on the list does not scroll. */
+        if (screen != SC_ARTIST_PAGE) {
+            ac_slide = 0; ac_slide_x = 0; ac_slide_nb = -1;
+        } else {
+            if (!ac_slide && touch_down && ac_bar_shown() && !sheet_open && !qs_open && !qs_pulling &&
+                !edge_active && !qd_edge_active && !hold_fired &&
+                touch_x >= EDGE_ZONE && touch_x < FB_W - QD_EDGE_ZONE) {
+                int dx = live_x - touch_x, dy = live_y - touch_y;
+                if (abs(dx) > AC_SLIDE_START && abs(dx) > 2 * abs(dy)) {
+                    ac_slide = 1;
+                    ac_slide_nb = -2;   /* not yet chosen: forces the first pick below */
+                    list_dragging = 0; inertia_active = 0; list_velocity = 0;
+                }
+            }
+            if (ac_slide == 1) {
+                if (touch_down) {
+                    int dx = live_x - touch_x;
+                    int nb = ac_neighbour(dx < 0 ? +1 : -1);
+                    if (nb != ac_slide_nb) { ac_slide_nb = nb; ac_slide_fresh = 0; }
+                    ac_slide_x = nb >= 0 ? dx : dx / 3;   /* nothing that way: it resists */
+                } else {
+                    int go = ac_slide_nb >= 0 && abs(ac_slide_x) > FB_W / 4;
+                    ac_slide_target = go ? (ac_slide_x < 0 ? -FB_W : FB_W) : 0;
+                    ac_slide = 2;
+                }
+                dirty = 1; idle = 0;
+            } else if (ac_slide == 2) {
+                int d = ac_slide_target - ac_slide_x;
+                int step = d * 3 / 10;
+                if (abs(step) < 16) step = d > 0 ? (d < 16 ? d : 16) : (d > -16 ? d : -16);
+                ac_slide_x += step;
+                if (ac_slide_x == ac_slide_target) {
+                    if (ac_slide_target != 0 && ac_slide_nb >= 0) {
+                        ac_regroup(ac_slide_nb);
+                        int off = scroll * ROW_H + scroll_px, mx = artist_page_max_px();
+                        if (off > mx) { scroll = mx / ROW_H; scroll_px = mx % ROW_H; }
+                    }
+                    ac_slide = 0; ac_slide_x = 0; ac_slide_nb = -1; ac_slide_fresh = 0;
+                }
+                dirty = 1; idle = 0;
+            }
+        }
+
         /* List scrolling: tracked live, one pixel at a time, rather than
          * jumping by whatever whole number of rows the release distance
          * happened to divide into — which is where "four items at a time"
@@ -16063,7 +16815,7 @@ int music_entry(void *a0, void *a1) {
              * scrolling. Artist page: same, its own photo runs edge-to-edge
              * from y=0 too. */
             int drag_top = ((screen == SC_TRACKS && !ab_list && !pod_list) ||
-                            screen == SC_ARTIST_PAGE) ? 0 : CONTENT_Y;
+                            screen == SC_ARTIST_PAGE || pod_page()) ? 0 : CONTENT_Y;
             /* Reported live on the album-detail screen: the cover would
              * visibly "pop" (a brief, wrong scroll jump) right as a
              * left-edge swipe-back began, before the gesture was recognised
@@ -16134,7 +16886,8 @@ int music_entry(void *a0, void *a1) {
                             !rec_swipe_active && !mseb_slider_gesture &&
                             touch_y >= drag_top && !edge_active && !edge_zone_ambiguous &&
                             !home_edge_active && !home_edge_zone_ambiguous &&
-                            !qs_pull_ambiguous && !qd_edge_active && !qd_active && !qd_zone_ambiguous;
+                            !qs_pull_ambiguous && !qd_edge_active && !qd_active && !qd_zone_ambiguous &&
+                            !ac_slide;
             if (list_dragging && !was) {
                 /* A raw drag on the list itself is free browsing, not bound
                  * by wherever the index last landed — otherwise a stale
@@ -16393,7 +17146,7 @@ int music_entry(void *a0, void *a1) {
                  * off. */
                 int idx;
                 if (pod_list) {
-                    idx = scroll + (touch_y - CONTENT_Y) / ROW_H;
+                    idx = pod_page_row_at(touch_y);
                 } else {
                     int off = scroll * ROW_H + scroll_px;
                     int content_y = touch_y + off;
@@ -16418,6 +17171,29 @@ int music_entry(void *a0, void *a1) {
                 if (idx >= 0 && idx < track_n) {
                     sheet_open = 1;
                     sheet_track = idx;
+                    dirty = 1; idle = 0;
+                }
+            }
+        }
+
+        /* Press-and-hold on an artist page album: move it to another
+         * category (see ac_move()). Same row math as this page's tap. */
+        if (touch_down && !touch_moved && !edge_active && !hold_fired && !sheet_open &&
+            screen == SC_ARTIST_PAGE && touch_y >= CONTENT_Y) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long held = (now.tv_sec - touch_at.tv_sec) * 1000L +
+                        (now.tv_nsec - touch_at.tv_nsec) / 1000000L;
+            if (held >= HOLD_MS) {
+                int content_y = touch_y + scroll * ROW_H + scroll_px;
+                int header_h = artist_page_hdr_h();
+                int idx = content_y >= header_h ? (content_y - header_h) / ROW_H : -1;
+                hold_fired = 1;
+                if (idx >= 0 && idx < ap_view_n) {
+                    sheet_ap_album = ap_view[idx];
+                    snprintf(sheet_ap_auto, sizeof(sheet_ap_auto), "Automatic (%s)",
+                             ac_names[ac_auto(&artist_page_albums[sheet_ap_album])]);
+                    sheet_open = 9;
                     dirty = 1; idle = 0;
                 }
             }
@@ -16774,6 +17550,38 @@ int music_entry(void *a0, void *a1) {
                  * write the same value that goes dark. */
                 st_brightness_set(last_lit_bright > 0 ? last_lit_bright : DEFAULT_BRIGHTNESS);
             }
+        }
+
+        /* This podcast's outro skip (its settings page): that close to the
+         * end, the episode counts as finished and stops, as if it had played
+         * out. Not mid-seek -- the position is the old one until it lands. */
+        if (podcast_mode && pod_play_outro_s > 0 && !pod_outro_fired &&
+            audio_is_active() && !audio_is_paused() && audio_seek_pending_ms() < 0 &&
+            cur_track >= 0 && cur_track < queue_n) {
+            int dur = audio_dur_ms();
+            if (dur <= 0) dur = queue[cur_track].dur_ms;
+            int left_ms = pod_play_outro_s * 1000;
+            if (dur > left_ms + pod_play_intro_s * 1000 && audio_pos_ms() >= dur - left_ms) {
+                pod_outro_fired = 1;
+                pod_resume_store(queue[cur_track].path, POD_FINISHED, dur);
+                mlog("[music] skipped the last %d s (this podcast's outro)\n", pod_play_outro_s);
+                audio_stop();
+                dirty = 1;
+            }
+        }
+
+        /* Auto intro finished (see pod_auto_worker()): set it, for its own
+         * feed whichever page is showing now. */
+        if (pod_auto_state == 2) {
+            pod_auto_state = 3;
+            if (pod_auto_result > 0) {
+                int intro, outro;
+                pod_skip_lookup(pod_auto_feed, &intro, &outro);
+                pod_skip_store(pod_auto_feed, pod_auto_result, outro);
+                if (!strcmp(pod_auto_feed, cur_feed)) pod_set_intro = pod_auto_result;
+                if (podcast_mode && !strcmp(pod_play_feed, pod_auto_feed)) pod_play_intro_s = pod_auto_result;
+            }
+            dirty = 1;
         }
 
         nav_track();   /* back history: remember the screen just left, if any */

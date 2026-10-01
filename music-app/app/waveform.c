@@ -259,8 +259,35 @@ static int pre_slot(void) {
     return -1;
 }
 
+/* waveform_hold(): until when, on CLOCK_MONOTONIC (0 = no hold). */
+static time_t g_hold_until;
+
+void waveform_hold(int seconds) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    pthread_mutex_lock(&g_lock);
+    int was = g_hold_until > ts.tv_sec;
+    if (ts.tv_sec + seconds > g_hold_until) g_hold_until = ts.tv_sec + seconds;
+    pthread_mutex_unlock(&g_lock);
+    if (!was) WLOG("[wave] holding off for %d s: a Bluetooth stream is starting\n", seconds);
+}
+
+/* Worker thread only: sit out a hold, a second at a time. */
+static void hold_wait(void) {
+    for (;;) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        pthread_mutex_lock(&g_lock);
+        int held = g_hold_until > ts.tv_sec && !g_paused;
+        pthread_mutex_unlock(&g_lock);
+        if (!held) return;
+        sleep(1);
+    }
+}
+
 static int still_wanted(void *ctx) {
     const char *path = (const char *)ctx;
+    hold_wait();   /* mid-job: wait here rather than lose what is done */
     pthread_mutex_lock(&g_lock);
     int ok;
     if (g_paused) {
@@ -343,6 +370,7 @@ static void *worker(void *arg) {
         } else {
             struct timespec t0, t1;
             clock_gettime(CLOCK_MONOTONIC, &t0);
+            hold_wait();
             outcome = audio_envelope(path, level, WAVEFORM_BUCKETS, still_wanted, path);
             clock_gettime(CLOCK_MONOTONIC, &t1);
             long ms = (t1.tv_sec - t0.tv_sec) * 1000L + (t1.tv_nsec - t0.tv_nsec) / 1000000L;

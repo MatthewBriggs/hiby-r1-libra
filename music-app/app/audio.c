@@ -110,6 +110,7 @@ static unsigned g_radio_rate;       /* sample rate of the current radio stream/r
 #include "status.h"
 #include "vorbis_dec.h"
 #include "crash.h"
+#include "waveform.h"
 #include "opus_dec.h"
 
 typedef enum { DEC_NONE = 0, DEC_FLAC, DEC_MP3, DEC_WAV, DEC_M4A,
@@ -1710,6 +1711,48 @@ out:
     return rc;
 }
 
+/* See audio.h: the first max_ms of a file as 50 ms loudness blocks, for
+ * working out a podcast's intro. Same private decode as above, no throttle:
+ * a minute of audio, from a thread that already runs at idle priority. */
+int audio_head_envelope(const char *path, int max_ms, float *db, int max_blocks) {
+    if (!path || !path[0] || !db || max_blocks <= 0 || max_ms <= 0) return 0;
+    short *pcm = malloc((size_t)DEC_MAX_FRAMES * 8 * sizeof(short));
+    short *buf = malloc((size_t)ENV_CHUNK * ENV_MAX_CH * sizeof(short));
+    int n = 0;
+    dec_t d;
+    if (!pcm || !buf) goto out;
+    if (dec_open_buf(&d, path, pcm) != 0) goto out;
+    if (d.channels >= 1 && d.channels <= ENV_MAX_CH && d.rate > 0) {
+        uint32_t ch = (uint32_t)d.channels;
+        uint32_t blk = d.rate / 20;            /* 50 ms */
+        uint64_t limit = (uint64_t)d.rate * (uint64_t)max_ms / 1000;
+        uint64_t done = 0;
+        double acc = 0;
+        uint32_t in = 0;
+        while (n < max_blocks && done < limit) {
+            uint64_t got = dec_read(&d, buf, ENV_CHUNK);
+            if (got == 0) break;
+            for (uint64_t i = 0; i < got && n < max_blocks; i++) {
+                int s = 0;
+                for (uint32_t c = 0; c < ch; c++) s += buf[i * ch + c];
+                s /= (int)ch;
+                acc += (double)s * s;
+                if (++in == blk) {
+                    db[n++] = (float)(10.0 * log10(acc / blk + 1.0));
+                    acc = 0;
+                    in = 0;
+                }
+            }
+            done += got;
+        }
+    }
+    dec_close(&d);
+out:
+    free(pcm);
+    free(buf);
+    return n;
+}
+
 /* ---- output routing ------------------------------------------------------ */
 /* An A2DP sink shows up as a bluealsa PCM ending in /sink. */
 static int bt_sink_connected(void) {
@@ -2749,6 +2792,11 @@ static void bt_open_failed(const char *name, const char *step, int rc) {
 static time_t bt_retry_at;
 static int    bt_fail_streak;
 
+/* When a Bluetooth stream was last seen playing (the playback loop's once a
+ * second tick). An open with nothing streaming for 10 s before it is a
+ * stream *starting* -- a resume, a reconnect, the first track -- rather than
+ * the next track of one already running. */
+static time_t bt_alive_at;
 void audio_bt_retry_now(void) { bt_retry_at = 0; bt_fail_streak = 0; }
 
 static void *pcm_open(unsigned rate, int channels, int deep, int want_fmt) {
@@ -2864,6 +2912,18 @@ static void *pcm_open(unsigned rate, int channels, int deep, int want_fmt) {
         } else if (use_bt) {
             bt_fail_streak = 0;
             bt_retry_at = 0;
+            /* The first seconds of a Bluetooth stream are the fragile ones:
+             * the headset's buffer starts empty and the encoder starts cold.
+             * Reported live as corrupted sound at the start of a podcast that
+             * resumed on waking, with the waveform worker reading the whole
+             * episode off the card at the same moment (38 s, on a resume at
+             * boot). It runs at idle priority, but the card I/O and memory it
+             * pulls in do not. So it waits out the start. Not on the next
+             * track of a stream already running: that is not a start, and a
+             * hold on every track would leave each song without a waveform
+             * for half a minute. */
+            if (time(NULL) - bt_alive_at > 10) waveform_hold(30);
+            bt_alive_at = time(NULL);
         }
         alog("[audio] %s %u Hz %d ch %s%s\n", names[i], r, channels,
              fmts[i] == FMT_S32_LE ? "S32_LE" :
@@ -3513,6 +3573,7 @@ static void *worker(void *arg) {
          * preempt either, so there's nothing for this check to do then). */
         if (++poll_tick >= (int)(rate / CHUNK_FRAMES) + 1) {
             poll_tick = 0;
+            if (g_out_kind == 2) bt_alive_at = time(NULL);   /* see bt_alive_at */
             int now = usb_card();
             int bt_now = 0;
             /* BG90 regression, reported live as "wake from sleep feels

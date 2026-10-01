@@ -62,6 +62,8 @@ int pod_scan_feeds(pod_feed_t *out, int max);
  * duration for anything downloaded. Also remembers `feed` internally as the
  * directory pod_download_start() targets next. */
 int pod_load_episodes(const char *feed, pod_episode_t *out, int max);
+/* ms spent in the last load: folder listing, manifest, sort, per-episode lookups. */
+void pod_load_timing(int out[4]);
 
 /* One line per episode: "<ms>\t<dur_ms>\t<path>" in .podsync/resume.txt on
  * the card -- unchanged from the standalone app's format, so an existing
@@ -86,6 +88,9 @@ void pod_delete_download(const char *path);
  * audio_set_speed() already takes. 0 back from the lookup means "no
  * saved speed for this feed" -- the caller's own default (1000) applies. */
 void pod_speed_store(const char *feed, int permille);
+/* Seconds to skip at the start/end of every episode of `feed` (0 = none). */
+void pod_skip_lookup(const char *feed, int *intro_s, int *outro_s);
+void pod_skip_store(const char *feed, int intro_s, int outro_s);
 int  pod_speed_lookup(const char *feed);
 
 /* On-demand download of one manifest-only episode (R18), same fork+curl
