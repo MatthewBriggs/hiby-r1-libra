@@ -391,7 +391,7 @@ static void sort_episodes(pod_episode_t *items, int n) {
  * once the episode had been played. Together most of a feed's opening time
  * (289 of 386 ms, measured). Now the resume file is read once per opening,
  * and lengths are measured once ever and kept here, "ms<TAB>path". */
-#define DUR_FILE "/usr/data/podcast_durations.txt"
+#define DUR_FILE "/usr/data/podcast_durations2.txt"   /* "2": the first counted ID3 tags as audio */
 
 typedef struct { char path[POD_PATH_LEN]; int a, b; } pod_kv_t;
 
@@ -582,11 +582,13 @@ int pod_load_episodes(const char *feed, pod_episode_t *out, int max) {
                     out[i].dur_ms = res[k].b;
                     break;
                 }
-            if (out[i].dur_ms <= 0) {
-                int d = kv_find(g_durs, g_durs_n, out[i].path);
-                if (d >= 0) out[i].dur_ms = g_durs[d].a;
-            }
-            if (out[i].dur_ms <= 0) {
+            /* The measured length wins over one saved with a resume position:
+             * those were the old estimate, which counted ID3 tags as audio. */
+            int d = kv_find(g_durs, g_durs_n, out[i].path);
+            if (d >= 0) {
+                out[i].dur_ms = g_durs[d].a;
+            } else {
+                out[i].dur_ms = 0;
                 pod_probe_dur(&out[i]);
                 durs_add(out[i].path, out[i].dur_ms);
             }

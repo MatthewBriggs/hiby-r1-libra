@@ -1069,6 +1069,60 @@ static void dec_close(dec_t *d) {
  * its own comment). Estimated instead from file size and the bitrate
  * already in the database -- exact for CBR, close for VBR, which is all
  * a list-row label needs. */
+/* An MP3's length from its headers alone. The Xing/Info header an encoder
+ * writes into the first frame states the frame count, exact even for VBR;
+ * without one, the audio bytes over the bitrate -- the audio bytes, not the
+ * file: an ID3v2 tag with cover art is often hundreds of KB, and counting it
+ * as audio overstated a 96 kbps episode with a 480 KB tag by 40 s. That
+ * mattered once a podcast's outro skip fired at "length minus N": it never
+ * fired. 0 when the first frame cannot be found. */
+static int mp3_exact_dur_ms(const char *path, int bitrate_bps) {
+    static const int kbps1[16] = { 0,32,40,48,56,64,80,96,112,128,160,192,224,256,320,0 };
+    static const int kbps2[16] = { 0,8,16,24,32,40,48,56,64,80,96,112,128,144,160,0 };
+    static const int rate1[4] = { 44100, 48000, 32000, 0 };
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    long start = 0;
+    unsigned char h[10];
+    if (fread(h, 1, 10, f) == 10 && !memcmp(h, "ID3", 3))
+        start = 10 + (((long)(h[6] & 0x7f) << 21) | ((long)(h[7] & 0x7f) << 14) |
+                      ((long)(h[8] & 0x7f) << 7)  |  (long)(h[9] & 0x7f));
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    long end = size;
+    if (size >= 128) {               /* ID3v1 at the very end */
+        unsigned char t[3];
+        fseek(f, size - 128, SEEK_SET);
+        if (fread(t, 1, 3, f) == 3 && !memcmp(t, "TAG", 3)) end = size - 128;
+    }
+    unsigned char b[4096];
+    fseek(f, start, SEEK_SET);
+    size_t n = fread(b, 1, sizeof(b), f);
+    fclose(f);
+    for (size_t i = 0; i + 48 <= n; i++) {
+        if (b[i] != 0xFF || (b[i + 1] & 0xE0) != 0xE0) continue;
+        int ver = (b[i + 1] >> 3) & 3;           /* 3 MPEG1, 2 MPEG2, 0 MPEG2.5 */
+        int layer = (b[i + 1] >> 1) & 3;         /* 1 = Layer III */
+        int bri = (b[i + 2] >> 4) & 0xF, sri = (b[i + 2] >> 2) & 3;
+        if (ver == 1 || layer != 1 || bri == 0 || bri == 15 || sri == 3) continue;
+        int rate = rate1[sri] >> (ver == 3 ? 0 : ver == 2 ? 1 : 2);
+        int mono = ((b[i + 3] >> 6) & 3) == 3;
+        int side = ver == 3 ? (mono ? 17 : 32) : (mono ? 9 : 17);
+        size_t x = i + 4 + (size_t)side;
+        if (x + 12 <= n && (!memcmp(b + x, "Xing", 4) || !memcmp(b + x, "Info", 4)) && (b[x + 7] & 1)) {
+            uint32_t frames = ((uint32_t)b[x + 8] << 24) | ((uint32_t)b[x + 9] << 16) |
+                              ((uint32_t)b[x + 10] << 8) | b[x + 11];
+            int spf = ver == 3 ? 1152 : 576;
+            if (frames && rate) return (int)((int64_t)frames * spf * 1000 / rate);
+        }
+        int kbps = ver == 3 ? kbps1[bri] : kbps2[bri];
+        if (bitrate_bps <= 0) bitrate_bps = kbps * 1000;
+        long audio = end - (start + (long)i);
+        return bitrate_bps > 0 && audio > 0 ? (int)((int64_t)audio * 8000 / bitrate_bps) : 0;
+    }
+    return 0;
+}
+
 int audio_probe_dur_ms(const char *path, int bitrate_bps) {
     if (!path[0]) return 0;
     unsigned char m4a_check[8];
@@ -1084,9 +1138,7 @@ int audio_probe_dur_ms(const char *path, int bitrate_bps) {
     if (dec_open(&d, path) != 0) return 0;
     int ms = 0;
     if (d.kind == DEC_MP3) {
-        struct stat st;
-        if (bitrate_bps > 0 && stat(path, &st) == 0)
-            ms = (int)((int64_t)st.st_size * 8000 / bitrate_bps);
+        ms = mp3_exact_dur_ms(path, bitrate_bps);
     } else if (d.frames && d.rate) {
         ms = (int)(d.frames * 1000 / d.rate);
     }
@@ -1750,6 +1802,69 @@ int audio_head_envelope(const char *path, int max_ms, float *db, int max_blocks)
 out:
     free(pcm);
     free(buf);
+    return n;
+}
+
+/* See audio.h. An MP3 has no cheap way to the last minute -- seeking means
+ * decoding from the start or building a seek table -- but its last bytes are
+ * themselves a stream an MP3 decoder can start in: it finds the next frame
+ * header and goes from there. TAIL_BYTES is ~100 s at 128 kbps, ~40 s at
+ * 320. Blocks go round a ring so only the last max_blocks are kept, then
+ * come out in order. */
+#define TAIL_BYTES (1600 * 1000)
+
+int audio_tail_envelope(const char *path, int max_ms, float *db, int max_blocks) {
+    if (!path || !path[0] || !db || max_blocks <= 0 || max_ms <= 0) return 0;
+    if (sniff(path) != DEC_MP3) return 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return 0; }
+    long size = ftell(f);
+    long want = size < TAIL_BYTES ? size : TAIL_BYTES;
+    unsigned char *bytes = want > 0 ? malloc((size_t)want) : NULL;
+    int ok = bytes && fseek(f, size - want, SEEK_SET) == 0 &&
+             fread(bytes, 1, (size_t)want, f) == (size_t)want;
+    fclose(f);
+    if (!ok) { free(bytes); return 0; }
+
+    int n = 0;
+    float *ring = malloc(sizeof(float) * (size_t)max_blocks);
+    short *buf = malloc(sizeof(short) * 4096 * 2);
+    drmp3 m;
+    if (ring && buf && drmp3_init_memory(&m, bytes, (size_t)want, NULL)) {
+        uint32_t ch = m.channels, blk = m.sampleRate / 20;
+        if (ch >= 1 && ch <= 2 && blk > 0) {
+            int total = 0;
+            double acc = 0;
+            uint32_t in = 0;
+            for (;;) {
+                drmp3_uint64 got = drmp3_read_pcm_frames_s16(&m, 4096, buf);
+                if (got == 0) break;
+                for (drmp3_uint64 i = 0; i < got; i++) {
+                    int s = 0;
+                    for (uint32_t c = 0; c < ch; c++) s += buf[i * ch + c];
+                    s /= (int)ch;
+                    acc += (double)s * s;
+                    if (++in == blk) {
+                        ring[total % max_blocks] = (float)(10.0 * log10(acc / blk + 1.0));
+                        total++;
+                        acc = 0;
+                        in = 0;
+                    }
+                }
+            }
+            int keep = max_ms / 50;
+            if (keep > max_blocks) keep = max_blocks;
+            if (keep > total) keep = total;
+            for (int k = 0; k < keep; k++)
+                db[k] = ring[(total - keep + k) % max_blocks];
+            n = keep;
+        }
+        drmp3_uninit(&m);
+    }
+    free(ring);
+    free(buf);
+    free(bytes);
     return n;
 }
 

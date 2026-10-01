@@ -69,6 +69,10 @@ int audio_envelope(const char *path, uint32_t *level, int n,
  * many it filled; 0 if the file will not decode. For working out a podcast's
  * intro (music_hook.c). Its own decoder and buffers: safe on any thread. */
 int audio_head_envelope(const char *path, int max_ms, float *db, int max_blocks);
+/* The same for the last `max_ms`, ending at the end of the file -- for the
+ * outro. MP3 only (0 for anything else): decoded from the file's last
+ * stretch of bytes rather than by seeking through the whole episode. */
+int audio_tail_envelope(const char *path, int max_ms, float *db, int max_blocks);
 
 /* Radio time-shift seeking (radio streams only -- audio_dur_ms()/
  * audio_pos_ms() do not apply to a live stream). See radio_buffer.h for the

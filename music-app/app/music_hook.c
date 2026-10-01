@@ -2986,7 +2986,7 @@ static int settings_content_rows(void) {
  * pushed by hand, not by CI against a tagged commit), so this stays a
  * literal that a human edits; the discipline is remembering to, not the
  * mechanism. */
-#define LIBRARY_VERSION "0.61"
+#define LIBRARY_VERSION "0.61.1"
 
 /* A custom-built kernel keeps uname()'s own release string exactly
  * "4.4.94+" on purpose -- that string is also the vermagic every one of the
@@ -3419,8 +3419,10 @@ typedef struct {
     char feed[POD_NAME_LEN];
     char path[AUTO_EPS][POD_PATH_LEN];
     int  n;
+    int  tail;   /* the outro: the last minute, compared backwards from the end */
 } pod_auto_job_t;
 static volatile int pod_auto_state;   /* 0 idle, 1 working, 2 finished, 3 shown */
+static int pod_auto_tail;             /* which one the state/result are for */
 static volatile int pod_auto_result;  /* seconds, or AUTO_NONE/FEW/LONG */
 static char pod_auto_feed[POD_NAME_LEN];
 
@@ -3453,13 +3455,24 @@ static int auto_pair(const float *a, int na, const float *b, int nb) {
         err /= k;
         if (err < best) { best = err; best_s = sft; best_off = off; }
     }
+    /* Each window over just the part both have: with b shifted earlier
+     * (best_s < 0) the first blocks have no partner, and refusing the whole
+     * window there answered 0 for every such pair -- found testing on real
+     * episodes, where a 50 ms lead-in difference is common. */
     int w = 0;
     for (;; w++) {
         int i0 = w * 20;
-        if (i0 + 20 > n || i0 + 20 + best_s > n || i0 + best_s < 0) break;
+        if (i0 + 20 > n) break;
         double err = 0;
-        for (int i = i0; i < i0 + 20; i++) err += fabs(a[i] - b[i + best_s] - best_off);
-        if (err / 20 > 3.0) return w;
+        int k = 0;
+        for (int i = i0; i < i0 + 20; i++) {
+            int j = i + best_s;
+            if (j < 0 || j >= n) continue;
+            err += fabs(a[i] - b[j] - best_off);
+            k++;
+        }
+        if (k < 10) break;
+        if (err / k > 3.0) return w;
     }
     return w;   /* alike to the end of what was decoded */
 }
@@ -3474,7 +3487,18 @@ static void *pod_auto_worker(void *arg) {
     int nb[AUTO_EPS] = { 0 };
     for (int i = 0; i < job->n; i++) {
         env[i] = malloc(sizeof(float) * AUTO_BLKS);
-        if (env[i]) nb[i] = audio_head_envelope(job->path[i], AUTO_MS, env[i], AUTO_BLKS);
+        if (!env[i]) continue;
+        if (!job->tail) {
+            nb[i] = audio_head_envelope(job->path[i], AUTO_MS, env[i], AUTO_BLKS);
+        } else {
+            /* The outro is the intro problem backwards: reversed, each
+             * episode's last minute starts at its end, and auto_pair()
+             * measures how long they stay alike from there. */
+            nb[i] = audio_tail_envelope(job->path[i], AUTO_MS, env[i], AUTO_BLKS);
+            for (int a = 0, b = nb[i] - 1; a < b; a++, b--) {
+                float t = env[i][a]; env[i][a] = env[i][b]; env[i][b] = t;
+            }
+        }
     }
     int r[3], k = 0;
     for (int i = 0; i < job->n; i++)
@@ -3487,7 +3511,7 @@ static void *pod_auto_worker(void *arg) {
      * every real one was 5 s or more with a sharp edge (0 dB apart, then
      * 10+), while the one 2 s "match" was 2 dB apart -- two quiet starts. */
     int res = med >= AUTO_MS / 1000 - 1 ? AUTO_LONG : med < 3 ? AUTO_NONE : med;
-    mlog("[music] auto intro for %s: pairs %d %d %d s -> %d\n", job->feed,
+    mlog("[music] auto %s for %s: pairs %d %d %d s -> %d\n", job->tail ? "outro" : "intro", job->feed,
          k > 0 ? r[0] : -1, k > 1 ? r[1] : -1, k > 2 ? r[2] : -1, res);
     for (int i = 0; i < job->n; i++) free(env[i]);
     pod_auto_result = res;
@@ -3497,11 +3521,13 @@ static void *pod_auto_worker(void *arg) {
 }
 
 /* From cur_feed's page, so pod_eps[] is its episodes, newest first. */
-static void pod_auto_start(void) {
+static void pod_auto_start(int tail) {
     if (pod_auto_state == 1) return;
     snprintf(pod_auto_feed, sizeof(pod_auto_feed), "%s", cur_feed);
+    pod_auto_tail = tail;
     pod_auto_job_t *job = calloc(1, sizeof(*job));
     if (!job) return;
+    job->tail = tail;
     snprintf(job->feed, sizeof(job->feed), "%s", cur_feed);
     for (int i = 0; i < pod_ep_n && job->n < AUTO_EPS; i++)
         if (pod_eps[i].downloaded && pod_eps[i].path[0])
@@ -10210,13 +10236,14 @@ static void draw_screen(uint16_t *fb) {
                       TEXT_PX_BODY, FB_W);
             fill_rect(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE);
         }
-        {
-            /* Auto: work the intro out from the last episodes. */
-            int ry = POD_SET_ROW0 + 2 * ROW_H;
+        for (int tail = 0; tail <= 1; tail++) {
+            /* Auto: work the intro (or outro) out from the last episodes. */
+            int ry = POD_SET_ROW0 + (2 + tail) * ROW_H;
             int busy = pod_auto_state == 1;
-            draw_text(fb, 24, ry + 20, "Auto intro", busy ? COL_DIM : COL_ACCENT, TEXT_PX_BODY, FB_W / 2);
+            draw_text(fb, 24, ry + 20, tail ? "Auto outro" : "Auto intro",
+                      busy ? COL_DIM : COL_ACCENT, TEXT_PX_BODY, FB_W / 2);
             char st[40] = "";
-            int mine = !strcmp(pod_auto_feed, cur_feed);
+            int mine = !strcmp(pod_auto_feed, cur_feed) && pod_auto_tail == tail;
             if (busy && mine) snprintf(st, sizeof(st), "Listening...");
             else if (pod_auto_state >= 2 && mine) {
                 int r = pod_auto_result;
@@ -10228,8 +10255,8 @@ static void draw_screen(uint16_t *fb) {
             if (st[0]) draw_right(fb, ry + 22, st);
             fill_rect(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE);
         }
-        int dy = POD_SET_ROW0 + 3 * ROW_H + 20;
-        draw_text(fb, 24, dy - 4, "Auto compares the start of the last 3 episodes.", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
+        int dy = POD_SET_ROW0 + 4 * ROW_H + 20;
+        draw_text(fb, 24, dy - 4, "Auto compares the last 3 episodes.", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
         dy += 34;
         draw_text(fb, 24, dy, "Intro: an episode started from the beginning", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
         draw_text(fb, 24, dy + 26, "starts this far in.", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
@@ -15435,8 +15462,8 @@ int music_entry(void *a0, void *a1) {
             } else if (screen == SC_POD_SETTINGS) {
                 int row = y >= POD_SET_ROW0 ? (y - POD_SET_ROW0) / ROW_H : -1;
                 int dir = abs(x - POD_SET_MINUS_X) <= 40 ? -1 : abs(x - POD_SET_PLUS_X) <= 40 ? +1 : 0;
-                if (row == 2) {
-                    pod_auto_start();
+                if (row == 2 || row == 3) {
+                    pod_auto_start(row == 3);
                 } else if ((row == 0 || row == 1) && dir) {
                     int *v = row == 0 ? &pod_set_intro : &pod_set_outro;
                     int nv = *v + dir * POD_SKIP_STEP;
@@ -17577,9 +17604,14 @@ int music_entry(void *a0, void *a1) {
             if (pod_auto_result > 0) {
                 int intro, outro;
                 pod_skip_lookup(pod_auto_feed, &intro, &outro);
-                pod_skip_store(pod_auto_feed, pod_auto_result, outro);
-                if (!strcmp(pod_auto_feed, cur_feed)) pod_set_intro = pod_auto_result;
-                if (podcast_mode && !strcmp(pod_play_feed, pod_auto_feed)) pod_play_intro_s = pod_auto_result;
+                if (pod_auto_tail) outro = pod_auto_result;
+                else               intro = pod_auto_result;
+                pod_skip_store(pod_auto_feed, intro, outro);
+                if (!strcmp(pod_auto_feed, cur_feed)) { pod_set_intro = intro; pod_set_outro = outro; }
+                if (podcast_mode && !strcmp(pod_play_feed, pod_auto_feed)) {
+                    pod_play_intro_s = intro;
+                    pod_play_outro_s = outro;
+                }
             }
             dirty = 1;
         }
