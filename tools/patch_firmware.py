@@ -1903,6 +1903,49 @@ MAINLINE_REPLACES = {
 }
 
 
+# Mainline cw2015_battery, backported as an out-of-tree module (the kernel
+# repo's modules-src/cw2015_battery): unlike the two above it is not built into
+# a kernel, so it works on the stock kernel too and needs no --kernel. It is a
+# drop-in for the vendor cw2015.ko -- same I2C client, same `fuel_gauge=`
+# profile string, same "battery" supply, same learned full point in register
+# 0x4F -- so the swap is the .ko and the one insmod line in cw2015.sh.
+CW2015_SCRIPT = "module_driver/cw2015.sh"
+CW2015_VENDOR_KO = "module_driver/cw2015.ko"
+CW2015_MAINLINE_KO = "module_driver/cw2015_battery.ko"
+
+
+def switch_to_mainline_cw2015(root, ko):
+    """Replace the vendor cw2015.ko with the mainline backport at `ko`, keeping
+    cw2015.sh's i2c_bus_num and battery profile. int_gpio is dropped: the
+    vendor module takes it but never requests an IRQ, and mainline polls.
+
+    Returns an error string, or None.
+    """
+    if not os.path.isfile(ko):
+        return f"{ko} not found"
+    path = os.path.join(root, CW2015_SCRIPT)
+    if not os.path.exists(path):
+        return f"{CW2015_SCRIPT} not found"
+    text = open(path).read()
+    m = re.search(r'insmod\s+cw2015\.ko\b(.*)', text)
+    if not m:
+        return f"no 'insmod cw2015.ko' in {CW2015_SCRIPT} -- check it first"
+    bus = re.search(r'\bi2c_bus_num=(\d+)', m.group(1))
+    prof = re.search(r'\bfuel_gauge="([0-9A-Fa-f,]+)"', m.group(1))
+    if not prof or len(prof.group(1).split(",")) != 64:
+        return f"no 64-byte fuel_gauge= profile in {CW2015_SCRIPT}"
+    line = (f'insmod cw2015_battery.ko i2c_bus_num={bus.group(1) if bus else 0} '
+            f'fuel_gauge="{prof.group(1)}"')
+    with open(path, "w") as fh:
+        fh.write(text[:m.start()] + line + text[m.end():])
+    shutil.copyfile(ko, os.path.join(root, CW2015_MAINLINE_KO))
+    os.chmod(os.path.join(root, CW2015_MAINLINE_KO), 0o644)
+    vendor = os.path.join(root, CW2015_VENDOR_KO)
+    if os.path.exists(vendor):
+        os.remove(vendor)
+    return None
+
+
 def drop_vendor_modules(root, which):
     """Stop loading the vendor modules a --mainline-* kernel has replaced.
 
@@ -2794,6 +2837,11 @@ def main():
                          "with build-kernel.sh --mainline-i2c and provides "
                          "the DAC's bus 3 with mainline i2c-gpio. Requires "
                          "--kernel.")
+    ap.add_argument("--mainline-cw2015", metavar="KO",
+                    help="replace the vendor cw2015.ko battery gauge driver "
+                         "with the mainline backport at KO (the kernel repo's "
+                         "modules-src/cw2015_battery). A module, not a kernel "
+                         "option: works with or without --kernel.")
     ap.add_argument("--bt-gpio-test", action="store_true",
                     help="EXPERIMENT: power the BT radio by driving PB04 from "
                          "userspace instead of waiting for cywdhd's rfkill0, "
@@ -2874,6 +2922,10 @@ def main():
     if (args.mainline_keys or args.mainline_i2c) and not args.kernel:
         die("--mainline-keys/--mainline-i2c need --kernel: the vendor module "
             "is only safe to drop from an image whose kernel replaces it")
+
+    if args.mainline_cw2015 and not args.standalone:
+        die("--mainline-cw2015 is applied with the other standalone module "
+            "patches: pass --standalone")
 
     if args.kernel:
         kernel = next((i for i in images if i["type"] == "kernel"), None)
@@ -3060,6 +3112,13 @@ def main():
                 print("patched module_driver (dropped "
                       f"{', '.join(MAINLINE_REPLACES[w] for w in which)}; "
                       "the kernel's mainline drivers replace them)")
+
+            if args.mainline_cw2015:
+                err = switch_to_mainline_cw2015(root, args.mainline_cw2015)
+                if err:
+                    die(f"--mainline-cw2015: {err}")
+                print("patched module_driver (cw2015 -> mainline "
+                      "cw2015_battery, same profile)")
 
             if enable_rtc32k_at_boot(root):
                 print("patched module_driver/soc_utils.sh (rtc32k_init_on=1: "

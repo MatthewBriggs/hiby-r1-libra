@@ -51,6 +51,15 @@ BRCMFMAC_SWITCH_ADDED = ("module_driver/brcmfmac.ko", "module_driver/brcmutil.ko
                          "module_driver/wifi_late.sh",
                          "etc/init.d/S12_bt_init", "etc/init.d/S91wifi")
 BRCMFMAC_SWITCH_REMOVED = ("module_driver/cywdhd.ko", "module_driver/cywdhd.sh")
+# --mainline-cw2015: the backport replaces the vendor .ko; cw2015.sh's insmod
+# line is rewritten for it. --mainline-keys/--mainline-i2c: the vendor module
+# and its .sh are dropped (its line goes from MODULE_INIT_SCRIPT, already
+# allowed below).
+MAINLINE_CHANGED = ("module_driver/cw2015.sh",)
+MAINLINE_ADDED = ("module_driver/cw2015_battery.ko",)
+MAINLINE_REMOVED = ("module_driver/cw2015.ko",
+                    "module_driver/keyboard_gpio_add.ko", "module_driver/keyboard_gpio_add.sh",
+                    "module_driver/i2c_gpio_add.ko", "module_driver/i2c_gpio_add.sh")
 WIFI_SCRIPTS = ("usr/bin/wifi_on.sh", "usr/bin/wifi_off.sh",
                 # soc_msc gets wifi_reg_on=PB03 from the same switch.
                 "module_driver/soc_msc.sh")
@@ -477,6 +486,9 @@ def main():
                 expected_removed = {"etc/init.d/S80_bt_init", "etc/init.d/S21mount_ubifs"}
                 expected_removed |= set(STRIPPED_FONTS_AND_BINARIES)
                 expected_removed |= set(BRCMFMAC_SWITCH_REMOVED)
+                expected |= set(MAINLINE_CHANGED)
+                expected_added |= set(MAINLINE_ADDED)
+                expected_removed |= set(MAINLINE_REMOVED)
 
                 # --bluealsa5 lists everything it installed or edited in the
                 # image itself (patch_firmware.py BLUEALSA5_MANIFEST): those
