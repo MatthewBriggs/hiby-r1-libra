@@ -954,8 +954,17 @@ int st_bt_on(void) {
 
 /* Backgrounded: wifi_on.sh restarts wpa_supplicant and waits on DHCP, which is
  * seconds. Blocking the UI on that would look like a crash. */
+static time_t g_wifi_on_at;
+
 void st_wifi_set(int on) {
+    if (on) g_wifi_on_at = time(NULL);
     st_spawn(on ? "/usr/bin/wifi_on.sh >/dev/null 2>&1" : "/usr/bin/wifi_off.sh >/dev/null 2>&1");
+}
+
+/* Joining takes a while -- ~10 s here, up to ~40 s to an address: within
+ * that window after a turn-on, "not connected" is just "not yet". */
+int st_wifi_joining(void) {
+    return g_wifi_on_at && time(NULL) - g_wifi_on_at < 45;
 }
 
 /* R64: /etc/init.d/S80_bt_init backgrounds /usr/bin/bt_init and returns

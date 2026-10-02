@@ -386,6 +386,15 @@ static int wifi_auto_off_enabled;
 static int wifi_bt_off_enabled = 1;
 static int wifi_bt_parked;     /* we turned it off for playback */
 static int wifi_bt_override;   /* switched back on by hand during this playback */
+/* Wi-Fi comes back this long after Bluetooth playback stops. It was 15 s,
+ * and turning Wi-Fi on is the disruptive part -- measured with a headset on:
+ * ~40 s of corruption while the driver loads, joins and gets an address,
+ * while a connected, idle Wi-Fi did not disturb it at all. A pause long
+ * enough to bring it back was usually followed by playing straight into
+ * that. */
+#define WIFI_UNPARK_S 180
+static time_t wifi_free_since;   /* when Bluetooth playback last stopped, while parked */
+static time_t wifi_block_note_until;   /* "can't turn it on yet" is showing */
 static int wifi_pref = 1, bt_pref = 1;
 static time_t wifi_idle_since;
 static unsigned long long wifi_idle_base_bytes = (unsigned long long)-1;   /* -1: no baseline yet */
@@ -2986,7 +2995,7 @@ static int settings_content_rows(void) {
  * pushed by hand, not by CI against a tagged commit), so this stays a
  * literal that a human edits; the discipline is remembering to, not the
  * mechanism. */
-#define LIBRARY_VERSION "0.61.1"
+#define LIBRARY_VERSION "0.61.2"
 
 /* A custom-built kernel keeps uname()'s own release string exactly
  * "4.4.94+" on purpose -- that string is also the vermagic every one of the
@@ -3389,7 +3398,7 @@ static int        pod_list;
 /* A podcast's own settings (SC_POD_SETTINGS, opened from the gear on its
  * page): seconds skipped at the start and the end of every episode. Being
  * edited, for cur_feed; and in force, for the episode playing. */
-#define POD_SKIP_STEP 5
+#define POD_SKIP_STEP 1   /* seconds per - or + tap; was 5, asked for 1 */
 #define POD_SKIP_MAX  600
 #define POD_SET_ROW0    (CONTENT_Y + 90)
 #define POD_SET_MINUS_X (FB_W - 190)
@@ -4104,9 +4113,9 @@ static void wifi_link_tick(void) {
         st_spawn("wpa_cli -i wlan0 scan_interval 30 >/dev/null 2>&1");
     }
 
-    /* Parking. Off on the first tick of Bluetooth playback, back on after 15 s
-     * of pause -- so a short pause or skipping about does not bounce the
-     * driver, which is what the wait is for. It used to wait 10 s of steady
+    /* Parking. Off on the first tick of Bluetooth playback, back on after
+     * WIFI_UNPARK_S of pause -- so a short pause or skipping about does not
+     * bounce the driver, which is what the wait is for. It used to wait 10 s of steady
      * playback before going off as well, and those 10 s are when Bluetooth
      * starts with Wi-Fi up beside it on the one chip: reported live as
      * corrupted sound for the first seconds of a podcast that resumed on
@@ -4115,11 +4124,10 @@ static void wifi_link_tick(void) {
      * time clearing up just as "wifi: off for Bluetooth playback" was logged.
      * Never mid-download, mid-sync, or while the Wi-Fi screen or a join is in
      * progress. */
-    static time_t free_since;
     int held = net_held();
     if (!held) wifi_bt_override = 0;
     if (!wifi_bt_parked) {
-        free_since = 0;
+        wifi_free_since = 0;
         if (held && wifi_bt_off_enabled && !wifi_bt_override && wifi_pref && on &&
             !pod_download_active() && !pod_update_running() &&
             !wifi_connecting_ssid[0] && screen != SC_SETTINGS_WIFI) {
@@ -4129,16 +4137,52 @@ static void wifi_link_tick(void) {
             mlog("[music] wifi: off for Bluetooth playback\n");
         }
     } else if (held) {
-        free_since = 0;
+        wifi_free_since = 0;
     } else {
-        if (!free_since) free_since = now;
-        else if (now - free_since >= 15) {
+        if (!wifi_free_since) wifi_free_since = now;
+        else if (now - wifi_free_since >= WIFI_UNPARK_S) {
             wifi_bt_parked = 0;
             if (wifi_pref && !st_wifi_on()) {
                 st_wifi_set(1);
                 mlog("[music] wifi: back on after Bluetooth playback\n");
             }
         }
+    }
+}
+
+/* Turning Wi-Fi on by hand while it is parked for Bluetooth: refused, with
+ * the reason shown where the tap was (the dropdown tile, the Settings row)
+ * -- asked for directly, "a visual indicator that it's not currently
+ * possible". Turning it off is always allowed. */
+static void save_conf(void);
+
+/* Keyed on Bluetooth playback itself, not only on Wi-Fi having been parked
+ * for it: Wi-Fi already off when playback started (by hand, or by anything
+ * else) was never parked, and a tap then turned it on mid-playback. */
+static int wifi_on_blocked(void) {
+    return wifi_bt_off_enabled && (wifi_bt_parked || net_held());
+}
+
+/* A refused tap still says what was wanted: Wi-Fi on, as soon as it may be
+ * -- parked, so it comes back WIFI_UNPARK_S after playback stops. */
+static void wifi_on_refused(const char *where) {
+    wifi_block_note_until = time(NULL) + 3;
+    if (!wifi_bt_parked) { wifi_bt_parked = 1; wifi_free_since = 0; }
+    if (!wifi_pref) { wifi_pref = 1; save_conf(); }
+    mlog("[music] wifi: on refused from %s while Bluetooth plays; on after\n", where);
+}
+
+/* Why, and until when: while Bluetooth still plays, that it waits for it to
+ * stop; after, the time left. short_form for the dropdown tile. */
+static void wifi_block_text(char *out, size_t n, int short_form) {
+    time_t now = time(NULL);
+    if (net_held() || !wifi_free_since) {
+        snprintf(out, n, short_form ? "After Bluetooth" : "Back 3 min after Bluetooth stops");
+    } else {
+        long left = WIFI_UNPARK_S - (long)(now - wifi_free_since);
+        if (left < 0) left = 0;
+        snprintf(out, n, short_form ? "Back in %ld:%02ld" : "Wi-Fi back in %ld:%02ld",
+                 left / 60, left % 60);
     }
 }
 
@@ -9878,7 +9922,8 @@ static void draw_screen(uint16_t *fb) {
             int on = st_wifi_on();
             char nm[64] = "";
             if (on) st_wifi_ssid(nm, sizeof(nm));
-            draw_right_clip(fb, ry + 20, on ? (nm[0] ? nm : "not connected") : "off", CONTENT_Y, clip_bot);
+            draw_right_clip(fb, ry + 20, on ? (nm[0] ? nm : st_wifi_joining() ? "connecting..." : "not connected")
+                                            : wifi_on_blocked() ? "off for Bluetooth" : "off", CONTENT_Y, clip_bot);
         }
         fill_rect_clip(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
 
@@ -9990,9 +10035,10 @@ static void draw_screen(uint16_t *fb) {
 
         char nm[64] = "", stline[96];
         if (on && st_wifi_carrier()) st_wifi_ssid(nm, sizeof(nm));
-        if (!on && wifi_bt_parked) snprintf(stline, sizeof(stline), "off while playing over Bluetooth");
+        if (!on && wifi_block_note_until > time(NULL)) wifi_block_text(stline, sizeof(stline), 0);
+        else if (!on && wifi_bt_parked) snprintf(stline, sizeof(stline), "off while playing over Bluetooth");
         else if (!on)              snprintf(stline, sizeof(stline), "off");
-        else if (!nm[0])           snprintf(stline, sizeof(stline), "on, not connected");
+        else if (!nm[0])           snprintf(stline, sizeof(stline), st_wifi_joining() ? "on, connecting..." : "on, not connected");
         else if (!st_wifi_has_ip()) snprintf(stline, sizeof(stline), "%s, getting an address", nm);
         else                       snprintf(stline, sizeof(stline), "%s", nm);
         draw_text_clip(fb, 24, ry + 20, "Status", COL_TEXT, TEXT_PX_BODY, FB_W - 24, CONTENT_Y, clip_bot);
@@ -11898,8 +11944,16 @@ static void draw_quick_settings(uint16_t *fb) {
     draw_wifi_icon(fb, c0, wy + 16, qs_wifi ? accent : dim);
     draw_text(fb, c0 + label_dx, wy + 6, "Wi-Fi", qs_wifi ? fg : dim, TEXT_PX_SMALL, c0 + cw);
     st_wifi_ssid(nm, sizeof(nm));
-    draw_text(fb, c0 + label_dx, wy + 32, qs_wifi ? (nm[0] ? nm : "not connected") : "off",
-              dim, TEXT_PX_SMALL, c0 + cw);
+    if (!qs_wifi && wifi_block_note_until > time(NULL)) {
+        char wb[40];
+        wifi_block_text(wb, sizeof(wb), 1);
+        draw_text(fb, c0 + label_dx, wy + 32, wb, accent, TEXT_PX_SMALL, c0 + cw);
+    } else {
+        draw_text(fb, c0 + label_dx, wy + 32,
+                  qs_wifi ? (nm[0] ? nm : st_wifi_joining() ? "connecting..." : "not connected")
+                          : wifi_on_blocked() ? "off for Bluetooth" : "off",
+                  dim, TEXT_PX_SMALL, c0 + cw);
+    }
 
     int by2 = qs_bt_y();
     draw_bt_icon(fb, c1 + 10, by2 + 10, qs_bt ? accent : dim);
@@ -13425,8 +13479,20 @@ static void suspend_radios_restore(void) {
                  (int)(ph - tmpl), tmpl, st_ba_ctl(), ph + strlen("ST_BA_CTL_PLACEHOLDER"));
         st_spawn(cmd);
     }
-    if (radios_wifi) st_wifi_set(1);
-    mlog("[music] suspend: radios back (wifi %d, bt %d)\n", radios_wifi, radios_bt);
+    /* Waking into Bluetooth playback -- a paused track, the headset coming
+     * back, "resume when it connects" on -- is exactly when Wi-Fi must not be
+     * turning on (see WIFI_UNPARK_S). It stays parked, and comes back the
+     * ordinary way once playback has been stopped long enough. */
+    int into_bt = radios_bt && bt_autoplay_enabled && wifi_bt_off_enabled &&
+                  audio_is_active() && audio_is_paused();
+    if (radios_wifi && into_bt) {
+        wifi_bt_parked = 1;
+        wifi_free_since = 0;
+    } else if (radios_wifi) {
+        st_wifi_set(1);
+    }
+    mlog("[music] suspend: radios back (wifi %d%s, bt %d)\n", radios_wifi,
+         radios_wifi && into_bt ? " parked for Bluetooth" : "", radios_bt);
 }
 
 static int suspend_ok(void) {
@@ -14542,7 +14608,9 @@ int music_entry(void *a0, void *a1) {
                     /* R-qsgrid: Wi-Fi (left) / Bluetooth (right), same row
                      * now -- x < FB_W / 2 is which cell a tap landed in,
                      * same split the draw code's own two columns use. */
-                    if (x < FB_W / 2) {
+                    if (x < FB_W / 2 && !qs_wifi && wifi_on_blocked()) {
+                        wifi_on_refused("the dropdown");
+                    } else if (x < FB_W / 2) {
                         qs_wifi = !qs_wifi;
                         st_wifi_set(qs_wifi);
                         mlog("[music] wifi: %s from the dropdown\n", qs_wifi ? "on" : "off");
@@ -15330,7 +15398,9 @@ int music_entry(void *a0, void *a1) {
                 int off = scroll * ROW_H + scroll_px;
                 int content_y = y + off;
                 int row = (content_y - CONTENT_Y) / ROW_H;
-                if (row == 0) {
+                if (row == 0 && !st_wifi_on() && wifi_on_blocked()) {
+                    wifi_on_refused("Settings");
+                } else if (row == 0) {
                     int on = !st_wifi_on();
                     st_wifi_set(on);
                     mlog("[music] wifi: %s from Settings\n", on ? "on" : "off");
@@ -17614,6 +17684,15 @@ int music_entry(void *a0, void *a1) {
                 }
             }
             dirty = 1;
+        }
+
+        /* The "can't turn Wi-Fi on yet" note: redraw while it shows (its
+         * countdown) and once more when it goes. */
+        if (wifi_block_note_until) {
+            static time_t last_note_draw;
+            time_t nn = time(NULL);
+            if (nn != last_note_draw) { last_note_draw = nn; dirty = 1; }
+            if (nn >= wifi_block_note_until) wifi_block_note_until = 0;
         }
 
         nav_track();   /* back history: remember the screen just left, if any */

@@ -100,6 +100,7 @@ int  st_wifi_has_ip(void);
 void st_wifi_dhcp(void);      /* (re)start DHCP on the network joined now */
 int  st_bt_on(void);
 void st_wifi_set(int on);
+int  st_wifi_joining(void);   /* turned on in the last 45 s: still joining, not failed */
 void st_bt_set(int on);
 /* Live gadget state, not a persisted preference -- -1 = unknown/neither
  * bound, 0 = ADB, 1 = Storage. Set drives stock's own adbon/adboff. See
