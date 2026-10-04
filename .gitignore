@@ -20,3 +20,4 @@ settings.txt
 
 # Built release assets, uploaded to GitHub Releases, not committed
 .release-staging/
+music-app/app/podsync_embed.h

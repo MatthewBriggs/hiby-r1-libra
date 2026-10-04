@@ -4,6 +4,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -829,8 +830,157 @@ static pid_t update_pid = -1;
 static int   update_running_flag;
 static int   update_died_flag;
 
+/* The sync script, built into the app (podsync_embed.h, made from
+ * podsync/podsync_once.sh at build time). It used to be only whatever had
+ * been copied onto the card by hand -- fine while nothing read its output
+ * but people, not now the app marks each podcast from its "@" lines. Before
+ * every sync the card's copy is replaced if it differs, keeping the one it
+ * replaces as .bak. */
+#include "podsync_embed.h"
+
+static void pod_install_script(void) {
+    const unsigned char *want = podsync_once_sh;
+    size_t want_n = podsync_once_sh_len;
+    FILE *f = fopen(SYNC_SCRIPT, "rb");
+    if (f) {
+        int same = 1;
+        size_t at = 0;
+        unsigned char buf[4096];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+            if (at + n > want_n || memcmp(buf, want + at, n) != 0) { same = 0; break; }
+            at += n;
+        }
+        fclose(f);
+        if (same && at == want_n) return;
+        char bak[sizeof(SYNC_SCRIPT) + 8];
+        snprintf(bak, sizeof(bak), "%s.bak", SYNC_SCRIPT);
+        rename(SYNC_SCRIPT, bak);
+    }
+    char tmp[sizeof(SYNC_SCRIPT) + 8];
+    snprintf(tmp, sizeof(tmp), "%s.new", SYNC_SCRIPT);
+    f = fopen(tmp, "wb");
+    if (!f) return;
+    int ok = fwrite(want, 1, want_n, f) == want_n;
+    ok = fclose(f) == 0 && ok;
+    if (!ok || rename(tmp, SYNC_SCRIPT) != 0) unlink(tmp);
+}
+
+/* ---- per-podcast sync status --------------------------------------------- */
+
+/* Read from the script's "@" lines as they arrive: which podcast it is on,
+ * and how each one ended. Kept after the sync finishes, until the next. */
+typedef struct { char name[POD_NAME_LEN]; int state, new_n; } pod_sst_t;
+#define POD_SST_MAX 64
+static pod_sst_t g_sst[POD_SST_MAX];
+static int  g_sst_n;
+static long g_sst_off;               /* how far into SYNC_LOG has been read */
+
+static pod_sst_t *sst_get(const char *name) {
+    if (!name[0]) return NULL;
+    for (int i = 0; i < g_sst_n; i++) if (!strcmp(g_sst[i].name, name)) return &g_sst[i];
+    if (g_sst_n == POD_SST_MAX) return NULL;
+    pod_sst_t *e = &g_sst[g_sst_n++];
+    snprintf(e->name, sizeof(e->name), "%s", name);
+    e->state = POD_SYNC_NONE;
+    e->new_n = 0;
+    return e;
+}
+
+int pod_sync_status_poll(void) {
+    FILE *f = fopen(SYNC_LOG, "r");
+    if (!f) return 0;
+    if (fseek(f, g_sst_off, SEEK_SET) != 0) { fclose(f); return 0; }
+    int changed = 0;
+    char line[512];
+    for (;;) {
+        long at = ftell(f);
+        if (!fgets(line, sizeof(line), f)) break;
+        size_t len = strlen(line);
+        if (len == 0 || line[len - 1] != '\n') { g_sst_off = at; fclose(f); return changed; }  /* half a line: next time */
+        line[len - 1] = '\0';
+        g_sst_off = ftell(f);
+        if (line[0] != '@') continue;
+        char *t1 = strchr(line, '\t');
+        if (!t1) continue;
+        *t1 = '\0';
+        char *name = t1 + 1, *t2 = strchr(name, '\t');
+        int n = 0;
+        if (t2) { *t2 = '\0'; n = atoi(t2 + 1); }
+        pod_sst_t *e;
+        if (!strcmp(line, "@feed") || !strcmp(line, "@name")) {
+            e = sst_get(name);
+            if (e) { e->state = POD_SYNC_BUSY; e->new_n = 0; }
+        } else if (!strcmp(line, "@ok") || !strcmp(line, "@fail")) {
+            e = sst_get(name);
+            if (e) { e->state = line[1] == 'o' ? POD_SYNC_OK : POD_SYNC_FAIL; e->new_n = n; }
+        } else {
+            continue;
+        }
+        changed = 1;
+    }
+    fclose(f);
+    return changed;
+}
+
+int pod_sync_status(const char *feed, int *new_n) {
+    for (int i = 0; i < g_sst_n; i++)
+        if (!strcmp(g_sst[i].name, feed)) {
+            if (new_n) *new_n = g_sst[i].new_n;
+            return g_sst[i].state;
+        }
+    return POD_SYNC_NONE;
+}
+
+/* A sync this process did not start: one left running when Libra restarted
+ * (the script is its own process group, so it outlives the app -- found when
+ * a restart mid-sync left it running unseen, the bar saying "Sync" and a tap
+ * able to start a second one over it). Found by its command line; watched
+ * with kill(pid, 0), since only a parent can waitpid() it. */
+static pid_t update_foreign = -1;
+
+static pid_t find_running_sync(void) {
+    DIR *d = opendir("/proc");
+    if (!d) return -1;
+    pid_t self = getpid(), found = -1;
+    struct dirent *e;
+    while (found < 0 && (e = readdir(d)) != NULL) {
+        if (e->d_name[0] < '1' || e->d_name[0] > '9') continue;
+        pid_t pid = (pid_t)atoi(e->d_name);
+        if (pid == self || pid == update_pid) continue;
+        char p[48], cmd[512];
+        snprintf(p, sizeof(p), "/proc/%s/cmdline", e->d_name);
+        int fd = open(p, O_RDONLY);
+        if (fd < 0) continue;
+        ssize_t n = read(fd, cmd, sizeof(cmd) - 1);
+        close(fd);
+        if (n <= 0) continue;
+        for (ssize_t i = 0; i < n; i++) if (!cmd[i]) cmd[i] = ' ';
+        cmd[n] = '\0';
+        if (strstr(cmd, "podsync_once.sh")) found = pid;
+    }
+    closedir(d);
+    return found;
+}
+
+int pod_update_adopt(void) {
+    if (update_running_flag) return 0;
+    pid_t pid = find_running_sync();
+    if (pid <= 0) return 0;
+    update_foreign = pid;
+    update_running_flag = 1;
+    update_died_flag = 0;
+    g_sst_n = 0;          /* its progress so far, from the top of its log */
+    g_sst_off = 0;
+    return 1;
+}
+
 void pod_update_start(void) {
     if (update_running_flag) return;
+    if (pod_update_adopt()) return;   /* one is already running: that one */
+    pod_install_script();
+    g_sst_n = 0;
+    g_sst_off = 0;
     /* Reported live: crashed the app repeatedly (crash-counted supervisor
      * forced a reboot) right after this was added and the user tried
      * Update feeds. Reverted the call immediately rather than debug it
@@ -866,6 +1016,7 @@ int pod_update_tail(char out[][POD_NAME_LEN], int max_lines) {
         if (nl) *nl = '\0';
         if (!line[0]) continue;
         if (strcmp(line, "__DONE__") == 0) { update_running_flag = 0; continue; }
+        if (line[0] == '@') continue;   /* progress for the podcast list, not reading */
         if (n < max_lines) {
             snprintf(out[n++], POD_NAME_LEN, "%s", line);
         } else {
@@ -899,6 +1050,15 @@ static int sync_log_has_done(void) {
 }
 
 void pod_update_reap(void) {
+    if (update_foreign > 0) {
+        if (kill(update_foreign, 0) == 0 || errno != ESRCH) return;   /* still going */
+        update_foreign = -1;
+        if (update_running_flag) {
+            update_running_flag = 0;
+            if (!sync_log_has_done()) update_died_flag = 1;
+        }
+        return;
+    }
     if (update_pid <= 0) return;
     int status;
     if (waitpid(update_pid, &status, WNOHANG) != update_pid) return;
@@ -921,6 +1081,12 @@ void pod_cancel_io(void) {
         (void)waitpid(dl_pid, NULL, 0);
         dl_pid = -1;
         unlink(dl_part_path);
+    }
+    if (update_foreign > 0) {
+        kill(-update_foreign, SIGTERM);
+        update_foreign = -1;
+        update_running_flag = 0;
+        update_died_flag = 1;
     }
     if (update_pid > 0) {
         kill(-update_pid, SIGTERM);

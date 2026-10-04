@@ -121,6 +121,18 @@ long pod_download_total(void);    /* 0 until Content-Length is known */
  * static curl -- busybox wget's TLS is too old for any modern host, and
  * porting that to C would be its own project). */
 void pod_update_start(void);
+/* A sync already running that this process did not start (Libra restarted
+ * mid-sync): taken over, as if started here. 1 if one was found. */
+int  pod_update_adopt(void);
+/* Per-podcast progress of the running (or last) sync, from the script's "@"
+ * lines: poll it while a sync runs (1 = something changed), then ask per
+ * feed. *new_n: episodes it fetched. */
+#define POD_SYNC_NONE 0
+#define POD_SYNC_BUSY 1
+#define POD_SYNC_OK   2
+#define POD_SYNC_FAIL 3
+int pod_sync_status_poll(void);
+int pod_sync_status(const char *feed, int *new_n);
 int  pod_update_running(void);
 int  pod_update_died(void);
 /* Last `max_lines` lines of the fetcher's own log, newest last. Clears

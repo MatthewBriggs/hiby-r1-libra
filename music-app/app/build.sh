@@ -1,6 +1,9 @@
 #!/bin/sh
 # Cross-compile the music hook for the R1 (MIPS32 little-endian, glibc 2.22).
 set -e
+# The feed-sync script, built into the binary so the copy on the card always
+# speaks the progress protocol this app reads (see pod_install_script()).
+( cd ../podsync && xxd -i podsync_once.sh ) > podsync_embed.h
 # -O2, not -Os. This is a decoder: dr_flac's residual and LPC loops are the
 # hot path on a 1 GHz in-order MIPS with no SIMD, and -Os deliberately
 # suppresses the loop optimisations they depend on to save a few hundred KB

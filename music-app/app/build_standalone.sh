@@ -19,6 +19,9 @@
 # and BACKLOG.md's RP1 entry for what a real boot-replacement build still
 # needs on top of this binary.
 set -e
+# The feed-sync script, built into the binary so the copy on the card always
+# speaks the progress protocol this app reads (see pod_install_script()).
+( cd ../podsync && xxd -i podsync_once.sh ) > podsync_embed.h
 zig cc -target mipsel-linux-gnueabihf.2.22 \
   -Wall -Wextra -Wno-unused-parameter \
   -O2 -s -fvisibility=hidden -fno-common -Ivendor \

@@ -2995,7 +2995,7 @@ static int settings_content_rows(void) {
  * pushed by hand, not by CI against a tagged commit), so this stays a
  * literal that a human edits; the discipline is remembering to, not the
  * mechanism. */
-#define LIBRARY_VERSION "0.61.2"
+#define LIBRARY_VERSION "0.61.3"
 
 /* A custom-built kernel keeps uname()'s own release string exactly
  * "4.4.94+" on purpose -- that string is also the vermagic every one of the
@@ -4619,8 +4619,11 @@ static char artist_page_val[LIB_NAME_LEN];
  * live EP, a 12-track remix album that is really Studio), so pressing and
  * holding an album moves it, and the move is kept in ALBUM_CAT_FILE, keyed by
  * album artist and album, so it survives a rescan. */
-enum { AC_STUDIO, AC_EP, AC_SINGLE, AC_LIVE, AC_REMIX, AC_N };
-static const char *const ac_names[AC_N] = { "Studio", "EP", "Singles", "Live", "Remixes" };
+/* Bootlegs is the user's alone: no rule ever puts an album there, only a
+ * press-and-hold move -- asked for that way. Last, so moves saved before it
+ * existed (stored by name) still mean what they meant. */
+enum { AC_STUDIO, AC_EP, AC_SINGLE, AC_LIVE, AC_REMIX, AC_BOOTLEG, AC_N };
+static const char *const ac_names[AC_N] = { "Studio", "EP", "Singles", "Live", "Remixes", "Bootlegs" };
 #define ALBUM_CAT_FILE "/usr/data/album_categories.txt"
 
 typedef struct { char artist[LIB_NAME_LEN], album[LIB_NAME_LEN]; int cat; } ac_move_t;
@@ -4764,35 +4767,51 @@ static void ac_regroup(int want) {
 }
 
 /* The bar's labels, laid out once for both the draw and the tap test: the
- * non-empty categories left to right, with their counts when they all fit. */
+ * non-empty categories left to right, with their counts. When they do not
+ * all fit across the screen (six categories can't) the bar scrolls sideways
+ * to keep the one on show in view -- asked for that way, rather than
+ * squeezing the labels -- see ac_bar_scroll(). */
 static int  ac_bar_n;
 static int  ac_bar_cat[AC_N], ac_bar_x0[AC_N], ac_bar_x1[AC_N];
 static char ac_bar_label[AC_N][32];
 #define AC_BAR_GAP 28
 
 static void ac_bar_layout(void) {
-    for (int counts = 1; counts >= 0; counts--) {
-        int x = 24;
-        ac_bar_n = 0;
-        for (int c = 0; c < AC_N; c++) {
-            if (!ac_count[c]) continue;
-            char *l = ac_bar_label[ac_bar_n];
-            if (counts) snprintf(l, sizeof(ac_bar_label[0]), "%s %d", ac_names[c], ac_count[c]);
-            else        snprintf(l, sizeof(ac_bar_label[0]), "%s", ac_names[c]);
-            int w = text_width(l, TEXT_PX_SMALL);
-            ac_bar_cat[ac_bar_n] = c;
-            ac_bar_x0[ac_bar_n] = x;
-            ac_bar_x1[ac_bar_n] = x + w;
-            ac_bar_n++;
-            x += w + AC_BAR_GAP;
-        }
-        if (x - AC_BAR_GAP <= FB_W - 24) break;
+    int x = 24;
+    ac_bar_n = 0;
+    for (int c = 0; c < AC_N; c++) {
+        if (!ac_count[c]) continue;
+        char *l = ac_bar_label[ac_bar_n];
+        snprintf(l, sizeof(ac_bar_label[0]), "%s %d", ac_names[c], ac_count[c]);
+        int w = text_width(l, TEXT_PX_SMALL);
+        ac_bar_cat[ac_bar_n] = c;
+        ac_bar_x0[ac_bar_n] = x;
+        ac_bar_x1[ac_bar_n] = x + w;
+        ac_bar_n++;
+        x += w + AC_BAR_GAP;
     }
+}
+
+/* How far the bar is scrolled left with `cat` on show: 0 when every label
+ * fits, else enough to centre that label, kept within the bar's ends. Call
+ * after ac_bar_layout(). */
+static int ac_bar_scroll(int cat) {
+    if (ac_bar_n == 0) return 0;
+    int end = ac_bar_x1[ac_bar_n - 1] + 24;          /* the bar's full width */
+    if (end <= FB_W) return 0;
+    int mid = FB_W / 2;
+    for (int i = 0; i < ac_bar_n; i++)
+        if (ac_bar_cat[i] == cat) mid = (ac_bar_x0[i] + ac_bar_x1[i]) / 2;
+    int off = mid - FB_W / 2;
+    if (off < 0) off = 0;
+    if (off > end - FB_W) off = end - FB_W;
+    return off;
 }
 
 /* The category whose label is nearest a tap at x, or -1. */
 static int ac_bar_hit(int x) {
     ac_bar_layout();
+    x += ac_bar_scroll(ac_cur);
     int best = -1, best_d = 1 << 30;
     for (int i = 0; i < ac_bar_n; i++) {
         int mid = (ac_bar_x0[i] + ac_bar_x1[i]) / 2;
@@ -4870,11 +4889,17 @@ static void ac_compose(uint16_t *fb, const uint16_t *cur, const uint16_t *nb, in
             }
             if (i0 >= 0) {
                 int t = i1 >= 0 ? a * 256 / FB_W : 0;
-                int x0 = ac_bar_x0[i0], x1 = ac_bar_x1[i0];
+                /* In the labels' coordinates as drawn -- this page's bar
+                 * scroll, which the composed frame shows -- so the underline
+                 * stays on the text; the bar re-centres once the slide ends. */
+                int s0 = ac_bar_scroll(ac_cur);
+                int x0 = ac_bar_x0[i0] - s0, x1 = ac_bar_x1[i0] - s0;
                 if (i1 >= 0) {
-                    x0 += (ac_bar_x0[i1] - x0) * t / 256;
-                    x1 += (ac_bar_x1[i1] - x1) * t / 256;
+                    x0 += (ac_bar_x0[i1] - s0 - x0) * t / 256;
+                    x1 += (ac_bar_x1[i1] - s0 - x1) * t / 256;
                 }
+                if (x0 < 0) x0 = 0;
+                if (x1 > FB_W) x1 = FB_W;
                 fill_rect(fb, 0, uy, FB_W, 3, COL_BG);
                 fill_rect(fb, x0, uy, x1 - x0, 3, COL_ACCENT);
             }
@@ -8122,12 +8147,24 @@ static void draw_screen(uint16_t *fb) {
             if (tx + tw < FB_W) fill_rect(fb, tx + tw - 1, ty, 1, th, COL_LINE);
             fill_rect(fb, tx, ty + th - 1, tw, 1, COL_LINE);
             const icon_t *ic = home_icons[i];
+            /* Podcasts while a feed sync runs: the tile in inverted colours,
+             * the glyph a spinning loader -- asked for, so a sync started on
+             * the Podcasts screen still shows from home. */
+            static const icon_t *const spin_lg[6] = {
+                &icon_sync_spin0_lg, &icon_sync_spin1_lg, &icon_sync_spin2_lg,
+                &icon_sync_spin3_lg, &icon_sync_spin4_lg, &icon_sync_spin5_lg };
+            int syncing = i == TOP_PODCASTS && !disabled && pod_update_running();
+            if (syncing) {
+                fill_rect(fb, tx, ty, tw - (tx + tw < FB_W ? 1 : 0), th - 1, COL_ACCENT);
+                ic = spin_lg[g_tick % 6];
+            }
             int px = TEXT_PX_BODY, gap = 14;
             int iy = ty + (th - (ic->h + gap + px)) / 2 + 4;
-            draw_icon(fb, FB_W, FB_H, tx + (tw - ic->w) / 2, iy, ic, disabled ? COL_DIM : COL_ACCENT);
+            draw_icon(fb, FB_W, FB_H, tx + (tw - ic->w) / 2, iy, ic,
+                      syncing ? COL_BG : disabled ? COL_DIM : COL_ACCENT);
             int lw = text_width(top_menu[i].label, px);
             draw_text(fb, tx + (tw - lw) / 2, iy + ic->h + gap, top_menu[i].label,
-                      disabled ? COL_DIM : COL_TEXT, px, tx + tw - 4);
+                      syncing ? COL_BG : disabled ? COL_DIM : COL_TEXT, px, tx + tw - 4);
         }
         if (usb_storage) {
             int bh = 60;
@@ -9265,13 +9302,15 @@ static void draw_screen(uint16_t *fb) {
         if (ac_bar_shown()) {
             int by = artist_page_bar_y() - off;
             ac_bar_layout();
+            int bs = ac_bar_scroll(ac_cur);
             for (int i = 0; i < ac_bar_n; i++) {
                 int cur = ac_bar_cat[i] == ac_cur;
-                draw_text_clip(fb, ac_bar_x0[i], by + 16, ac_bar_label[i],
-                               cur ? COL_ACCENT : COL_DIM, TEXT_PX_SMALL, FB_W - 24, 0, clip_bot);
+                int x0 = ac_bar_x0[i] - bs, x1 = ac_bar_x1[i] - bs;
+                if (x0 < 0 || x1 > FB_W) continue;   /* only whole labels: no left clip here */
+                draw_text_clip(fb, x0, by + 16, ac_bar_label[i],
+                               cur ? COL_ACCENT : COL_DIM, TEXT_PX_SMALL, FB_W, 0, clip_bot);
                 if (cur)
-                    fill_rect_clip(fb, ac_bar_x0[i], by + AC_BAR_H - 12,
-                                   ac_bar_x1[i] - ac_bar_x0[i], 3, COL_ACCENT, 0, clip_bot);
+                    fill_rect_clip(fb, x0, by + AC_BAR_H - 12, x1 - x0, 3, COL_ACCENT, 0, clip_bot);
             }
             fill_rect_clip(fb, 0, by + AC_BAR_H - 1, FB_W, 1, COL_LINE, 0, clip_bot);
         }
@@ -9279,9 +9318,14 @@ static void draw_screen(uint16_t *fb) {
         draw_text_clip(fb, 24, artist_page_title_y() - off, artist_page_name,
                        COL_TEXT, TEXT_PX_TITLE, FB_W - 24, 0, clip_bot);
         {
+            /* "Releases" once any of them is not a studio album -- an EP,
+             * a single, a live or remix record or a bootleg is not an
+             * album, and the count covers all of them. Asked for. */
+            int other = 0;
+            for (int c = 0; c < AC_N; c++) if (c != AC_STUDIO && ac_count[c]) other = 1;
             char cbuf[32];
-            snprintf(cbuf, sizeof(cbuf), "%d album%s", artist_page_album_n,
-                     artist_page_album_n == 1 ? "" : "s");
+            snprintf(cbuf, sizeof(cbuf), "%d %s%s", artist_page_album_n,
+                     other ? "release" : "album", artist_page_album_n == 1 ? "" : "s");
             draw_text_clip(fb, 24, artist_page_info_y() - off, cbuf,
                            COL_DIM, TEXT_PX_SMALL, FB_W, 0, clip_bot);
         }
@@ -10353,6 +10397,29 @@ static void draw_screen(uint16_t *fb) {
             snprintf(buf, sizeof(buf), "%d", row->count);
             draw_right_clip(fb, y + 22, buf, CONTENT_Y, clip_bot);
         }
+        if (screen == SC_PODCASTS) {
+            /* This podcast in the running (or last) sync: a spinner while
+             * it is on it, then a tick with how many episodes it fetched,
+             * or a cross. Asked for with these exact icons (Lucide's
+             * loader, circle-check, circle-x). */
+            static const icon_t *const spin[6] = {
+                &icon_sync_spin0, &icon_sync_spin1, &icon_sync_spin2,
+                &icon_sync_spin3, &icon_sync_spin4, &icon_sync_spin5 };
+            int got = 0, st = pod_sync_status(row->name, &got);
+            int ix = FB_W - 24 - 30, iy = y + (ROW_H - 30) / 2;
+            if (st != POD_SYNC_NONE && iy >= CONTENT_Y) {
+                const icon_t *ic = st == POD_SYNC_BUSY ? spin[g_tick % 6]
+                                 : st == POD_SYNC_OK   ? &icon_sync_ok : &icon_sync_fail;
+                uint16_t c = st == POD_SYNC_FAIL ? RGB(230, 80, 70) : COL_ACCENT;
+                draw_icon(fb, FB_W, clip_bot, ix, iy, ic, c);
+                if (st == POD_SYNC_OK) {
+                    snprintf(buf, sizeof(buf), "%d", got);
+                    int w = text_width(buf, TEXT_PX_BODY);   /* the name's size, asked for */
+                    draw_text_clip(fb, ix - 10 - w, y + 20, buf, COL_TEXT, TEXT_PX_BODY,
+                                   ix - 6, CONTENT_Y, clip_bot);
+                }
+            }
+        }
         fill_rect_clip(fb, 0, y + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
         y += ROW_H;
     }
@@ -10366,14 +10433,16 @@ static void draw_screen(uint16_t *fb) {
         /* Sync every feed (.podsync/podsync_once.sh). Dimmed while a sync is
          * already running, or waiting for Bluetooth playback to pause --
          * tapping again would only fork a second sync over the first. */
+        /* Running: "Sync in progress", colours inverted (the accent becomes
+         * the bar) -- as asked; the list itself shows which podcast it is on. */
         int by = pod_sync_bar_y();
-        fill_rect(fb, 0, by, FB_W, POD_SYNC_BAR_H, COL_HEADER);
+        int running = pod_update_running();
+        fill_rect(fb, 0, by, FB_W, POD_SYNC_BAR_H, running ? COL_ACCENT : COL_HEADER);
         fill_rect(fb, 0, by, FB_W, 1, COL_LINE);
-        int busy = pod_update_running() || pod_sync_deferred;
-        const char *lbl = pod_update_running() ? "Syncing..." : pod_sync_deferred ? "Sync waiting" : "Sync";
+        const char *lbl = running ? "Sync in progress" : pod_sync_deferred ? "Sync waits for Bluetooth" : "Sync";
         int lw = text_width(lbl, TEXT_PX_BODY);
         draw_text(fb, (FB_W - lw) / 2, by + (POD_SYNC_BAR_H - TEXT_PX_BODY) / 2 - 2, lbl,
-                  busy ? COL_DIM : COL_ACCENT, TEXT_PX_BODY, FB_W);
+                  running ? COL_BG : pod_sync_deferred ? COL_DIM : COL_ACCENT, TEXT_PX_BODY, FB_W);
     }
     if (mini_visible()) draw_mini(fb);
 }
@@ -10620,15 +10689,25 @@ static void qd_render_queue(uint16_t *buf) {
 }
 
 /* Underneath on the left, the queue's own left edge at FB_W - slide, and a
- * line down that edge so the two do not run together. */
+ * line down that edge so the two do not run together.
+ *
+ * Not the mini player's strip: both images draw it (every screen does), so
+ * the queue's copy slid in beside the one already there -- reported as a
+ * second mini player arriving with the queue. That strip stays as it is
+ * underneath, which is also what the queue shows there once open. */
 static void qd_compose(uint16_t *fb, const uint16_t *under, const uint16_t *queue_img, int slide) {
     int x0 = FB_W - slide;
+    int bottom = mini_visible() ? FB_H - MINI_H : FB_H;
     for (int y = 0; y < FB_H; y++) {
         uint16_t *row = fb + (size_t)y * FB_W;
+        if (y >= bottom) {
+            memcpy(row, under + (size_t)y * FB_W, (size_t)FB_W * sizeof(uint16_t));
+            continue;
+        }
         if (x0 > 0) memcpy(row, under + (size_t)y * FB_W, (size_t)x0 * sizeof(uint16_t));
         if (slide > 0) memcpy(row + x0, queue_img + (size_t)y * FB_W, (size_t)slide * sizeof(uint16_t));
     }
-    if (slide > 0 && slide < FB_W) fill_rect(fb, x0, 0, 2, FB_H, COL_LINE);
+    if (slide > 0 && slide < FB_W) fill_rect(fb, x0, 0, 2, bottom, COL_LINE);
 }
 
 /* A finger that slid sideways and lifted still arrives as a tap, at the
@@ -14159,6 +14238,9 @@ int music_entry(void *a0, void *a1) {
     g_is_standalone = !is_hiby_player();
     mlog("[music] entering app\n");
     crash_note_phase(&g_phase);   /* the watchdog's phase, in a crash report too */
+    /* A feed sync left running by the last run (the app restarted mid-sync):
+     * follow it, rather than show "Sync" and let a tap start a second. */
+    if (pod_update_adopt()) mlog("[music] following a feed sync already running\n");
     /* R66 put the framebuffer before lib_open() so the resume splash covers
      * the slow part, and the log shows that working: on a resume, 4.3 s pass
      * between here and the touch node opening, all of it behind a splash. The
@@ -15093,12 +15175,15 @@ int music_entry(void *a0, void *a1) {
                 }
             } else if (screen == SC_PODCASTS && y >= pod_sync_bar_y() &&
                        y < pod_sync_bar_y() + POD_SYNC_BAR_H) {
-                if (!pod_update_running()) {
+                /* Starts it and stays on the list, which shows the progress
+                 * row by row; tapped again while it runs, the full log. */
+                if (pod_update_running()) {
+                    screen = SC_POD_SYNC; reset_scroll();
+                } else {
                     pod_sync_log_n = 0;
                     if (net_held()) pod_sync_deferred = 1;
                     else            pod_update_start();
                 }
-                screen = SC_POD_SYNC; reset_scroll();
             } else if (y < CONTENT_Y && screen != SC_KEYBOARD && screen != SC_MENU) {
                 /* BG108: SC_KEYBOARD draws its own header (Cancel top-left,
                  * Done top-right, both at y=20 -- see draw_keyboard()) rather
@@ -16265,7 +16350,17 @@ int music_entry(void *a0, void *a1) {
             pod_sync_log_n = pod_update_tail(pod_sync_log, POD_SYNC_LOG_N);
             int log_changed = pod_sync_log_n != n_before ||
                               (pod_sync_log_n > 0 && strcmp(pod_sync_log[pod_sync_log_n - 1], last_before));
+            /* The podcast list's per-row progress: every tick on it, for the
+             * spinner; and a podcast that is new this sync gets its row as
+             * soon as it has a folder. */
+            if (pod_sync_status_poll() && screen == SC_PODCASTS) {
+                pod_feed_n = pod_scan_feeds(pod_feeds, POD_MAX_FEEDS);
+                pod_rebuild_rows();
+                total = pod_feed_n;
+            }
+            if (screen == SC_PODCASTS || screen == SC_MENU) dirty = 1;   /* the spinners */
             if (!pod_update_running()) {
+                pod_sync_status_poll();   /* the last podcast's result */
                 if (screen == SC_PODCASTS || screen == SC_POD_SYNC) {
                     /* Just finished: the feed list on screen may have new
                      * subfolders (a brand new feed) or new manifest-only

@@ -12,7 +12,8 @@
 | `music-app/app/vendor/stb_truetype.h` | [stb](https://github.com/nothings/stb) by Sean Barrett | Public domain / MIT |
 | `music-app/app/vendor/miniz/miniz.c`, `miniz.h` | [miniz](https://github.com/richgel999/miniz) by Rich Geldreich | MIT |
 | `music-app/app/vendor/jpeg9/*.h` | [libjpeg 9](https://ijg.org/) by the Independent JPEG Group | IJG licence |
-| `music-app/tools/icons/*.svg` | [Font Awesome Free](https://fontawesome.com) by Fonticons, Inc. | CC BY 4.0 (icons) |
+| `music-app/tools/icons/*.svg` (except below) | [Font Awesome Free](https://fontawesome.com) by Fonticons, Inc. | CC BY 4.0 (icons) |
+| `music-app/tools/icons/home-*.svg`, `lucide-*.svg` | [Lucide](https://lucide.dev) by Lucide Contributors | ISC |
 
 (This app used to share the device with a separate standalone Podcasts app,
 retired once Podcasts was absorbed into this one directly — it vendored its
@@ -24,6 +25,17 @@ rasterized offline by `music-app/tools/icons/gen_icons.py` into 8-bit
 alpha-coverage bitmaps baked into `music-app/app/icons_data.h`, which *is*
 compiled into the app (the device has no SVG renderer). CC BY 4.0 requires
 attribution for a derivative work — this notice is it.
+
+The Lucide icons (the home screen's section icons and the podcast sync
+loader, tick and cross) go the same way, rasterized into `icons_data.h`;
+`lucide-loader-*.svg` are rotated copies of Lucide's loader. Lucide's ISC
+licence asks that its notice travel with copies: copyright (c) for portions
+of Lucide are held by Cole Bemis 2013-2022 as part of Feather (MIT); all
+other copyright (c) for Lucide are held by Lucide Contributors 2022.
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies. THE
+SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES.
 
 The Opus and Vorbis vendoring is **headers only**, the same pattern as the
 libjpeg headers below: the R1's firmware provides the actual decode libraries

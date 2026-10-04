@@ -131,16 +131,63 @@ total_new=0
 # Read the feed list from a file rather than a pipe. `... | while read` runs the
 # loop in a subshell, so every count it kept was discarded when the loop ended
 # and the run could never report what it had done.
-grep -v '^[[:space:]]*#' "$FEEDS" 2>/dev/null | grep -v '^[[:space:]]*$' > "$TMP/feeds.list"
+grep -v '^[[:space:]]*#' "$FEEDS" 2>/dev/null | grep -v '^[[:space:]]*$' > "$TMP/feeds.raw"
+
+# Work through the podcasts in the order the app lists them -- by name,
+# ignoring case -- so its progress runs down the list rather than jumping
+# about in feeds.txt order. A feed's name is known from the .feedurl its
+# folder keeps (see below); feeds not seen before have none yet and go last,
+# in feeds.txt order.
+: > "$TMP/feeds.named"
+: > "$TMP/feeds.new"
+while read -r url; do
+    url=$(echo "$url" | tr -d '\r')
+    [ -z "$url" ] && continue
+    nm=""
+    for _f in "$DEST"/*/.feedurl; do
+        [ -f "$_f" ] || continue
+        if [ "$(cat "$_f")" = "$url" ]; then
+            nm=${_f%/.feedurl}
+            nm=${nm##*/}
+            break
+        fi
+    done
+    if [ -n "$nm" ]; then
+        printf '%s\t%s\n' "$nm" "$url" >> "$TMP/feeds.named"
+    else
+        printf '%s\n' "$url" >> "$TMP/feeds.new"
+    fi
+done < "$TMP/feeds.raw"
+{ sort -f -t '	' -k1,1 "$TMP/feeds.named" | cut -f2-; cat "$TMP/feeds.new"; } > "$TMP/feeds.list"
 
 while read -r url; do
     url=$(echo "$url" | tr -d '\r')
     [ -z "$url" ] && continue
 
+    # Progress for the app, one line each, all starting "@": "@feed NAME" as a
+    # feed starts, "@name NAME" once a new feed's name is known, and "@ok NAME
+    # N" / "@fail NAME N" when it is done, N being the episodes it fetched.
+    # The app marks each podcast's row from these. A feed's name is only in
+    # the feed itself, so each podcast's folder keeps the URL it came from
+    # (.feedurl) -- which is how a feed that fails to load is still named.
+    known=""
+    for _f in "$DEST"/*/.feedurl; do
+        [ -f "$_f" ] || continue
+        if [ "$(cat "$_f")" = "$url" ]; then
+            known=${_f%/.feedurl}
+            known=${known##*/}
+            break
+        fi
+    done
+    log "@feed	$known"
+    new_here=0
+    failed_here=0
+
     rss="$TMP/feed.rss"
     rm -f "$rss"
     if ! get "$url" "$rss" || [ ! -s "$rss" ]; then
         log "FAILED to fetch feed"
+        log "@fail	$known	0"
         continue
     fi
 
@@ -152,6 +199,8 @@ while read -r url; do
     dir="$DEST/$name"
     mkdir -p "$dir"
     log "$name"
+    printf '%s\n' "$url" > "$dir/.feedurl"
+    [ "$name" = "$known" ] || log "@name	$name"
 
     # Cover art, if the feed offers one and we do not already have it.
     img=$(grep '^image	' "$TMP/parsed.txt" | head -1 | cut -f2-)
@@ -228,6 +277,7 @@ while read -r url; do
             # otherwise put the newest episode last.
             [ -n "$pubdate" ] && touch -d "$pubdate" "$out" 2>/dev/null
             total_new=$((total_new + 1))
+            new_here=$((new_here + 1))
             log "  ok $base"
             # The player decodes MP3 only. Downloading anything else is still
             # worth doing — it can be copied off the card — but silently listing
@@ -236,8 +286,14 @@ while read -r url; do
         else
             rm -f "$out.part"
             log "  FAILED $base"
+            failed_here=$((failed_here + 1))
         fi
     done < "$TMP/eps.txt"
+    if [ "$failed_here" -gt 0 ]; then
+        log "@fail	$name	$new_here"
+    else
+        log "@ok	$name	$new_here"
+    fi
 done < "$TMP/feeds.list"
 
 if [ "$total_new" -eq 0 ]; then

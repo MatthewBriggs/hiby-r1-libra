@@ -100,6 +100,22 @@ SPECS = [
     ("home", "home-radio.svg.png",      "home_radio",      [(88, 88, ""), (30, 30, "_sb")]),
     ("home", "home-stats.svg.png",      "home_stats",      [(88, 88, ""), (30, 30, "_sb")]),
     ("home", "home-settings.svg.png",   "home_settings",   [(88, 88, ""), (30, 30, "_sb")]),
+    # Podcast sync status on each feed's row (Lucide, stroke icons; their SVGs
+    # are re-declared 512x512 so qlmanage renders them large -- at their own
+    # 24x24 it drew ~40 px of ink and the 30 px result came out soft). One
+    # family: they swap in the same spot, so one crop box keeps them the same
+    # size. The loader spins by frames: its 8 spokes repeat every 45 degrees,
+    # so six frames 7.5 degrees apart (lucide-loader-N.svg, rotated copies)
+    # cycle seamlessly. _lg: the home screen's Podcasts tile while a sync runs,
+    # the same size as the home icons it stands in for.
+    ("sync", "lucide-loader-0.svg.png",     "sync_spin0", [(30, 30, ""), (88, 88, "_lg")]),
+    ("sync", "lucide-loader-1.svg.png",     "sync_spin1", [(30, 30, ""), (88, 88, "_lg")]),
+    ("sync", "lucide-loader-2.svg.png",     "sync_spin2", [(30, 30, ""), (88, 88, "_lg")]),
+    ("sync", "lucide-loader-3.svg.png",     "sync_spin3", [(30, 30, ""), (88, 88, "_lg")]),
+    ("sync", "lucide-loader-4.svg.png",     "sync_spin4", [(30, 30, ""), (88, 88, "_lg")]),
+    ("sync", "lucide-loader-5.svg.png",     "sync_spin5", [(30, 30, ""), (88, 88, "_lg")]),
+    ("sync", "lucide-circle-check.svg.png", "sync_ok",    [(30, 30, "")]),
+    ("sync", "lucide-circle-x.svg.png",     "sync_fail",  [(30, 30, "")]),
 ]
 
 def load_full(path):
