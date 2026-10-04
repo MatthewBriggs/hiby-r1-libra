@@ -2995,7 +2995,7 @@ static int settings_content_rows(void) {
  * pushed by hand, not by CI against a tagged commit), so this stays a
  * literal that a human edits; the discipline is remembering to, not the
  * mechanism. */
-#define LIBRARY_VERSION "0.61.3"
+#define LIBRARY_VERSION "0.61.4"
 
 /* A custom-built kernel keeps uname()'s own release string exactly
  * "4.4.94+" on purpose -- that string is also the vermagic every one of the
@@ -8147,13 +8147,16 @@ static void draw_screen(uint16_t *fb) {
             if (tx + tw < FB_W) fill_rect(fb, tx + tw - 1, ty, 1, th, COL_LINE);
             fill_rect(fb, tx, ty + th - 1, tw, 1, COL_LINE);
             const icon_t *ic = home_icons[i];
-            /* Podcasts while a feed sync runs: the tile in inverted colours,
-             * the glyph a spinning loader -- asked for, so a sync started on
-             * the Podcasts screen still shows from home. */
+            /* Podcasts while a feed sync runs, Music while the library scan
+             * does (both passes: the file walk, then the index): the tile in
+             * inverted colours, the glyph a spinning loader -- asked for, so
+             * work started elsewhere still shows from home. */
             static const icon_t *const spin_lg[6] = {
                 &icon_sync_spin0_lg, &icon_sync_spin1_lg, &icon_sync_spin2_lg,
                 &icon_sync_spin3_lg, &icon_sync_spin4_lg, &icon_sync_spin5_lg };
-            int syncing = i == TOP_PODCASTS && !disabled && pod_update_running();
+            int syncing = !disabled &&
+                          ((i == TOP_PODCASTS && pod_update_running()) ||
+                           (i == TOP_MUSIC && (scanner_scan_running() || index_scan_running())));
             if (syncing) {
                 fill_rect(fb, tx, ty, tw - (tx + tw < FB_W ? 1 : 0), th - 1, COL_ACCENT);
                 ic = spin_lg[g_tick % 6];
@@ -17788,6 +17791,34 @@ int music_entry(void *a0, void *a1) {
             time_t nn = time(NULL);
             if (nn != last_note_draw) { last_note_draw = nn; dirty = 1; }
             if (nn >= wifi_block_note_until) wifi_block_note_until = 0;
+        }
+
+        /* A finished sync's ticks and crosses are shown for one visit to the
+         * Podcasts list -- the one where the sync ends, or the next one --
+         * and cleared on leaving it. Asked for that way: results are news
+         * once, not a permanent decoration. */
+        {
+            static int results_seen;
+            if (!pod_update_running() && pod_sync_has_results()) {
+                if (screen == SC_PODCASTS) {
+                    results_seen = 1;
+                } else if (results_seen) {
+                    pod_sync_status_clear();
+                    results_seen = 0;
+                }
+            } else {
+                results_seen = 0;
+            }
+        }
+
+        /* Home's Music tile spins while the library scan runs (the podcast
+         * sync's own spinner is redrawn from its poll above), and is redrawn
+         * once more as the scan ends. */
+        if (screen == SC_MENU) {
+            static int scan_was;
+            int scan_now = scanner_scan_running() || index_scan_running();
+            if (scan_now || scan_was) dirty = 1;
+            scan_was = scan_now;
         }
 
         nav_track();   /* back history: remember the screen just left, if any */

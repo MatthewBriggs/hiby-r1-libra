@@ -133,6 +133,8 @@ int  pod_update_adopt(void);
 #define POD_SYNC_FAIL 3
 int pod_sync_status_poll(void);
 int pod_sync_status(const char *feed, int *new_n);
+int  pod_sync_has_results(void);   /* any row marked from the last sync */
+void pod_sync_status_clear(void);  /* forget them: they have been seen */
 int  pod_update_running(void);
 int  pod_update_died(void);
 /* Last `max_lines` lines of the fetcher's own log, newest last. Clears

@@ -923,6 +923,9 @@ int pod_sync_status_poll(void) {
     return changed;
 }
 
+int  pod_sync_has_results(void) { return g_sst_n > 0; }
+void pod_sync_status_clear(void) { g_sst_n = 0; }
+
 int pod_sync_status(const char *feed, int *new_n) {
     for (int i = 0; i < g_sst_n; i++)
         if (!strcmp(g_sst[i].name, feed)) {
