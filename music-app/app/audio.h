@@ -145,6 +145,10 @@ int  audio_output_lost(void);         /* playback stopped because the device wen
 /* A headset has just (re)connected: try Bluetooth on the next open rather
  * than waiting out the backoff a failed open set (see pcm_open()). */
 void audio_bt_retry_now(void);
+/* Bluetooth "Robust connection": SBC at a moderate bitpool rather than the
+ * best codec. 0 off, 1 automatic (once the link keeps stalling), 2 always.
+ * A change in effect reopens the stream within a second. */
+void audio_bt_set_robust(int mode);
 const char *audio_output(void);   /* "3.5 mm", "USB" or "Bluetooth" */
 /* Radio only: sample rate of the current stream/recording in Hz, and the
  * real measured bitrate of the live fetch in kbps (not a nominal figure --

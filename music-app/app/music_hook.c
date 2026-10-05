@@ -330,6 +330,14 @@ static int usb_bypass_enabled;
  * bt_eq_pending_path already uses: audio_toggle() belongs to the UI thread. */
 static int bt_autoplay_enabled;
 static int bt_autoplay_pending;      /* set under bt_lock, cleared by the main loop */
+/* Settings > Bluetooth > Robust connection: SBC at a moderate bitpool instead
+ * of aptX/LDAC -- see audio.c's bt_pick_robust(). 0 off, 1 automatic (when
+ * the link keeps stalling -- audio.c's bt_stall_check()), 2 always. */
+static int bt_robust_mode;
+static const char *const BT_ROBUST_NAMES[] = { "Off", "Auto", "Always" };
+/* Settings > Bluetooth > Show RSSI: the raw reading next to the codec in
+ * quick settings, as well as the bars. */
+static int bt_show_rssi;
 
 static void mlog(const char *fmt, ...);   /* defined below; used by R84's idle check */
 
@@ -750,7 +758,12 @@ static char      art_want_album[LIB_NAME_LEN];
 static pthread_mutex_t bt_lock = PTHREAD_MUTEX_INITIALIZER;
 static char bt_codec_cached[32];
 static int  bt_batt_cached = -1;
+/* The headset link's signal, from bt_poll(): st_bt_signal()'s RSSI and link
+ * quality, and when they were read (0 = no reading for this connection). */
+static int  bt_rssi_cached, bt_lq_cached;
+static time_t bt_sig_at;
 static int  bt_poll_run;
+static int  qs_open;   /* defined with the rest of the panel's state below */
 static pthread_t bt_thread;
 static int  bt_thread_valid;
 
@@ -814,23 +827,45 @@ static void bt_match_profile(const char *dev_name) {
     pthread_mutex_unlock(&bt_lock);
 }
 
+/* Logs the link's signal while playing over Bluetooth, to line dropouts up
+ * against: every change, and once a minute when nothing changes. A good link
+ * reads a steady RSSI of 0, so this stays quiet until it is not. */
+static void bt_signal_log(int rssi, int lq, const char *codec) {
+    static int last_rssi = 1000, last_lq = -1000;
+    static time_t last_at;
+    time_t now = time(NULL);
+    if (rssi == last_rssi && lq == last_lq && now - last_at < 60) return;
+    mlog("[bt] link rssi %d lq %d codec %s\n", rssi, lq, codec[0] ? codec : "?");
+    last_rssi = rssi; last_lq = lq; last_at = now;
+}
+
 static void *bt_poll(void *arg) {
     (void)arg;
     while (bt_poll_run) {
         int on_bt = audio_using_bt();
-        if (on_bt) {
+        /* Codec, headset battery and signal: while playing over Bluetooth,
+         * and while the quick-settings panel (which shows all three) is
+         * open with a headset connected. Not otherwise -- each is a process
+         * spawned on the single core bluealsad encodes on. */
+        int want = on_bt || (qs_open && bt_matched_name[0]);
+        if (want) {
             char c[32];
             st_bt_codec(c, sizeof(c));
             int b = st_bt_battery();
-            audio_bt_volume_service();
+            int rssi = 0, lq = -1;
+            int sig = st_bt_signal(&rssi, &lq);
+            if (on_bt) audio_bt_volume_service();
+            if (sig && on_bt) bt_signal_log(rssi, lq, c);
             pthread_mutex_lock(&bt_lock);
             snprintf(bt_codec_cached, sizeof(bt_codec_cached), "%s", c);
             bt_batt_cached = b;
+            if (sig) { bt_rssi_cached = rssi; bt_lq_cached = lq; bt_sig_at = time(NULL); }
             pthread_mutex_unlock(&bt_lock);
-        } else {
+        } else if (!bt_matched_name[0]) {
             pthread_mutex_lock(&bt_lock);
             bt_codec_cached[0] = '\0';
             bt_batt_cached = -1;
+            bt_sig_at = 0;
             pthread_mutex_unlock(&bt_lock);
         }
         /* BG38 (part 2): connection-based, not audio_using_bt()'s
@@ -880,6 +915,8 @@ static void *bt_poll(void *arg) {
         for (int i = 0; i < subs && bt_poll_run; i++) {
             usleep(sub_us);
             if (on_bt && audio_bt_volume_pending()) audio_bt_volume_service();
+            /* The panel just opened: fill it now, not up to 5 s from now. */
+            if (!want && qs_open && bt_matched_name[0]) break;
         }
     }
     return NULL;
@@ -2995,7 +3032,7 @@ static int settings_content_rows(void) {
  * pushed by hand, not by CI against a tagged commit), so this stays a
  * literal that a human edits; the discipline is remembering to, not the
  * mechanism. */
-#define LIBRARY_VERSION "0.61.4"
+#define LIBRARY_VERSION "0.61.5"
 
 /* A custom-built kernel keeps uname()'s own release string exactly
  * "4.4.94+" on purpose -- that string is also the vermagic every one of the
@@ -5137,10 +5174,13 @@ static int bt_row_kind(int r, int *out_idx) {
     return bt_row_kind_of(r, bt_dev_n, bt_paired_n, bt_order, out_idx);
 }
 
+/* Bluetooth, Status, Robust connection, Show RSSI, Scan for devices: the
+ * rows above the device list. */
+#define BT_FIXED_ROWS 5
 static int bt_row_n_of(int dev_n, int paired_n) {
-    if (dev_n == 0) return 3;   /* toggle, status, "Scan for devices" */
+    if (dev_n == 0) return BT_FIXED_ROWS;
     int other_n = dev_n - paired_n;
-    int rows = 3;
+    int rows = BT_FIXED_ROWS;
     if (paired_n > 0) rows += 1 + paired_n;
     if (other_n > 0)  rows += 1 + other_n;
     return rows;
@@ -7720,6 +7760,25 @@ static int status_action_x(const char *label) {
     return status_right_group_x() - 28 - text_width(label, STATUS_TEXT_PX);
 }
 
+/* Background work worth knowing about from anywhere: a podcast sync or a
+ * library scan. Shown as a small spinner in the status strip, left of the
+ * battery -- asked for. It turns at ~8 frames a second (STATUS_SPIN_TICKS
+ * main-loop ticks a frame) rather than every tick: a scan can run for
+ * minutes, often during Bluetooth playback, and every frame of it is a full
+ * redraw of whatever screen is showing, competing with the audio for the one
+ * core. */
+#define STATUS_SPIN_TICKS 4
+static int status_busy(void) {
+    return pod_update_running() || scanner_scan_running() || index_scan_running();
+}
+
+/* The screens that draw the status strip at all (see draw_screen()'s header). */
+static int status_strip_shown(void) {
+    return screen == SC_MENU ||
+           (screen != SC_PLAYING && screen != SC_ARTIST_PAGE &&
+            !(screen == SC_TRACKS && !ab_list && !pod_list) && !pod_page());
+}
+
 static void draw_status(uint16_t *fb) {
     char buf[16];
     uint16_t sdim  = g_pod_theme ? np_view_col_dim()    : g_queue_theme ? np_col_dim()    : COL_DIM;
@@ -7769,6 +7828,15 @@ static void draw_status(uint16_t *fb) {
         snprintf(buf, sizeof(buf), "%d%%", pct);
         int tw = text_width(buf, px);
         draw_text(fb, bx - 11 - tw, ty, buf, sdim, px, FB_W);
+    }
+    if (status_busy()) {
+        /* 8 px clear of the battery group; a screen's own action label
+         * (status_action_x()) ends 28 px clear of it, so the two never meet. */
+        static const icon_t *const spin_sm[6] = {
+            &icon_sync_spin0_sm, &icon_sync_spin1_sm, &icon_sync_spin2_sm,
+            &icon_sync_spin3_sm, &icon_sync_spin4_sm, &icon_sync_spin5_sm };
+        const icon_t *sp = spin_sm[(g_tick / STATUS_SPIN_TICKS) % 6];
+        draw_icon(fb, FB_W, FB_H, status_right_group_x() - 8 - sp->w, mid - sp->h / 2, sp, sacc);
     }
 
     fill_rect(fb, 0, h - 1, FB_W, 1, sline);
@@ -10171,6 +10239,23 @@ static void draw_screen(uint16_t *fb) {
         fill_rect_clip(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
 
         ry = CONTENT_Y + 2 * ROW_H - off;
+        draw_text_clip(fb, 24, ry + 20, "Robust connection", COL_TEXT, TEXT_PX_BODY, FB_W - 140, CONTENT_Y, clip_bot);
+        draw_text_clip(fb, 24, ry + 46,
+                       bt_robust_mode == 2 ? "SBC instead of aptX, always"
+                       : bt_robust_mode == 1 ? "SBC when the link keeps stalling"
+                       : "Always the best codec",
+                       COL_DIM, TEXT_PX_SMALL, FB_W - 140, CONTENT_Y, clip_bot);
+        draw_right_col_clip(fb, ry + ROW_H / 2 - TEXT_PX_SMALL / 2, BT_ROBUST_NAMES[bt_robust_mode],
+                            COL_ACCENT, CONTENT_Y, clip_bot);
+        fill_rect_clip(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
+
+        ry = CONTENT_Y + 3 * ROW_H - off;
+        draw_text_clip(fb, 24, ry + 20, "Show RSSI", COL_TEXT, TEXT_PX_BODY, FB_W - 140, CONTENT_Y, clip_bot);
+        draw_text_clip(fb, 24, ry + 46, "Signal reading next to the codec", COL_DIM, TEXT_PX_SMALL, FB_W - 140, CONTENT_Y, clip_bot);
+        draw_toggle_switch_h_clip(fb, ry, bt_show_rssi, ROW_H, CONTENT_Y, clip_bot);
+        fill_rect_clip(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
+
+        ry = CONTENT_Y + 4 * ROW_H - off;
         draw_text_clip(fb, 24, ry + 20, "Scan for devices", COL_ACCENT, TEXT_PX_BODY, FB_W - 48, CONTENT_Y, clip_bot);
         fill_rect_clip(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
 
@@ -10189,12 +10274,12 @@ static void draw_screen(uint16_t *fb) {
             bt_devs_refresh_at = now;
         }
         if (bt_dev_n == 0) {
-            ry = CONTENT_Y + 3 * ROW_H - off;
+            ry = CONTENT_Y + BT_FIXED_ROWS * ROW_H - off;
             draw_text_clip(fb, 24, ry + 20, "No devices found yet", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
         } else {
-            int total = bt_row_n() - 3;
+            int total = bt_row_n() - BT_FIXED_ROWS;
             for (int r = 0; r < total; r++) {
-                ry = CONTENT_Y + (3 + r) * ROW_H - off;
+                ry = CONTENT_Y + (BT_FIXED_ROWS + r) * ROW_H - off;
                 if (ry + ROW_H < CONTENT_Y) continue;
                 if (ry > clip_bot) break;
                 int idx = -1;
@@ -11926,6 +12011,12 @@ static void qs_format_info(char *line1, size_t line1sz, char *line2, size_t line
     }
 }
 
+static const icon_t *qs_batt_icon(int pct) {
+    return pct > 87 ? &icon_batt_100_qs : pct > 62 ? &icon_batt_75_qs
+         : pct > 37 ? &icon_batt_50_qs  : pct > 12 ? &icon_batt_25_qs
+         : &icon_batt_0_qs;
+}
+
 static void draw_quick_settings(uint16_t *fb) {
     /* R-qstheme: unlike the mini-player and the volume popup (which follow
      * the playing track's palette from anywhere, on purpose -- both are
@@ -12037,42 +12128,47 @@ static void draw_quick_settings(uint16_t *fb) {
                   dim, TEXT_PX_SMALL, c0 + cw);
     }
 
+    /* Bluetooth: the connected headset's name in place of "Bluetooth", and
+     * under it the link's signal (bars from bt_poll()'s RSSI reading) and
+     * codec. Its battery joins the R1's own in the Format row below. */
     int by2 = qs_bt_y();
     draw_bt_icon(fb, c1 + 10, by2 + 10, qs_bt ? accent : dim);
-    draw_text(fb, c1 + label_dx, by2 + 6, "Bluetooth", qs_bt ? fg : dim, TEXT_PX_SMALL, c1 + cw);
     st_bt_name(nm, sizeof(nm));
-    if (qs_bt && nm[0]) {
-        /* The codec and the headset's own battery used to sit on the Now
-         * Playing screen's route line; they moved here, next to the name
-         * they actually describe. Narrower column now than when this was
-         * written (was FB_W - 180 wide; is qs_col_w() - label_dx, about
-         * 130px) -- draw_text's own right-edge clip just cuts it short
-         * rather than overflowing into Wi-Fi's column, which for a longer
-         * device+codec name it now routinely will. */
-        char codec[32]; int batt;
+    int bt_conn = qs_bt && nm[0];
+    char bt_codec[32] = "";
+    int bt_batt = -1, bt_bars = 0, bt_rssi = 0;
+    if (bt_conn) {
         pthread_mutex_lock(&bt_lock);
-        snprintf(codec, sizeof(codec), "%s", bt_codec_cached);
-        batt = bt_batt_cached;
+        snprintf(bt_codec, sizeof(bt_codec), "%s", bt_codec_cached);
+        bt_batt = bt_batt_cached;
+        bt_rssi = bt_rssi_cached;
+        if (bt_sig_at && time(NULL) - bt_sig_at < 30) bt_bars = st_bt_signal_bars(bt_rssi);
         pthread_mutex_unlock(&bt_lock);
-        char base[80];
-        if (codec[0]) snprintf(base, sizeof(base), "%s \xc2\xb7 %s", nm, codec);
-        else          snprintf(base, sizeof(base), "%s", nm);
-        int rx = c1 + cw;
-        draw_text(fb, c1 + label_dx, by2 + 32, base, dim, TEXT_PX_SMALL, rx);
-        if (batt >= 0) {
-            int tx = c1 + label_dx + text_width(base, TEXT_PX_SMALL);
-            if (tx < rx) {
-                draw_text(fb, tx, by2 + 32, " \xc2\xb7 ", dim, TEXT_PX_SMALL, rx);
-                tx += text_width(" \xc2\xb7 ", TEXT_PX_SMALL);
+    }
+    draw_text(fb, c1 + label_dx, by2 + 6, bt_conn ? nm : "Bluetooth", qs_bt ? fg : dim,
+              TEXT_PX_SMALL, c1 + cw);
+    if (bt_conn) {
+        int tx = c1 + label_dx;
+        if (bt_bars) {
+            /* Four rising bars, bottoms on the text's baseline. */
+            for (int k = 0; k < 4; k++) {
+                int h = 6 + 4 * k;
+                fill_rect(fb, tx + k * 6, by2 + 50 - h, 4, h,
+                          k < bt_bars ? dim : (themed ? qc_line() : COL_LINE));
             }
-            if (tx < rx) {
-                draw_battery(fb, tx, by2 + 37, batt, 0);
-                tx += 30;
-                char pct[8];
-                snprintf(pct, sizeof(pct), "%d%%", batt);
-                draw_text(fb, tx, by2 + 32, pct, dim, TEXT_PX_SMALL, rx);
-            }
+            tx += 4 * 6 + 6;
         }
+        char sub[48];
+        snprintf(sub, sizeof(sub), "%s", bt_codec[0] ? bt_codec : bt_bars ? "" : "connected");
+        if (bt_show_rssi && bt_bars) {
+            /* "aptX · RSSI -3", or just the number when that is too wide. */
+            char wide[48];
+            snprintf(wide, sizeof(wide), "%s%sRSSI %d", sub, sub[0] ? " \xc2\xb7 " : "", bt_rssi);
+            if (tx + text_width(wide, TEXT_PX_SMALL) <= c1 + cw) snprintf(sub, sizeof(sub), "%s", wide);
+            else snprintf(sub + strlen(sub), sizeof(sub) - strlen(sub), "%s%d",
+                          sub[0] ? " \xc2\xb7 " : "", bt_rssi);
+        }
+        draw_text(fb, tx, by2 + 32, sub, dim, TEXT_PX_SMALL, c1 + cw);
     } else {
         draw_text(fb, c1 + label_dx, by2 + 32, qs_bt ? "not connected" : "off",
                   dim, TEXT_PX_SMALL, c1 + cw);
@@ -12161,11 +12257,30 @@ static void draw_quick_settings(uint16_t *fb) {
      * the plain 28x28 icon_disc the multi-disc album banner uses -- still
      * reported the small size live after Cover colours/USB grew. Offset
      * +9, not +14, same halved-height-gain adjustment as those two. */
+    /* The battery group to its right is laid out first: with the headset's
+     * battery beside the R1's it can be wider than its column, and then it
+     * grows leftwards and the format text stops short of it. */
+    int pct = st_battery_pct();
+    char pctbuf[8] = "", hbuf[8] = "";
+    int bpx = TEXT_PX_BODY, bgx = c1 + 10;
+    if (pct >= 0) {
+        snprintf(pctbuf, sizeof(pctbuf), "%d%%", pct);
+        if (bt_batt >= 0) snprintf(hbuf, sizeof(hbuf), "%d%%", bt_batt);
+        for (;;) {
+            int w = 37 + 6 + text_width(pctbuf, bpx);
+            if (hbuf[0]) w += 12 + icon_bt_sm.w + 6 + 37 + 6 + text_width(hbuf, bpx);
+            if (bgx + w <= c1 + cw) break;
+            if (bpx == TEXT_PX_BODY) { bpx = TEXT_PX_SMALL; continue; }
+            bgx = c1 + cw - w;
+            break;
+        }
+    }
+    int fmt_rx = pct >= 0 && bgx < c1 ? bgx - 10 : c1 + cw;
     draw_icon(fb, FB_W, FB_H, c0, by5 + 9, &icon_disc_qs, fmt[0] ? accent : dim);
     draw_text(fb, c0 + label_dx, by5 + 6, fmt[0] ? fmt : "Nothing playing",
-              fmt[0] ? accent : dim, TEXT_PX_SMALL, c1 + cw);
+              fmt[0] ? accent : dim, TEXT_PX_SMALL, fmt_rx);
     if (kbps_line[0])
-        draw_text(fb, c0 + label_dx, by5 + 32, kbps_line, dim, TEXT_PX_SMALL, c1 + cw);
+        draw_text(fb, c0 + label_dx, by5 + 32, kbps_line, dim, TEXT_PX_SMALL, fmt_rx);
 
     /* R-qsnotop: battery, to the right of Format -- explicit request, moved
      * in now that the header row it used to sit in is gone.
@@ -12183,22 +12298,31 @@ static void draw_quick_settings(uint16_t *fb) {
      * R-qsbattpos: x = c1 + 10, not right-edge-aligned -- reported live
      * that it should sit directly under USB mode's own icon (same x) in
      * the row above, not float at the panel's own right margin. */
-    int pct = st_battery_pct();
     if (pct >= 0) {
         int charging = st_charging();
-        const icon_t *bic = pct > 87 ? &icon_batt_100_qs : pct > 62 ? &icon_batt_75_qs
-                           : pct > 37 ? &icon_batt_50_qs  : pct > 12 ? &icon_batt_25_qs
-                           : &icon_batt_0_qs;
         uint16_t batt_c = charging ? accent : (pct <= 15 ? RGB(230, 80, 70) : dim);
-        int bx = c1 + 10;
+        int bx = bgx;
         /* R-qsbattvalign: y = by5 + 18, not + 6 -- reported live as out of
          * line with the disc glyph beside it. Disc is 38 tall at by5 + 9
          * (centre by5 + 28); this icon is 20 tall, so by5 + 18 puts its
          * own centre at the same by5 + 28. */
-        draw_icon(fb, FB_W, FB_H, bx, by5 + 18, bic, batt_c);
-        char pctbuf[8];
-        snprintf(pctbuf, sizeof(pctbuf), "%d%%", pct);
-        draw_text(fb, bx + 37 + 8, by5 + 16, pctbuf, batt_c, TEXT_PX_BODY, c1 + cw);
+        /* Measured on screen: these put the digits' own centre on the
+         * icon's (by5 + 28), for either size. */
+        int ty = bpx == TEXT_PX_BODY ? by5 + 16 : by5 + 17;
+        draw_icon(fb, FB_W, FB_H, bx, by5 + 18, qs_batt_icon(pct), batt_c);
+        bx += 37 + 6;
+        draw_text(fb, bx, ty, pctbuf, batt_c, bpx, c1 + cw);
+        bx += text_width(pctbuf, bpx);
+        /* The headset's, after a Bluetooth glyph: [R1][%] [bt][headset][%]. */
+        if (hbuf[0]) {
+            uint16_t hc = bt_batt <= 15 ? RGB(230, 80, 70) : dim;
+            bx += 12;
+            draw_icon(fb, FB_W, FB_H, bx, by5 + 28 - icon_bt_sm.h / 2, &icon_bt_sm, dim);
+            bx += icon_bt_sm.w + 6;
+            draw_icon(fb, FB_W, FB_H, bx, by5 + 18, qs_batt_icon(bt_batt), hc);
+            bx += 37 + 6;
+            draw_text(fb, bx, ty, hbuf, hc, bpx, c1 + cw);
+        }
     }
 
     /* R-qsnotop: footer row -- the output-route glyph (previously in the
@@ -12720,6 +12844,18 @@ static void load_conf(void) {
         } else if (sscanf(line, "bt_autoplay_enabled = %d", &v) == 1 ||
                    sscanf(line, "bt_autoplay_enabled=%d", &v) == 1) {
             bt_autoplay_enabled = v != 0;
+        } else if (sscanf(line, "bt_robust_mode = %d", &v) == 1 ||
+                   sscanf(line, "bt_robust_mode=%d", &v) == 1) {
+            bt_robust_mode = v < 0 ? 0 : v > 2 ? 2 : v;
+            audio_bt_set_robust(bt_robust_mode);
+        } else if (sscanf(line, "bt_robust_enabled = %d", &v) == 1 ||
+                   sscanf(line, "bt_robust_enabled=%d", &v) == 1) {
+            /* The on/off switch it replaced: on was Always. */
+            bt_robust_mode = v ? 2 : 0;
+            audio_bt_set_robust(bt_robust_mode);
+        } else if (sscanf(line, "bt_show_rssi = %d", &v) == 1 ||
+                   sscanf(line, "bt_show_rssi=%d", &v) == 1) {
+            bt_show_rssi = v != 0;
         } else if (sscanf(line, "wifi_auto_off_enabled = %d", &v) == 1 ||
                    sscanf(line, "wifi_auto_off_enabled=%d", &v) == 1) {
             wifi_auto_off_enabled = v != 0;
@@ -12867,6 +13003,9 @@ static void save_conf(void) {
                 !conf_line_is(lines[n], "usb_bypass_enabled") &&
                 !conf_line_is(lines[n], "cover_palette_enabled") &&
                 !conf_line_is(lines[n], "bt_autoplay_enabled") &&
+                !conf_line_is(lines[n], "bt_robust_enabled") &&
+                !conf_line_is(lines[n], "bt_robust_mode") &&
+                !conf_line_is(lines[n], "bt_show_rssi") &&
                 !conf_line_is(lines[n], "wifi_auto_off_enabled") &&
                 !conf_line_is(lines[n], "wifi_bt_off_enabled") &&
                 !conf_line_is(lines[n], "light_theme") &&
@@ -12904,6 +13043,8 @@ static void save_conf(void) {
     fprintf(f, "usb_bypass_enabled = %d\n", usb_bypass_enabled);
     fprintf(f, "cover_palette_enabled = %d\n", cover_palette_enabled);
     fprintf(f, "bt_autoplay_enabled = %d\n", bt_autoplay_enabled);
+    fprintf(f, "bt_robust_mode = %d\n", bt_robust_mode);
+    fprintf(f, "bt_show_rssi = %d\n", bt_show_rssi);
     fprintf(f, "wifi_auto_off_enabled = %d\n", wifi_auto_off_enabled);
     fprintf(f, "wifi_bt_off_enabled = %d\n", wifi_bt_off_enabled);
     fprintf(f, "theme_mode = %d\n", theme_mode);
@@ -15560,8 +15701,16 @@ int music_entry(void *a0, void *a1) {
                     bt_pref = on;
                     save_conf();          /* R64 */
                 } else if (row == 2) {
+                    bt_robust_mode = (bt_robust_mode + 1) % 3;
+                    audio_bt_set_robust(bt_robust_mode);
+                    save_conf();
+                    mlog("[bt] robust connection: %s\n", BT_ROBUST_NAMES[bt_robust_mode]);
+                } else if (row == 3) {
+                    bt_show_rssi = !bt_show_rssi;
+                    save_conf();
+                } else if (row == 4) {
                     bt_scan_start();
-                } else if (row >= 3) {
+                } else if (row >= BT_FIXED_ROWS) {
                     /* Resolved against the cached bt_devs[]/bt_order[] the draw
                      * loop actually put on screen, via bt_row_kind() -- which
                      * is bt_row_kind_of() bound to exactly that state, so the
@@ -15578,7 +15727,7 @@ int music_entry(void *a0, void *a1) {
                      * than the one under the finger. Same defect the Wi-Fi
                      * handler above just had, for the same reason. */
                     int idx = -1;
-                    if (bt_row_kind(row - 3, &idx) == BT_ROW_DEVICE) {
+                    if (bt_row_kind(row - BT_FIXED_ROWS, &idx) == BT_ROW_DEVICE) {
                         snprintf(bt_connecting_mac, sizeof(bt_connecting_mac), "%s", bt_devs[idx].mac);
                         bt_connecting_since = time(NULL);
                         bt_pair(bt_devs[idx].mac);
@@ -17454,7 +17603,7 @@ int music_entry(void *a0, void *a1) {
                 int row = (touch_y + off - CONTENT_Y) / ROW_H;
                 int idx = -1;
                 hold_fired = 1;
-                if (row >= 3 && bt_row_kind(row - 3, &idx) == BT_ROW_DEVICE && bt_devs[idx].paired) {
+                if (row >= BT_FIXED_ROWS && bt_row_kind(row - BT_FIXED_ROWS, &idx) == BT_ROW_DEVICE && bt_devs[idx].paired) {
                     snprintf(sheet_bt_mac, sizeof(sheet_bt_mac), "%s", bt_devs[idx].mac);
                     snprintf(sheet_bt_name, sizeof(sheet_bt_name), "%s",
                              bt_devs[idx].name[0] ? bt_devs[idx].name : bt_devs[idx].mac);
@@ -17809,6 +17958,21 @@ int music_entry(void *a0, void *a1) {
             } else {
                 results_seen = 0;
             }
+        }
+
+        /* The status strip's spinner (see status_busy()): a redraw per frame
+         * of it, ~8 a second, on screens that show the strip; and one more as
+         * the work starts or ends, so it appears and goes promptly. */
+        {
+            static int busy_was;
+            static unsigned spin_frame;
+            int busy = status_busy();
+            if (busy && status_strip_shown()) {
+                unsigned fr = g_tick / STATUS_SPIN_TICKS;
+                if (fr != spin_frame) { spin_frame = fr; dirty = 1; }
+            }
+            if (busy != busy_was) dirty = 1;
+            busy_was = busy;
         }
 
         /* Home's Music tile spins while the library scan runs (the podcast

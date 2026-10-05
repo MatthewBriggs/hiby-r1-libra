@@ -30,6 +30,11 @@ int st_net_up(void);         /* Wi-Fi actually associated, not merely present */
  * connected or the firmware does not report it. */
 void st_bt_codec(char *out, unsigned n);
 int  st_bt_battery(void);    /* percent, -1 unknown */
+/* The headset link's RSSI and link quality from the controller (hcitool);
+ * 0 when nothing is connected or it could not be read. See status.c for
+ * what the RSSI is relative to. st_bt_signal_bars() maps it to 1-4. */
+int  st_bt_signal(int *rssi, int *lq);
+int  st_bt_signal_bars(int rssi);
 /* What each radio is attached to, for the quick-settings panel. Empty when
  * nothing is. */
 void st_wifi_ssid(char *out, unsigned n);

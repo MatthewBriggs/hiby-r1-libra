@@ -2750,12 +2750,25 @@ typedef struct {
     int running;
     int softvol;
     char selected[24];
-    char available[160];
+    char sel_cfg[40];     /* the selected codec's configuration, hex */
+    char sbc_caps[16];    /* the headset's SBC capabilities, hex */
+    char available[160];  /* names only, space-delimited both ends */
 } bt_link_t;
+
+/* "SBC:21150235" -> name "SBC", and the hex after the colon into cfg. */
+static void bt_codec_split(const char *tok, size_t len, char *name, size_t nn,
+                           char *cfg, size_t cn) {
+    const char *colon = memchr(tok, ':', len);
+    size_t nl = colon ? (size_t)(colon - tok) : len;
+    snprintf(name, nn, "%.*s", (int)nl, tok);
+    if (cfg) snprintf(cfg, cn, "%.*s", colon ? (int)(len - nl - 1) : 0, colon ? colon + 1 : "");
+}
 
 static int bt_link_read(const char *qpath, bt_link_t *l) {
     char cmd[640], out[2048];
-    snprintf(cmd, sizeof(cmd), "%s info %s 2>/dev/null", st_ba_ctl(), qpath);
+    /* -v: each codec with its configuration ("SBC:21150235"), which the
+     * robust-connection setting needs; the names are split back out. */
+    snprintf(cmd, sizeof(cmd), "%s -v info %s 2>/dev/null", st_ba_ctl(), qpath);
     memset(l, 0, sizeof(*l));
     /* Playback thread, just before opening: bounded (st_cmd()). */
     st_cmd(cmd, out, sizeof(out), ST_CMD_QUICK_MS, 0);
@@ -2769,18 +2782,206 @@ static int bt_link_read(const char *qpath, bt_link_t *l) {
         else if (!strncmp(line, "Selected codec:", 15)) {
             const char *v = line + 15;
             while (*v == ' ') v++;
-            snprintf(l->selected, sizeof(l->selected), "%s", v);
-            l->selected[strcspn(l->selected, ": ")] = '\0';
-        } else if (!strncmp(line, "Available codecs:", 17))
-            snprintf(l->available, sizeof(l->available), " %s ", line + 17);
+            bt_codec_split(v, strcspn(v, " "), l->selected, sizeof(l->selected),
+                           l->sel_cfg, sizeof(l->sel_cfg));
+        } else if (!strncmp(line, "Available codecs:", 17)) {
+            size_t at = 0;
+            l->available[at++] = ' ';
+            for (const char *t = line + 17; *t; ) {
+                while (*t == ' ') t++;
+                size_t len = strcspn(t, " ");
+                if (!len) break;
+                char name[24], cfg[40];
+                bt_codec_split(t, len, name, sizeof(name), cfg, sizeof(cfg));
+                if (!strcmp(name, "SBC")) snprintf(l->sbc_caps, sizeof(l->sbc_caps), "%s", cfg);
+                int w = snprintf(l->available + at, sizeof(l->available) - at, "%s ", name);
+                if (w < 0 || (size_t)w >= sizeof(l->available) - at) break;
+                at += (size_t)w;
+                t += len;
+            }
+        }
     }
     return l->rate != 0;
 }
 
+/* "Prefer a robust connection": SBC at a moderate bitpool instead of the
+ * best codec. aptX is a fixed 352 kbps; SBC at bitpool 35 (BlueALSA's own
+ * "medium" for 44.1 kHz joint stereo) is about 229, so each second of
+ * audio needs about a third less airtime, leaving that much more for
+ * retransmissions when the 2.4 GHz band is crowded or a body is in the way.
+ * BlueALSA has no per-stream quality option, but it clamps its encoder's
+ * bitpool to the configuration's maximum, so the configuration asked for
+ * carries the limit. */
+#define BT_ROBUST_BITPOOL 35
+static int bt_robust_mode;       /* audio_bt_set_robust(): 0 off, 1 automatic, 2 always */
+static int bt_robust;            /* in effect: always, or automatic and tripped */
+static int bt_robust_refused;    /* this device would not take it */
+static int bt_robust_applied;    /* this device is on it */
+
+/* Automatic: robust once the link has stalled BT_AUTO_STALLS times within
+ * BT_AUTO_WINDOW_S, and back to the best codec once it has gone
+ * BT_AUTO_CLEAN_S without one -- at the next time the stream opens anyway,
+ * since switching costs a gap of its own.
+ *
+ * A stall is seen from this side: the device is kept full, so a write
+ * returns only as fast as bluealsad takes audio; bluealsad takes it only as
+ * fast as the headset link carries it, its socket write blocking while the
+ * controller is still retransmitting. A write that takes BT_STALL_MS longer
+ * than the audio it carries is the link falling behind. */
+#define BT_STALL_MS      150
+#define BT_AUTO_STALLS   3
+#define BT_AUTO_WINDOW_S 60
+#define BT_AUTO_CLEAN_S  900
+static int    bt_auto_tripped;
+static char   bt_best_codec[16];  /* the headset's best, from bt_pick_codec() */
+static time_t bt_stall_times[BT_AUTO_STALLS];
+static time_t bt_last_stall;
+
+/* Raised when the setting changes. Tracks hand over without reopening the
+ * device, so waiting for the next open could mean waiting for the end of the
+ * album: the worker reopens the stream within a second instead, and that open
+ * picks the codec. Any open clears it. */
+static volatile int bt_recodec;
+
+/* Whether robust SBC is worth it over the headset's best codec. Not over
+ * AAC: BlueALSA encodes that at 220 kbps, no more airtime than robust SBC
+ * and better sound. Over LDAC only when asked for always: bluealsad runs
+ * with --ldac-abr, which already steps LDAC down from 990 to 660 to 330 kbps
+ * as the link backs up, and the stalls Automatic counts would mostly come
+ * while that is happening. */
+static int bt_robust_helps(const char *best, int mode) {
+    if (!best || !best[0] || !strcasecmp(best, "AAC")) return 0;
+    if (!strcasecmp(best, "LDAC")) return mode == 2;
+    return 1;
+}
+
+static void bt_robust_update(void) {
+    int eff = bt_robust_mode == 2 || (bt_robust_mode == 1 && bt_auto_tripped);
+    if (eff != bt_robust) bt_recodec = 1;
+    bt_robust = eff;
+}
+
+void audio_bt_set_robust(int mode) {
+    bt_robust_mode = mode < 0 ? 0 : mode > 2 ? 2 : mode;
+    bt_robust_update();
+}
+
+/* Write path, Bluetooth only: a write of `frames` that took `ms`. */
+static void bt_stall_check(unsigned long frames, long ms) {
+    static struct timespec last_end;
+    static long long quiet_until;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long long now_ms = now.tv_sec * 1000LL + now.tv_nsec / 1000000;
+    long long start_ms = now_ms - ms;
+    long long last_ms = last_end.tv_sec * 1000LL + last_end.tv_nsec / 1000000;
+    last_end = now;
+    /* Not writing for a while -- paused, a new stream, a seek -- and the
+     * first writes after wait on A2DP starting up, not on the link. */
+    if (start_ms - last_ms > 500) quiet_until = now_ms + 3000;
+    if (now_ms < quiet_until || !g_out_rate) return;
+    long over = ms - (long)(frames * 1000 / g_out_rate);
+    if (over < BT_STALL_MS) return;
+    time_t t = time(NULL);
+    alog("[bt] stall %ld ms\n", over);
+    bt_last_stall = t;
+    memmove(bt_stall_times, bt_stall_times + 1, sizeof(bt_stall_times[0]) * (BT_AUTO_STALLS - 1));
+    bt_stall_times[BT_AUTO_STALLS - 1] = t;
+    if (bt_robust_mode == 1 && !bt_auto_tripped && !bt_robust_refused &&
+        bt_robust_helps(bt_best_codec, 1) &&
+        bt_stall_times[0] && t - bt_stall_times[0] <= BT_AUTO_WINDOW_S) {
+        bt_auto_tripped = 1;
+        alog("[bt] %d stalls in %ld s: switching to robust SBC\n",
+             BT_AUTO_STALLS, (long)(t - bt_stall_times[0]));
+        bt_robust_update();
+    }
+}
+
+static int hex_byte(const char *h, int i) {
+    if (strlen(h) < (size_t)(2 * i + 2)) return -1;
+    char b[3] = { h[2 * i], h[2 * i + 1], 0 };
+    char *e;
+    long v = strtol(b, &e, 16);
+    return *e ? -1 : (int)v;
+}
+
+/* The A2DP SBC configuration bytes: frequency (high nibble) | channel mode,
+ * block length | subbands | allocation, min bitpool, max bitpool. One of
+ * each from what the headset offers, preferring 44.1 kHz joint stereo. */
+static int bt_robust_sbc_config(const char *caps, char *out, size_t n) {
+    int b0 = hex_byte(caps, 0), b1 = hex_byte(caps, 1);
+    int lo = hex_byte(caps, 2), hi = hex_byte(caps, 3);
+    if (b0 < 0 || b1 < 0 || lo < 0 || hi < 0) return 0;
+    int freq = b0 & 0x20 ? 0x20 : b0 & 0x10 ? 0x10 : 0;
+    int mode = b0 & 0x01 ? 0x01 : b0 & 0x02 ? 0x02 : 0;
+    int blk  = b1 & 0x10 ? 0x10 : b1 & 0x20 ? 0x20 : b1 & 0x40 ? 0x40 : b1 & 0x80 ? 0x80 : 0;
+    int sub  = b1 & 0x04 ? 0x04 : b1 & 0x08 ? 0x08 : 0;
+    int all  = b1 & 0x01 ? 0x01 : b1 & 0x02 ? 0x02 : 0;
+    if (lo < 2) lo = 2;
+    if (hi > BT_ROBUST_BITPOOL) hi = BT_ROBUST_BITPOOL;
+    if (!freq || !mode || !blk || !sub || !all || hi < lo) return 0;
+    snprintf(out, n, "%02x%02x%02x%02x", freq | mode, blk | sub | all, lo, hi);
+    return 1;
+}
+
+static int bt_robust_in_effect(const bt_link_t *l) {
+    int hi = hex_byte(l->sel_cfg, 3);
+    return !strcasecmp(l->selected, "SBC") && hi > 0 && hi <= BT_ROBUST_BITPOOL;
+}
+
+/* 1 when the link is on robust SBC, or was put there; 0 to carry on with
+ * the ordinary choice. */
+static int bt_pick_robust(const char *qpath, bt_link_t *l, const char *best) {
+    if (!bt_robust || bt_robust_refused || !strstr(l->available, " SBC ") ||
+        !bt_robust_helps(best, bt_robust_mode)) return 0;
+    if (bt_robust_in_effect(l)) { bt_robust_applied = 1; return 1; }
+    char conf[16];
+    if (!bt_robust_sbc_config(l->sbc_caps, conf, sizeof(conf))) {
+        alog("[audio] bt codec: no robust SBC configuration in caps '%s'\n", l->sbc_caps);
+        bt_robust_refused = 1;
+        return 0;
+    }
+    char cmd[640], was[24];
+    snprintf(was, sizeof(was), "%s", l->selected);
+    snprintf(cmd, sizeof(cmd), "%s codec %s SBC:%s >/dev/null 2>&1", st_ba_ctl(), qpath, conf);
+    int rc = st_cmd(cmd, NULL, 0, ST_CMD_SLOW_MS, 0);
+    if (rc != 0 || !bt_link_read(qpath, l) || !bt_robust_in_effect(l)) {
+        bt_robust_refused = 1;
+        alog("[audio] bt codec: %s -> SBC:%s (robust) refused (now %s:%s)\n",
+             was, conf, l->selected[0] ? l->selected : "?", l->sel_cfg);
+        return 0;
+    }
+    bt_robust_applied = 1;
+    alog("[audio] bt codec: %s -> SBC:%s (robust, max bitpool %d)\n",
+         was, l->sel_cfg, hex_byte(l->sel_cfg, 3));
+    return 1;
+}
+
 static void bt_pick_codec(const char *qpath, const char *dev, bt_link_t *l) {
+    if (bt_auto_tripped && time(NULL) - bt_last_stall > BT_AUTO_CLEAN_S) {
+        bt_auto_tripped = 0;
+        alog("[bt] no stalls for %d min: back to the best codec\n", BT_AUTO_CLEAN_S / 60);
+        bt_robust_update();
+    }
+    int recodec = bt_recodec;
+    bt_recodec = 0;
+    /* Reopened for a codec change: bluealsad notices the old client has gone
+     * on its own next poll, and until then the stream still reads as
+     * running and cannot be switched. */
+    for (int i = 0; recodec && l->running && i < 6; i++) {
+        usleep(250000);
+        if (!bt_link_read(qpath, l)) return;
+    }
     if (strcmp(bt_codec_dev, dev) != 0) {
         snprintf(bt_codec_dev, sizeof(bt_codec_dev), "%s", dev);
         bt_codec_refused = 0;
+        bt_robust_refused = bt_robust_applied = 0;
+        /* A different headset starts from the best codec again. */
+        if (bt_auto_tripped) {
+            bt_auto_tripped = 0;
+            memset(bt_stall_times, 0, sizeof(bt_stall_times));
+            bt_robust_update();
+        }
     }
     if (l->running) return;
     const char *best = NULL;
@@ -2792,7 +2993,13 @@ static void bt_pick_codec(const char *qpath, const char *dev, bt_link_t *l) {
         best = BT_CODEC_RANK[i]; bit = 1u << i;
         break;
     }
-    if (!best || !strcasecmp(best, l->selected)) return;
+    snprintf(bt_best_codec, sizeof(bt_best_codec), "%s", best ? best : "");
+    if (bt_pick_robust(qpath, l, best)) return;
+    /* Robust switched off on a headset whose best is SBC anyway: asking for
+     * plain SBC lets BlueALSA pick its full bitpool again. */
+    int unrobust = !bt_robust && bt_robust_applied && bt_robust_in_effect(l);
+    bt_robust_applied = 0;
+    if (!best || (!strcasecmp(best, l->selected) && !unrobust)) return;
     char cmd[640];
     snprintf(cmd, sizeof(cmd), "%s codec %s %s >/dev/null 2>&1", st_ba_ctl(), qpath, best);
     int rc = st_cmd(cmd, NULL, 0, ST_CMD_SLOW_MS, 0);
@@ -3277,6 +3484,9 @@ static int     g_wsola_rate, g_wsola_ch, g_wsola_speed;
  * handle, or NULL if the output was lost (the caller must stop writing). */
 static void *write_pcm_frames(void *pcm, const char *p, snd_pcm_uframes_t left,
                               size_t frame_bytes) {
+    struct timespec w0;
+    unsigned long frames = left;
+    if (g_out_kind == 2) clock_gettime(CLOCK_MONOTONIC, &w0);
     while (left > 0) {
         snd_pcm_sframes_t w = x_writei(pcm, p, left);
         if (w < 0) {
@@ -3307,6 +3517,11 @@ static void *write_pcm_frames(void *pcm, const char *p, snd_pcm_uframes_t left,
         }
         left -= (snd_pcm_uframes_t)w;
         p += (size_t)w * frame_bytes;
+    }
+    if (g_out_kind == 2) {
+        struct timespec w1;
+        clock_gettime(CLOCK_MONOTONIC, &w1);
+        bt_stall_check(frames, (w1.tv_sec - w0.tv_sec) * 1000L + (w1.tv_nsec - w0.tv_nsec) / 1000000L);
     }
     return pcm;
 }
@@ -3712,9 +3927,12 @@ static void *worker(void *arg) {
                      (t1.tv_sec - t0.tv_sec) * 1000L +
                      (t1.tv_nsec - t0.tv_nsec) / 1000000L);
             }
+            int recodec = g_out_kind == 2 && bt_recodec;
             if ((g_out_kind != 2 && now != g_out_card) ||
-                (g_out_kind == 0 && bt_now && !(bt_retry_at && time(NULL) < bt_retry_at))) {
-                alog("[audio] output changed, reopening\n");
+                (g_out_kind == 0 && bt_now && !(bt_retry_at && time(NULL) < bt_retry_at)) ||
+                recodec) {
+                alog(recodec ? "[audio] bt codec setting changed, reopening\n"
+                             : "[audio] output changed, reopening\n");
                 x_drop(pcm); x_close(pcm);
                 pcm = pcm_open(rate, ch, d->is_stream, want_fmt);
                 if (!pcm) break;

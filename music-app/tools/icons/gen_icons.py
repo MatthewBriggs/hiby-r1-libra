@@ -107,13 +107,14 @@ SPECS = [
     # size. The loader spins by frames: its 8 spokes repeat every 45 degrees,
     # so six frames 7.5 degrees apart (lucide-loader-N.svg, rotated copies)
     # cycle seamlessly. _lg: the home screen's Podcasts tile while a sync runs,
-    # the same size as the home icons it stands in for.
-    ("sync", "lucide-loader-0.svg.png",     "sync_spin0", [(30, 30, ""), (88, 88, "_lg")]),
-    ("sync", "lucide-loader-1.svg.png",     "sync_spin1", [(30, 30, ""), (88, 88, "_lg")]),
-    ("sync", "lucide-loader-2.svg.png",     "sync_spin2", [(30, 30, ""), (88, 88, "_lg")]),
-    ("sync", "lucide-loader-3.svg.png",     "sync_spin3", [(30, 30, ""), (88, 88, "_lg")]),
-    ("sync", "lucide-loader-4.svg.png",     "sync_spin4", [(30, 30, ""), (88, 88, "_lg")]),
-    ("sync", "lucide-loader-5.svg.png",     "sync_spin5", [(30, 30, ""), (88, 88, "_lg")]),
+    # the same size as the home icons it stands in for. _sm: the status strip,
+    # while a sync or a library scan runs.
+    ("sync", "lucide-loader-0.svg.png",     "sync_spin0", [(30, 30, ""), (88, 88, "_lg"), (18, 18, "_sm")]),
+    ("sync", "lucide-loader-1.svg.png",     "sync_spin1", [(30, 30, ""), (88, 88, "_lg"), (18, 18, "_sm")]),
+    ("sync", "lucide-loader-2.svg.png",     "sync_spin2", [(30, 30, ""), (88, 88, "_lg"), (18, 18, "_sm")]),
+    ("sync", "lucide-loader-3.svg.png",     "sync_spin3", [(30, 30, ""), (88, 88, "_lg"), (18, 18, "_sm")]),
+    ("sync", "lucide-loader-4.svg.png",     "sync_spin4", [(30, 30, ""), (88, 88, "_lg"), (18, 18, "_sm")]),
+    ("sync", "lucide-loader-5.svg.png",     "sync_spin5", [(30, 30, ""), (88, 88, "_lg"), (18, 18, "_sm")]),
     ("sync", "lucide-circle-check.svg.png", "sync_ok",    [(30, 30, "")]),
     ("sync", "lucide-circle-x.svg.png",     "sync_fail",  [(30, 30, "")]),
 ]

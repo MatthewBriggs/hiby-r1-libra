@@ -293,6 +293,19 @@ static int bt_pcm_path(char *out, unsigned n) {
     return 0;
 }
 
+/* .../dev_94_DB_56_8E_03_43/a2dpsrc/sink -> 94:DB:56:8E:03:43 */
+static int bt_mac_from_path(const char *path, char mac[18]) {
+    const char *d = strstr(path, "dev_");
+    if (!d || strlen(d) < 4 + 17) return 0;
+    for (int i = 0; i < 17; i++) {
+        char c = d[4 + i];
+        if (!(isxdigit((unsigned char)c) || c == '_')) return 0;
+        mac[i] = c == '_' ? ':' : c;
+    }
+    mac[17] = '\0';
+    return 1;
+}
+
 void st_bt_codec(char *out, unsigned n) {
     static char cached[32];
     static time_t when;
@@ -365,7 +378,49 @@ int st_bt_battery(void) {
         int v = atoi(b + 8);
         if (v >= 0 && v <= 100) cached = v;
     }
+    /* BlueALSA 5 also hands the level to BlueZ's battery provider, and 5.87
+     * has Battery1, so bluetoothctl shows it as "Battery Percentage: 0x5a
+     * (90)". Asked only when BlueALSA had nothing. */
+    char mac[18];
+    if (cached < 0 && bt_mac_from_path(path, mac)) {
+        snprintf(cmd, sizeof(cmd), "bluetoothctl info %s 2>/dev/null", mac);
+        run_cmd(cmd, buf, sizeof(buf));
+        char *bp = strstr(buf, "Battery Percentage:");
+        char *paren = bp ? strchr(bp, '(') : NULL;
+        if (paren && paren - bp < 40) {
+            int v = atoi(paren + 1);
+            if (v >= 0 && v <= 100) cached = v;
+        }
+    }
     return cached;
+}
+
+/* The connected headset's link, from the controller: HCI Read RSSI and Read
+ * Link Quality via hcitool. For BR/EDR the spec makes RSSI relative to the
+ * controller's "golden receive power range" -- 0 inside it, negative dB
+ * below, positive above -- rather than dBm, though some controllers report
+ * dBm anyway; st_bt_signal_bars() takes both. Link quality is 0-255, vendor
+ * defined. Uncached: the caller decides how often. */
+int st_bt_signal(int *rssi, int *lq) {
+    char path[256], mac[18];
+    if (!bt_pcm_path(path, sizeof(path)) || !bt_mac_from_path(path, mac)) return 0;
+    char cmd[128], buf[256];
+    snprintf(cmd, sizeof(cmd), "hcitool rssi %s 2>&1; hcitool lq %s 2>&1", mac, mac);
+    run_cmd(cmd, buf, sizeof(buf));
+    char *r = strstr(buf, "RSSI return value:");
+    char *q = strstr(buf, "Link quality:");
+    if (!r) return 0;
+    *rssi = atoi(r + 18);
+    *lq = q ? atoi(q + 13) : -1;
+    return 1;
+}
+
+int st_bt_signal_bars(int rssi) {
+    /* Relative readings sit within a few tens of dB of 0; the golden range's
+     * lower edge is about -56 dBm, so -6 is roughly -62 dBm. An earbud link
+     * gives out somewhere near -85 to -90 dBm. */
+    if (rssi > -30) return rssi >= -6 ? 4 : rssi >= -14 ? 3 : rssi >= -22 ? 2 : 1;
+    return rssi >= -62 ? 4 : rssi >= -70 ? 3 : rssi >= -78 ? 2 : 1;
 }
 
 /* Names for the panel. Both shell out, both are cached, and both are only
