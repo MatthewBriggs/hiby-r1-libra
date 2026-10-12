@@ -105,6 +105,18 @@ int  st_wifi_has_ip(void);
 void st_wifi_dhcp(void);      /* (re)start DHCP on the network joined now */
 int  st_bt_on(void);
 void st_wifi_set(int on);
+/* While Bluetooth plays, a turn-on scans only the channel last joined on
+ * (see status.c): the caller says when that is wanted, st_wifi_note_joined()
+ * records the channel on each join, and st_wifi_narrow_check() lifts the
+ * restriction -- 1 after a join, 2 after a timeout. st_wifi_narrowed() is
+ * the channel being scanned, 0 for none. */
+/* The Wi-Fi switch's state to draw and toggle from: the last request until
+ * the interface catches up with it (see status.c), else the interface. */
+int  st_wifi_shown(void);
+void st_wifi_scan_narrow_wanted(int on);
+int  st_wifi_narrowed(void);
+void st_wifi_note_joined(void);
+int  st_wifi_narrow_check(int joined);
 int  st_wifi_joining(void);   /* turned on in the last 45 s: still joining, not failed */
 void st_bt_set(int on);
 /* Live gadget state, not a persisted preference -- -1 = unknown/neither

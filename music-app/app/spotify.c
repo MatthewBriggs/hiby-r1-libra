@@ -219,10 +219,13 @@ static int titles_resemble(const char *searched, const char *found) {
 
 int spotify_fetch_cover(const char *artist, const char *album, const char *dest_jpg) {
     spotify_load_config();
-    if (!g_client_id[0] || !g_client_secret[0] || !artist[0] || !album[0]) return -1;
+    if (!g_client_id[0] || !g_client_secret[0] || !artist[0] || !album[0]) return COVER_FETCH_NONE;
 
+    /* Every failure to ask or to hear back is COVER_FETCH_ERROR: search
+     * never answers "not found" with an error status, only with results
+     * that do not match, so an HTTP error here (429, 5xx) is never a no. */
     char token[512];
-    if (get_access_token(token, sizeof(token)) != 0) return -1;
+    if (get_access_token(token, sizeof(token)) != 0) return COVER_FETCH_ERROR;
 
     /* Plain free-text, not the field-restricted `album:X artist:Y` syntax
      * this started as -- checked live against a real messy title ("1969:
@@ -260,15 +263,15 @@ int spotify_fetch_cover(const char *artist, const char *album, const char *dest_
         "-H", auth_hdr, "-o", meta_path, url,
         NULL
     };
-    if (run_curl_argv(argv, meta_path) != 0) { unlink(meta_path); return -1; }
+    if (run_curl_argv(argv, meta_path) != 0) { unlink(meta_path); return COVER_FETCH_ERROR; }
 
     FILE *f = fopen(meta_path, "rb");
     unlink(meta_path);
-    if (!f) return -1;
+    if (!f) return COVER_FETCH_ERROR;
     char *buf = malloc(65536);
     size_t n = buf ? fread(buf, 1, 65535, f) : 0;
     fclose(f);
-    if (!buf) return -1;
+    if (!buf) return COVER_FETCH_ERROR;
     buf[n] = '\0';
 
     /* Each result item carries exactly one "images" array; "name" (the
@@ -299,7 +302,7 @@ int spotify_fetch_cover(const char *artist, const char *album, const char *dest_
         }
     }
     free(buf);
-    if (!img_url[0]) return -1;
+    if (!img_url[0]) return COVER_FETCH_NONE;
 
     char tmp_jpg[600];
     snprintf(tmp_jpg, sizeof(tmp_jpg), "%s.part%d", dest_jpg, tid());
@@ -309,8 +312,8 @@ int spotify_fetch_cover(const char *artist, const char *album, const char *dest_
         "-o", tmp_jpg, img_url,
         NULL
     };
-    if (run_curl_argv(dl_argv, tmp_jpg) != 0) { unlink(tmp_jpg); return -1; }
-    if (rename(tmp_jpg, dest_jpg) != 0) { unlink(tmp_jpg); return -1; }
+    if (run_curl_argv(dl_argv, tmp_jpg) != 0) { unlink(tmp_jpg); return COVER_FETCH_ERROR; }
+    if (rename(tmp_jpg, dest_jpg) != 0) { unlink(tmp_jpg); return COVER_FETCH_ERROR; }
     return 0;
 }
 

@@ -1336,6 +1336,36 @@ def bt_mac_before_rfkill_wait(root):
 
 
 
+BT_FW_AW = "BCM4343A1_001.002.009.0122.0538.hcd"    # aw-nb372sm (chipvendor 0x81)
+BT_FW_AP = "BCM4343A1_001.002.009.1010.1030.hcd"    # AP6212, this board
+
+
+def bt_firmware_fallback(text):
+    """Make bt_init/bt_resume load this board's Bluetooth firmware when the
+    chipvendor node is missing.
+
+    Stock picks the BT patch from chipvendor, a node under SDIO function 2
+    that cywdhd's stock kernel provides by the time bt_init runs: 0x81 is the
+    aw-nb372sm, anything else the AP6212 -- and with no node at all, the
+    aw-nb372sm. On the custom kernel the node never exists there, so every
+    custom-kernel image loaded the aw-nb372sm patch onto the R1's AP6212
+    (seen on the device: 0122.0538 in brcm_patchram_plus's command line),
+    while its Wi-Fi half already gets the AP6212's nvram_ap6212a.txt. The
+    patch carries the module's BT radio tuning and its side of the chip's
+    Wi-Fi/BT arbitration; stock, compas and r1-stock.upt all load the
+    AP6212 one. The 0x81 branch is kept for a board that does report it.
+    Returns the new text, or None when there is nothing to change."""
+    old = "else\n    firmware=" + BT_FW_AW + "\nfi\n"
+    if old not in text:
+        return None
+    return text.replace(old,
+                        "else\n"
+                        "    # No chipvendor node (the custom kernel never has one here):\n"
+                        "    # this board's AP6212, not stock's aw-nb372sm default.\n"
+                        "    firmware=" + BT_FW_AP + "\n"
+                        "fi\n", 1)
+
+
 def bt_gpio_power_test(root):
     """EXPERIMENT: power the BT radio from userspace, without cywdhd.
 
@@ -3295,6 +3325,24 @@ def main():
                         with open(rtarget, "w", encoding="utf-8", errors="surrogateescape") as fh:
                             fh.write(rnolpm)
                         print("patched usr/bin/bt_resume (dropped --enable_lpm, same as bt_init)")
+
+                # The Bluetooth patch for this board, not stock's fallback --
+                # see bt_firmware_fallback().
+                fixed = bt_firmware_fallback(btext)
+                if fixed is None:
+                    die(f"--brcmfmac-switch: no chipvendor fallback in {BT_INIT} to fix")
+                btext = fixed
+                bpatched = btext
+                print(f"patched {BT_INIT} (Bluetooth firmware fallback: AP6212, "
+                      f"{BT_FW_AP})")
+                if os.path.exists(rtarget):
+                    with open(rtarget, encoding="utf-8", errors="surrogateescape") as fh:
+                        rtext = fh.read()
+                    rfixed = bt_firmware_fallback(rtext)
+                    if rfixed is not None:
+                        with open(rtarget, "w", encoding="utf-8", errors="surrogateescape") as fh:
+                            fh.write(rfixed)
+                        print("patched usr/bin/bt_resume (Bluetooth firmware fallback: AP6212)")
 
             reordered = reorder_bt_init_radio_first(btext)
             if reordered is None:

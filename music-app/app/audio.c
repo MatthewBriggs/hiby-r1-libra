@@ -25,10 +25,12 @@
  *    stack is then never reclaimed for the life of hiby_player.
  */
 
+#include <dirent.h>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <math.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -3014,21 +3016,54 @@ static void bt_pick_codec(const char *qpath, const char *dev, bt_link_t *l) {
     alog("[audio] bt codec: %s -> %s\n", was, best);
 }
 
-static int bt_pin_pcm(void) {
-    if (!st_ba_v5()) return 0;
+/* The connected headset's A2DP PCM: its path shell-quoted, and its address.
+ * 0 when there is none. */
+static int bt_pcm_target(char *qpath, size_t qn, char mac[18]) {
     char path[256];
     if (!st_bt_pcm_path(path, sizeof(path))) return 0;
     const char *dev = strstr(path, "dev_");
     if (!dev || strlen(dev) < 4 + 17) return 0;
-    char mac[18];
     for (int i = 0; i < 17; i++) mac[i] = dev[4 + i] == '_' ? ':' : dev[4 + i];
     mac[17] = '\0';
+    shell_quote(path, qpath, qn);
+    return 1;
+}
 
-    char qpath[520];
-    shell_quote(path, qpath, sizeof(qpath));
+/* bt_pick_codec() runs from two threads: the playback thread just before it
+ * opens the PCM, and bt_poll's when a headset connects. Both read and switch
+ * the same link and share bt_pick_codec()'s per-device state. */
+static pthread_mutex_t bt_pick_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* A headset just connected and nothing is playing: give it its best codec
+ * now, rather than leave BlueZ's choice in place until the first play.
+ * BlueZ 5 chooses by endpoint order, not quality -- the BTR17 comes up on AAC
+ * with LDAC on offer -- so the codec quick settings showed was not the one
+ * the music would play with, and the first play paid for the switch. The
+ * switch recreates the transport, which is only safe with no stream running;
+ * bt_pick_codec() returns without touching a running one. Called by
+ * music_hook.c's bt_poll on each headset arrival. */
+void audio_bt_pick_codec_idle(void) {
+    char qpath[520], mac[18];
     bt_link_t link;
-    if (!bt_link_read(qpath, &link)) return 0;
+    if (!st_ba_v5() || !bt_pcm_target(qpath, sizeof(qpath), mac)) return;
+    pthread_mutex_lock(&bt_pick_lock);
+    if (bt_link_read(qpath, &link) && !link.running)
+        bt_pick_codec(qpath, mac, &link);
+    pthread_mutex_unlock(&bt_pick_lock);
+}
+
+static int bt_pin_pcm(void) {
+    if (!st_ba_v5()) return 0;
+    char qpath[520], mac[18];
+    if (!bt_pcm_target(qpath, sizeof(qpath), mac)) return 0;
+    bt_link_t link;
+    pthread_mutex_lock(&bt_pick_lock);
+    if (!bt_link_read(qpath, &link)) {
+        pthread_mutex_unlock(&bt_pick_lock);
+        return 0;
+    }
     bt_pick_codec(qpath, mac, &link);
+    pthread_mutex_unlock(&bt_pick_lock);
     /* A codec switch recreates the PCM, and its path with it only if the
      * device changed -- which it cannot here -- but the rate may move. */
     if (!link.rate && !bt_link_read(qpath, &link)) return 0;
@@ -3545,6 +3580,78 @@ static void *write_pcm_frames(void *pcm, const char *p, snd_pcm_uframes_t left,
  * rate-capped by bt_target_rate() and forced to S16_LE, and the logs show
  * decode at 3-13% of one core on that path. This was outranking the encoder
  * to protect headroom that was never in short supply. */
+/* bluealsad's encoder thread on SCHED_FIFO, as `--io-rt-priority` would put
+ * it -- the image's bt_init does not pass that, and the rootfs cannot be
+ * changed from here. That thread has the hard deadline: the socket under it
+ * holds three packets, about 60 ms of aptX, and at nice 0 it took turns on
+ * the one core with this process's interface and decoder. Sonix Player runs
+ * it at 12, above its own real-time playback thread; nothing in this process
+ * is real-time, so any level puts it first.
+ *
+ * One thread per stream ("ba-a2dp-aptx", "-sbc", ...), made when the
+ * transport starts and again on every codec change or reconnect, so this is
+ * asked once a second while playing over Bluetooth: a known thread still at
+ * FIFO is two small reads, anything else is a walk of bluealsad's tasks. */
+#define BT_ENC_RT_PRIO 12
+
+static int read_small(const char *path, char *out, size_t n) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    ssize_t got = read(fd, out, n - 1);
+    close(fd);
+    if (got <= 0) return 0;
+    out[got] = '\0';
+    out[strcspn(out, "\n")] = '\0';
+    return 1;
+}
+
+static void bt_encoder_rt(void) {
+    static pid_t done_tid;
+    char path[64], comm[32];
+    if (done_tid) {
+        snprintf(path, sizeof(path), "/proc/%d/comm", (int)done_tid);
+        if (read_small(path, comm, sizeof(comm)) && !strncmp(comm, "ba-a2dp-", 8) &&
+            sched_getscheduler(done_tid) == SCHED_FIFO)
+            return;
+        done_tid = 0;
+    }
+    DIR *proc = opendir("/proc");
+    if (!proc) return;
+    struct dirent *e;
+    pid_t daemon = 0;
+    while ((e = readdir(proc)) != NULL) {
+        if (e->d_name[0] < '1' || e->d_name[0] > '9') continue;
+        snprintf(path, sizeof(path), "/proc/%s/comm", e->d_name);
+        if (read_small(path, comm, sizeof(comm)) &&
+            (!strcmp(comm, "bluealsad") || !strcmp(comm, "bluealsa"))) {
+            daemon = (pid_t)atoi(e->d_name);
+            break;
+        }
+    }
+    closedir(proc);
+    if (!daemon) return;
+    snprintf(path, sizeof(path), "/proc/%d/task", (int)daemon);
+    DIR *tasks = opendir(path);
+    if (!tasks) return;
+    while ((e = readdir(tasks)) != NULL) {
+        if (e->d_name[0] < '1' || e->d_name[0] > '9') continue;
+        pid_t tid = (pid_t)atoi(e->d_name);
+        snprintf(path, sizeof(path), "/proc/%d/task/%d/comm", (int)daemon, (int)tid);
+        if (!read_small(path, comm, sizeof(comm)) || strncmp(comm, "ba-a2dp-", 8) != 0) continue;
+        if (sched_getscheduler(tid) != SCHED_FIFO) {
+            struct sched_param sp = { .sched_priority = BT_ENC_RT_PRIO };
+            if (sched_setscheduler(tid, SCHED_FIFO, &sp) != 0) {
+                static int moaned;
+                if (!moaned++) alog("[bt] encoder %s (%d): SCHED_FIFO refused\n", comm, (int)tid);
+                continue;
+            }
+            alog("[bt] encoder %s (%d) now SCHED_FIFO %d\n", comm, (int)tid, BT_ENC_RT_PRIO);
+        }
+        done_tid = tid;
+    }
+    closedir(tasks);
+}
+
 static void apply_decode_priority(void) {
     int bt = (g_out_kind == 2);
     int want = bt ? 0 : -8;
@@ -3903,6 +4010,7 @@ static void *worker(void *arg) {
          * preempt either, so there's nothing for this check to do then). */
         if (++poll_tick >= (int)(rate / CHUNK_FRAMES) + 1) {
             poll_tick = 0;
+            if (g_out_kind == 2) bt_encoder_rt();
             if (g_out_kind == 2) bt_alive_at = time(NULL);   /* see bt_alive_at */
             int now = usb_card();
             int bt_now = 0;

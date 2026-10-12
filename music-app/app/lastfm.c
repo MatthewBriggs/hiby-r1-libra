@@ -282,9 +282,36 @@ int lastfm_fetch_artist(const char *artist, const char *dest_jpg,
     return result;
 }
 
+/* run_curl() without -f: an HTTP error status still leaves its body in
+ * out_path. album.getinfo answers an unknown album with 404 and
+ * {"error":6}, and a bad moment on its side with a 5xx whose body is not
+ * Last.fm's JSON at all -- -f made both the same failure, and an album that
+ * merely met a 503 was remembered as having no cover. 0 when a body
+ * arrived, -1 when nothing did. */
+static int run_curl_body(const char *url, const char *out_path) {
+    unlink(out_path);
+    pid_t pid = fork();
+    if (pid == 0) {
+        execl(CURL_BIN, CURL_BIN, "-sSL", "--cacert", CURL_CA,
+              "--connect-timeout", "10", "--max-time", "20",
+              "-o", out_path, url, (char *)NULL);
+        execlp("curl", "curl", "-sSL",
+               "--connect-timeout", "10", "--max-time", "20",
+               "-o", out_path, url, (char *)NULL);
+        _exit(127);
+    }
+    if (pid < 0) return -1;
+    int status;
+    if (waitpid(pid, &status, 0) != pid) return -1;
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return -1;
+    struct stat st;
+    if (stat(out_path, &st) != 0 || st.st_size <= 0) return -1;
+    return 0;
+}
+
 int lastfm_fetch_cover(const char *artist, const char *album, const char *dest_jpg) {
     lastfm_load_config();
-    if (!g_api_key[0] || !artist[0] || !album[0]) return -1;
+    if (!g_api_key[0] || !artist[0] || !album[0]) return COVER_FETCH_NONE;
 
     char ea[300], eb[300];
     url_encode(artist, ea, sizeof(ea));
@@ -298,25 +325,33 @@ int lastfm_fetch_cover(const char *artist, const char *album, const char *dest_j
 
     char meta_path[64];
     snprintf(meta_path, sizeof(meta_path), "/tmp/.lastfm_meta_%d.json", tid());
-    if (run_curl(url, meta_path) != 0) { unlink(meta_path); return -1; }
+    if (run_curl_body(url, meta_path) != 0) { unlink(meta_path); return COVER_FETCH_ERROR; }
 
     FILE *f = fopen(meta_path, "rb");
-    if (!f) { unlink(meta_path); return -1; }
+    if (!f) { unlink(meta_path); return COVER_FETCH_ERROR; }
     char *buf = malloc(65536);
     size_t n = buf ? fread(buf, 1, 65535, f) : 0;
     fclose(f);
     unlink(meta_path);
-    if (!buf) return -1;
+    if (!buf) return COVER_FETCH_ERROR;
     buf[n] = '\0';
 
+    /* "No such album" is error 6. Any other error code (a bad key, rate
+     * limiting, "service temporarily unavailable"), or a body that is not
+     * an album at all, says nothing about whether the cover exists. */
+    if (strstr(buf, "\"album\"") == NULL) {
+        int not_found = strstr(buf, "\"error\":6") != NULL;
+        free(buf);
+        return not_found ? COVER_FETCH_NONE : COVER_FETCH_ERROR;
+    }
     char img_url[600];
     int rc = extract_best_image_url(buf, img_url, sizeof(img_url));
     free(buf);
-    if (rc != 0) return -1;
+    if (rc != 0) return COVER_FETCH_NONE;   /* known, but no image */
 
     char tmp_jpg[600];
     snprintf(tmp_jpg, sizeof(tmp_jpg), "%s.part%d", dest_jpg, tid());
-    if (run_curl(img_url, tmp_jpg) != 0) { unlink(tmp_jpg); return -1; }
-    if (rename(tmp_jpg, dest_jpg) != 0) { unlink(tmp_jpg); return -1; }
+    if (run_curl(img_url, tmp_jpg) != 0) { unlink(tmp_jpg); return COVER_FETCH_ERROR; }
+    if (rename(tmp_jpg, dest_jpg) != 0) { unlink(tmp_jpg); return COVER_FETCH_ERROR; }
     return 0;
 }

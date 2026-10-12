@@ -20,10 +20,16 @@ int lastfm_has_key(void);
  * "largest available image size" pick, Navidrome's Last.fm agent uses)
  * and saves the result to `dest_jpg` on success. Blocking -- does two
  * network round trips via a curl subprocess -- so only ever call this off
- * the UI thread. Returns 0 on success, -1 on any failure (no match, no
- * network, no key, curl missing, decode-unfriendly image -- the caller
- * doesn't need to distinguish these, cover_load() is what actually
- * validates the saved file the next time it's read). */
+ * the UI thread. Returns 0 on success, -1 when Last.fm answered and has no
+ * cover (album unknown, or known without an image, or no key to ask with),
+ * and -2 when it could not be asked or did not answer properly: no network,
+ * a timeout, one of its own 5xx replies, the image download failing. Only
+ * -1 is worth remembering as "no cover"; -2 is "try again some other time".
+ * cover_load() is what validates the saved file the next time it's read. */
+#ifndef COVER_FETCH_NONE
+#define COVER_FETCH_NONE  (-1)
+#define COVER_FETCH_ERROR (-2)
+#endif
 int lastfm_fetch_cover(const char *artist, const char *album, const char *dest_jpg);
 
 /* Artist page: artist.getinfo instead of album.getinfo, one call for both

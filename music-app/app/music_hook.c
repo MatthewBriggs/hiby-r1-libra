@@ -894,6 +894,10 @@ static void *bt_poll(void *arg) {
                 }
                 bt_match_profile(nm);
                 snprintf(bt_matched_name, sizeof(bt_matched_name), "%s", nm);
+                /* Its best codec now, while idle, not at the first play --
+                 * see audio_bt_pick_codec_idle(). On this thread: the codec
+                 * switch is a bluealsactl call that can take a second. */
+                audio_bt_pick_codec_idle();
             }
         } else {
             bt_matched_name[0] = '\0';
@@ -1012,6 +1016,9 @@ static int art_seq(void) {
  * (cover_palette_enabled); the three colours themselves are runtime-only,
  * recomputed from art_bits, never saved. */
 static int      cover_palette_enabled;
+/* Settings > Rounded art corners: cover and artist art drawn with rounded
+ * corners wherever it shows -- see art_round_corners(). */
+static int      art_round_enabled;
 static uint16_t np_bg = 0, np_accent = 0, np_fg = 0xFFFF;
 static int       np_palette_seq = -1;   /* art_seq_v this was last computed for */
 
@@ -1552,6 +1559,75 @@ static uint16_t np_col_line(void) {
     return (cover_palette_enabled && np_palette_valid) ? np_blend(np_bg, np_fg, 0.35f) : COL_LINE;
 }
 
+/* The online cover lookup both art workers fall back to: Last.fm, then
+ * Spotify (see art_worker()'s comment for why in that order), saved as the
+ * album's own cover.jpg so it is found the ordinary way afterwards.
+ *
+ * Asked with the album artist first and the track's own artist second when
+ * they differ. It used to ask with the track artist alone, which cannot find
+ * a compilation or a "presents" album: a release is listed under its album
+ * artist, and "Section 25 / New Order Presents Be Music" is not a release.
+ *
+ * A miss on every query leaves .cover_no_match in the folder so the APIs are
+ * not asked again each time the album comes up -- but only when every query
+ * was answered. A lookup that could not get through (Wi-Fi still getting an
+ * address, a timeout, a 503 from Last.fm itself, all seen) used to count as a
+ * miss too, and the album never had its cover looked up again; Navidrome
+ * found the same Last.fm cover for one of them. The marker says which search
+ * failed: one from an older search (empty: track artist only; "2": network
+ * failures counted as misses) gets one more try, then is rewritten. Returns
+ * the decoded cover or NULL. */
+#define COVER_NOMATCH_VERSION "3"
+static uint16_t *art_fetch_online(const char *track, const char *first_artist,
+                                  const char *second_artist, const char *album,
+                                  const char **source) {
+    char dir[512], dest[560], nomatch[580], have[8] = "";
+    int had_marker = 0;
+    *source = NULL;
+    album_dir(track, dir, sizeof(dir));
+    snprintf(dest, sizeof(dest), "%s/cover.jpg", dir);
+    snprintf(nomatch, sizeof(nomatch), "%s/.cover_no_match", dir);
+    FILE *f = fopen(nomatch, "r");
+    if (f) {
+        had_marker = 1;
+        if (!fgets(have, sizeof(have), f)) have[0] = '\0';
+        fclose(f);
+        have[strcspn(have, "\r\n")] = '\0';
+        if (!strcmp(have, COVER_NOMATCH_VERSION)) return NULL;
+    }
+    if (second_artist && (!second_artist[0] || !strcasecmp(second_artist, first_artist)))
+        second_artist = NULL;
+    const char *who[2] = { first_artist, second_artist };
+    int unanswered = 0;
+    for (int i = 0; i < 2 && !*source; i++) {
+        if (!who[i] || !who[i][0]) continue;
+        int rc = lastfm_has_key() ? lastfm_fetch_cover(who[i], album, dest) : COVER_FETCH_NONE;
+        if (rc == 0) { *source = "lastfm"; break; }
+        if (rc == COVER_FETCH_ERROR) unanswered = 1;
+        rc = spotify_has_key() ? spotify_fetch_cover(who[i], album, dest) : COVER_FETCH_NONE;
+        if (rc == 0) { *source = "spotify"; break; }
+        if (rc == COVER_FETCH_ERROR) unanswered = 1;
+    }
+    if (!*source && unanswered) {
+        mlog("[music] art: lookup did not get through for %s / %s; will try again\n",
+             first_artist, album);
+        return NULL;
+    }
+    if (!*source) {
+        f = fopen(nomatch, "w");
+        if (f) { fputs(COVER_NOMATCH_VERSION "\n", f); fclose(f); }
+        mlog("[music] art: no match anywhere for %s%s%s / %s\n", first_artist,
+             second_artist ? " or " : "", second_artist ? second_artist : "", album);
+        return NULL;
+    }
+    if (had_marker)
+        unlink(nomatch);
+    /* BG104: shrink before caching/showing it -- see FETCHED_COVER_MAX_DIM's
+     * own comment. A no-op when the fetch was already small enough. */
+    cover_downscale_max(dest, FETCHED_COVER_MAX_DIM);
+    return cover_load(dest, dir, ART_PX);
+}
+
 static void *art_worker(void *arg) {
     art_job_t *job = arg;
     art_worker_yield_priority("art");
@@ -1599,34 +1675,14 @@ static void *art_worker(void *arg) {
      * is remembered with one sentinel file so a real "no match anywhere"
      * doesn't retry (and re-hit both APIs) every single time the album is
      * opened. */
-    if (!bits && artist[0] && album[0] && st_net_up() && !net_held() &&
-        (lastfm_has_key() || spotify_has_key())) {
-        char dir[512], dest[560], nomatch[580];
-        album_dir(track, dir, sizeof(dir));
-        snprintf(dest, sizeof(dest), "%s/cover.jpg", dir);
-        snprintf(nomatch, sizeof(nomatch), "%s/.cover_no_match", dir);
-        struct stat nm_st;
-        if (stat(nomatch, &nm_st) != 0) {
-            int ok = lastfm_has_key() && lastfm_fetch_cover(artist, album, dest) == 0;
-            const char *source = "lastfm";
-            if (!ok && spotify_has_key() && spotify_fetch_cover(artist, album, dest) == 0) {
-                ok = 1;
-                source = "spotify";
-            }
-            if (ok) {
-                /* BG104: shrink before caching/showing it -- see
-                 * FETCHED_COVER_MAX_DIM's own comment. A no-op return (0)
-                 * when the fetch was already small enough; either way
-                 * cover_load() below reads whatever ended up on disk. */
-                cover_downscale_max(dest, FETCHED_COVER_MAX_DIM);
-                bits = cover_load(dest, dir, ART_PX);
-                mlog("[music] %s: cover fetched for %s / %s\n", source, artist, album);
-            } else {
-                FILE *f = fopen(nomatch, "w");
-                if (f) fclose(f);
-                mlog("[music] art: no match anywhere for %s / %s\n", artist, album);
-            }
-        }
+    if (!bits && (album_artist[0] || artist[0]) && album[0] && st_net_up() &&
+        !net_held() && (lastfm_has_key() || spotify_has_key())) {
+        const char *source;
+        bits = art_fetch_online(track, album_artist[0] ? album_artist : artist,
+                                artist, album, &source);
+        if (source)
+            mlog("[music] %s: cover fetched for %s / %s\n", source,
+                 album_artist[0] ? album_artist : artist, album);
     }
 
     pthread_mutex_lock(&art_lock);
@@ -1819,24 +1875,9 @@ static void *view_art_worker(void *arg) {
      * played, and it deserves the same chance at a fetched cover. */
     if (!bits && artist[0] && album[0] && st_net_up() && !net_held() &&
         (lastfm_has_key() || spotify_has_key())) {
-        char dir[512], dest[560], nomatch[580];
-        album_dir(track, dir, sizeof(dir));
-        snprintf(dest, sizeof(dest), "%s/cover.jpg", dir);
-        snprintf(nomatch, sizeof(nomatch), "%s/.cover_no_match", dir);
-        struct stat nm_st;
-        if (stat(nomatch, &nm_st) != 0) {
-            int ok = lastfm_has_key() && lastfm_fetch_cover(artist, album, dest) == 0;
-            if (!ok && spotify_has_key() && spotify_fetch_cover(artist, album, dest) == 0)
-                ok = 1;
-            if (ok) {
-                /* BG104: see art_worker()'s matching call for why. */
-                cover_downscale_max(dest, FETCHED_COVER_MAX_DIM);
-                bits = cover_load(dest, dir, ART_PX);
-            } else {
-                FILE *f = fopen(nomatch, "w");
-                if (f) fclose(f);
-            }
-        }
+        const char *source;
+        /* The page's artist: the album artist when browsing by album artist. */
+        bits = art_fetch_online(track, artist, NULL, album, &source);
     }
 
     /* By request, not by track: reopening the same album (or holding its
@@ -2199,6 +2240,38 @@ static void blit_art(uint16_t *fb, int x, int y) {
                    (size_t)ART_PX * sizeof(uint16_t));
     }
     pthread_mutex_unlock(&art_lock);
+}
+
+/* Rounded art corners. Rounds all four corners of a w*h image at (x, y),
+ * the ones against the screen's edges included. Each corner pixel is
+ * blended toward `bg`, the colour drawn around the image there, by how much
+ * of it the radius leaves outside the arc: antialiased, so the edge does not stair-step. Rows outside [clip_top, clip_bot) are left alone, for the pages that
+ * scroll their cover under a header. Nothing happens with the setting off. */
+#define ART_CORNER_R    28
+static uint16_t mix565(uint16_t a, uint16_t b, int t);
+static void art_round_corners(uint16_t *fb, int x, int y, int w, int h, int r,
+                              uint16_t bg, int clip_top, int clip_bot) {
+    if (!art_round_enabled || r <= 0 || w < 2 * r || h < 2 * r) return;
+    for (int c = 0; c < 4; c++) {
+        int right = c & 1, bottom = c >> 1;
+        for (int dy = 0; dy < r; dy++) {
+            int py = bottom ? y + h - 1 - dy : y + dy;
+            if (py < clip_top || py >= clip_bot || py < 0 || py >= FB_H) continue;
+            for (int dx = 0; dx < r; dx++) {
+                int px = right ? x + w - 1 - dx : x + dx;
+                if (px < 0 || px >= FB_W) continue;
+                /* Distance from the arc's centre, (r, r) in from the corner,
+                 * to this pixel's centre; coverage falls off over one pixel. */
+                float fx = (float)(r - dx) - 0.5f, fy = (float)(r - dy) - 0.5f;
+                if (fx <= 0 || fy <= 0) continue;
+                float d = sqrtf(fx * fx + fy * fy);
+                float cov = (float)r - d + 0.5f;
+                if (cov >= 1.0f) continue;
+                uint16_t *pp = fb + (size_t)py * FB_W + px;
+                *pp = cov <= 0.0f ? bg : mix565(bg, *pp, (int)(cov * 256.0f));
+            }
+        }
+    }
 }
 
 /* R46: blit_art() writes ART_PX rows unconditionally with no bounds check --
@@ -2595,7 +2668,7 @@ static int qs_pulling;
 static void qs_refresh(void) {
     qs_bright = st_brightness();
     qs_bright_max = st_brightness_max();
-    qs_wifi = st_wifi_on();
+    qs_wifi = st_wifi_shown();
     qs_bt = st_bt_on();
 }
 
@@ -3003,7 +3076,9 @@ static int set_coverpalette_desc_y(void) { return set_row_coverpalette_y() + ROW
 /* R26: About, one row below Accent colour -- which now needs its own
  * trailing divider back (it used to be the last row and closed the list
  * itself), and this row takes over closing the list instead. */
-static int set_row_about_y(void) { return set_coverpalette_desc_y() + 64; }
+/* Rounded art corners, after Cover colours: one plain toggle row. */
+static int set_row_artround_y(void) { return set_coverpalette_desc_y() + 64; }
+static int set_row_about_y(void) { return set_row_artround_y() + ROW_H; }
 /* Wi-Fi/Bluetooth: reachable here too, not just via holding their row in
  * quick settings -- that hold is fast once you know it's there, but
  * nothing on screen ever told a first-time user it existed. */
@@ -3032,7 +3107,7 @@ static int settings_content_rows(void) {
  * pushed by hand, not by CI against a tagged commit), so this stays a
  * literal that a human edits; the discipline is remembering to, not the
  * mechanism. */
-#define LIBRARY_VERSION "0.61.5"
+#define LIBRARY_VERSION "0.61.6"
 
 /* A custom-built kernel keeps uname()'s own release string exactly
  * "4.4.94+" on purpose -- that string is also the vermagic every one of the
@@ -4131,10 +4206,24 @@ static void wifi_link_tick(void) {
     last = now;
     int up = st_wifi_on() && st_wifi_carrier();
     if (was_up < 0) was_up = up;   /* already joined at start: wifi_on.sh has it */
+    /* A turn-on while Bluetooth plays scans one channel -- see status.c. */
+    st_wifi_scan_narrow_wanted(audio_using_bt());
+    static int narrow_logged;
+    int narrowed = st_wifi_narrowed();
+    if (narrowed && !narrow_logged) {
+        mlog("[music] wifi: scanning only %d MHz, where it last joined, while Bluetooth plays\n", narrowed);
+        narrow_logged = 1;
+    }
     if (up && (!was_up || (!st_wifi_has_ip() && now - last_dhcp >= 30))) {
         st_wifi_dhcp();
         last_dhcp = now;
         mlog("[music] wifi: joined, asking for an address\n");
+        if (!was_up) st_wifi_note_joined();
+    }
+    int lifted = st_wifi_narrow_check(up);
+    if (lifted) {
+        narrow_logged = 0;
+        if (lifted == 2) mlog("[music] wifi: nothing on the last channel; scanning all of them\n");
     }
     was_up = up;
 
@@ -8565,6 +8654,7 @@ static void draw_screen(uint16_t *fb) {
             int cy = 0, cx = (FB_W - ART_PX) / 2;
             fill_rect(fb, cx, cy, ART_PX, ART_PX, COL_ROW);
             blit_art(fb, cx, cy);
+            art_round_corners(fb, cx, cy, ART_PX, ART_PX, ART_CORNER_R, COL_BG, 0, FB_H);
             int ty = title_y();
             draw_scroll_title(fb, ty, t->name, COL_TEXT, COL_BG);
 
@@ -8711,6 +8801,7 @@ static void draw_screen(uint16_t *fb) {
                     memcpy(fb + (size_t)r * FB_W, radio_art_bits + (size_t)r * ART_PX,
                            (size_t)ART_PX * sizeof(uint16_t));
             }
+            art_round_corners(fb, 0, 0, ART_PX, ART_PX, ART_CORNER_R, np_col_bg(), 0, FB_H);
             char art_title[160];
             snprintf(art_title, sizeof(art_title), "%s", radio_art_title);
             pthread_mutex_unlock(&radio_art_lock);
@@ -8856,6 +8947,7 @@ static void draw_screen(uint16_t *fb) {
         } else {
             fill_rect(fb, cx, cy, ART_PX, ART_PX, COL_ROW);
             blit_art(fb, cx, cy);
+            art_round_corners(fb, cx, cy, ART_PX, ART_PX, ART_CORNER_R, np_col_bg(), 0, FB_H);
         }
         int ty = title_y();
         draw_scroll_title(fb, ty, t->name, np_col_fg(), np_col_bg());
@@ -9180,6 +9272,8 @@ static void draw_screen(uint16_t *fb) {
             int cover_y = 0 - off;
             fill_rect_clip(fb, 0, cover_y, ART_PX, ART_PX, COL_ROW, 0, clip_bot);
             view_blit_art_clip(fb, 0, cover_y, 0, clip_bot);
+            art_round_corners(fb, 0, cover_y, ART_PX, ART_PX, ART_CORNER_R,
+                              np_view_col_bg(), 0, clip_bot);
         }
 
         /* Same "say it is a playlist" rule as Now Playing's own album line --
@@ -9368,6 +9462,7 @@ static void draw_screen(uint16_t *fb) {
         int photo_y = 0 - off;
         fill_rect_clip(fb, 0, photo_y, ART_PX, ART_PX, COL_ROW, 0, clip_bot);
         artist_blit_art_clip(fb, 0, photo_y, 0, clip_bot);
+        art_round_corners(fb, 0, photo_y, ART_PX, ART_PX, ART_CORNER_R, COL_BG, 0, clip_bot);
 
         /* The category bar, straight under the photo. */
         if (ac_bar_shown()) {
@@ -9468,6 +9563,7 @@ static void draw_screen(uint16_t *fb) {
             if (!g_view_art_gone_frame) {
                 fill_rect_clip(fb, 0, -pp_off, ART_PX, ART_PX, pc_row, 0, clip_bot);
                 view_blit_art_clip(fb, 0, -pp_off, 0, clip_bot);
+                art_round_corners(fb, 0, -pp_off, ART_PX, ART_PX, ART_CORNER_R, pc_bg, 0, clip_bot);
             }
             draw_text_clip(fb, 24, tracks_hdr_title_y() - pp_off, cur_feed, pc_text,
                            TEXT_PX_TITLE, POD_GEAR_X - 16, 0, clip_bot);
@@ -10013,7 +10109,7 @@ static void draw_screen(uint16_t *fb) {
                             ACCENT_PRESETS[g_accent_idx].name, ACCENT_PRESETS[g_accent_idx].color, CONTENT_Y, clip_bot);
 
         ry = set_row_coverpalette_y() - off;
-        int coverpalette_h = set_row_about_y() - set_row_coverpalette_y();
+        int coverpalette_h = set_row_artround_y() - set_row_coverpalette_y();
         fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
         draw_text_clip(fb, 24, ry + 20, "Cover colours", COL_TEXT, TEXT_PX_BODY, FB_W - 140, CONTENT_Y, clip_bot);
         draw_toggle_switch_h_clip(fb, ry, cover_palette_enabled, coverpalette_h, CONTENT_Y, clip_bot);
@@ -10021,6 +10117,11 @@ static void draw_screen(uint16_t *fb) {
         int cpy = set_coverpalette_desc_y() - off;
         draw_text_clip(fb, 24, cpy, "Now Playing's background and accent follow", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
         draw_text_clip(fb, 24, cpy + 26, "the current album art (Music only).", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
+
+        ry = set_row_artround_y() - off;
+        fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
+        draw_text_clip(fb, 24, ry + 20, "Rounded art corners", COL_TEXT, TEXT_PX_BODY, FB_W - 140, CONTENT_Y, clip_bot);
+        draw_toggle_switch_h_clip(fb, ry, art_round_enabled, ROW_H, CONTENT_Y, clip_bot);
 
         ry = set_row_about_y() - off;
         fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
@@ -10034,7 +10135,7 @@ static void draw_screen(uint16_t *fb) {
         ry = set_row_wifi_y() - off;
         draw_text_clip(fb, 24, ry + 20, "Wi-Fi", COL_TEXT, TEXT_PX_BODY, FB_W - 200, CONTENT_Y, clip_bot);
         {
-            int on = st_wifi_on();
+            int on = st_wifi_shown();
             char nm[64] = "";
             if (on) st_wifi_ssid(nm, sizeof(nm));
             draw_right_clip(fb, ry + 20, on ? (nm[0] ? nm : st_wifi_joining() ? "connecting..." : "not connected")
@@ -10142,7 +10243,7 @@ static void draw_screen(uint16_t *fb) {
         int off = scroll * ROW_H + scroll_px;
         int clip_bot = mini_visible() ? FB_H - MINI_H : FB_H;
         int ry = CONTENT_Y - off;
-        int on = st_wifi_on();
+        int on = st_wifi_shown();
         draw_text_clip(fb, 24, ry + 20, "Wi-Fi", COL_TEXT, TEXT_PX_BODY, FB_W - 140, CONTENT_Y, clip_bot);
         draw_toggle_switch_h_clip(fb, ry, on, ROW_H, CONTENT_Y, clip_bot);
         ry += ROW_H;
@@ -12838,6 +12939,9 @@ static void load_conf(void) {
         } else if (sscanf(line, "usb_bypass_enabled = %d", &v) == 1 ||
                    sscanf(line, "usb_bypass_enabled=%d", &v) == 1) {
             usb_bypass_enabled = v != 0;
+        } else if (sscanf(line, "art_round_enabled = %d", &v) == 1 ||
+                   sscanf(line, "art_round_enabled=%d", &v) == 1) {
+            art_round_enabled = v != 0;
         } else if (sscanf(line, "cover_palette_enabled = %d", &v) == 1 ||
                    sscanf(line, "cover_palette_enabled=%d", &v) == 1) {
             cover_palette_enabled = v != 0;
@@ -13002,6 +13106,7 @@ static void save_conf(void) {
                 !conf_line_is(lines[n], "button_lock_enabled") &&
                 !conf_line_is(lines[n], "usb_bypass_enabled") &&
                 !conf_line_is(lines[n], "cover_palette_enabled") &&
+                !conf_line_is(lines[n], "art_round_enabled") &&
                 !conf_line_is(lines[n], "bt_autoplay_enabled") &&
                 !conf_line_is(lines[n], "bt_robust_enabled") &&
                 !conf_line_is(lines[n], "bt_robust_mode") &&
@@ -13042,6 +13147,7 @@ static void save_conf(void) {
     fprintf(f, "button_lock_enabled = %d\n", button_lock_enabled);
     fprintf(f, "usb_bypass_enabled = %d\n", usb_bypass_enabled);
     fprintf(f, "cover_palette_enabled = %d\n", cover_palette_enabled);
+    fprintf(f, "art_round_enabled = %d\n", art_round_enabled);
     fprintf(f, "bt_autoplay_enabled = %d\n", bt_autoplay_enabled);
     fprintf(f, "bt_robust_mode = %d\n", bt_robust_mode);
     fprintf(f, "bt_show_rssi = %d\n", bt_show_rssi);
@@ -15524,7 +15630,8 @@ int music_entry(void *a0, void *a1) {
                 int off = scroll * ROW_H + scroll_px;
                 int ry_lock = set_row_lock_y() - off, ry_theme = set_row_theme_y() - off;
                 int ry_coverpalette = set_row_coverpalette_y() - off;
-                int coverpalette_h = set_row_about_y() - set_row_coverpalette_y();
+                int coverpalette_h = set_row_artround_y() - set_row_coverpalette_y();
+                int ry_artround = set_row_artround_y() - off;
                 int ry_usbbypass = set_row_usbbypass_y() - off;
                 int ry_autooff = set_row_autooff_y() - off, ry_about = set_row_about_y() - off;
                 int ry_btautoplay = set_row_btautoplay_y() - off;
@@ -15604,6 +15711,9 @@ int music_entry(void *a0, void *a1) {
                      * scan to happen to run again. */
                     if (cover_palette_enabled) cover_prewarm_start();
                     save_conf();
+                } else if (y >= ry_artround && y < ry_artround + ROW_H) {
+                    art_round_enabled = !art_round_enabled;
+                    save_conf();
                 } else if (y >= ry_about && y < ry_about + ROW_H) {
                     screen = SC_SETTINGS_ABOUT; reset_scroll();
                 } else if (y >= ry_wifi && y < ry_wifi + ROW_H) {
@@ -15627,10 +15737,10 @@ int music_entry(void *a0, void *a1) {
                 int off = scroll * ROW_H + scroll_px;
                 int content_y = y + off;
                 int row = (content_y - CONTENT_Y) / ROW_H;
-                if (row == 0 && !st_wifi_on() && wifi_on_blocked()) {
+                if (row == 0 && !st_wifi_shown() && wifi_on_blocked()) {
                     wifi_on_refused("Settings");
                 } else if (row == 0) {
-                    int on = !st_wifi_on();
+                    int on = !st_wifi_shown();
                     st_wifi_set(on);
                     mlog("[music] wifi: %s from Settings\n", on ? "on" : "off");
                     wifi_pref = on;

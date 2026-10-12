@@ -149,6 +149,9 @@ void audio_bt_retry_now(void);
  * best codec. 0 off, 1 automatic (once the link keeps stalling), 2 always.
  * A change in effect reopens the stream within a second. */
 void audio_bt_set_robust(int mode);
+/* A headset just connected, nothing playing: switch it to its best codec now
+ * rather than at the first play. bt_poll calls this on each arrival. */
+void audio_bt_pick_codec_idle(void);
 const char *audio_output(void);   /* "3.5 mm", "USB" or "Bluetooth" */
 /* Radio only: sample rate of the current stream/recording in Hz, and the
  * real measured bitrate of the live fetch in kbps (not a nominal figure --

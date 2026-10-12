@@ -1011,9 +1011,124 @@ int st_bt_on(void) {
  * seconds. Blocking the UI on that would look like a crash. */
 static time_t g_wifi_on_at;
 
+/* A narrow first scan while Bluetooth plays. Turning Wi-Fi on is the one
+ * moment it still takes the radio from Bluetooth once connected-idle Wi-Fi
+ * no longer does: measured on the device, the stall falls in the
+ * supplicant's first sweep of every channel (driver ready at +0.9 s, stall
+ * at +2.6 s, joined at +5 s), with two saved networks probed by name on
+ * each. Asking it for only the channel it last joined on makes that sweep
+ * one channel long. The restriction goes in as a freq_list line in its
+ * config before wifi_on.sh starts it, and comes back out once it joins --
+ * or after WIFI_NARROW_S without a join (another place, another channel),
+ * when it is told to re-read the config and scan everything. */
+#define WPA_CONF        "/data/wpa_supplicant.conf"
+#define WIFI_FREQ_FILE  "/usr/data/.wifi_last_freq"
+#define WIFI_NARROW_S   10
+static int    g_narrow_wanted;
+/* The switch's state: what was last asked for, for WIFI_SWITCH_GRACE_S or
+ * until the interface agrees. Turning on takes 1-3 s (driver, firmware,
+ * interface up) and off about 1 s, and the panel re-reads the radio every
+ * second or so: read straight from the interface, a tile tapped on showed
+ * off again before it got there, and the next tap turned it "on" again --
+ * reported as needing three presses. */
+#define WIFI_SWITCH_GRACE_S 15
+static int    g_wifi_wanted = -1;
+static time_t g_wifi_set_at;
+static int    g_narrow_freq;
+static time_t g_narrow_at;
+
+void st_wifi_scan_narrow_wanted(int on) { g_narrow_wanted = on != 0; }
+int  st_wifi_narrowed(void) { return g_narrow_freq; }
+
+/* freq_list goes with the global settings, ahead of the first network
+ * block; freq 0 takes any out. Written whole and renamed, like music.conf. */
+static void wpa_conf_freq_list(int freq) {
+    FILE *f = fopen(WPA_CONF, "r");
+    if (!f) return;
+    char out[8192], line[512];
+    size_t at = 0;
+    int placed = !freq, changed = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (!strncmp(line, "freq_list=", 10)) { changed = 1; continue; }
+        if (!placed && !strncmp(line, "network={", 9)) {
+            at += (size_t)snprintf(out + at, sizeof(out) - at, "freq_list=%d\n", freq);
+            placed = changed = 1;
+        }
+        size_t n = strlen(line);
+        if (at + n >= sizeof(out)) { fclose(f); return; }   /* not ours to truncate */
+        memcpy(out + at, line, n);
+        at += n;
+    }
+    fclose(f);
+    if (!changed) return;
+    char tmp[] = WPA_CONF ".tmp";
+    f = fopen(tmp, "w");
+    if (!f) return;
+    int ok = fwrite(out, 1, at, f) == at;
+    ok = fclose(f) == 0 && ok;
+    if (ok) rename(tmp, WPA_CONF); else unlink(tmp);
+}
+
+int st_wifi_shown(void) {
+    int actual = st_wifi_on();
+    if (g_wifi_wanted >= 0 && actual != g_wifi_wanted &&
+        time(NULL) - g_wifi_set_at < WIFI_SWITCH_GRACE_S)
+        return g_wifi_wanted;
+    return actual;
+}
+
 void st_wifi_set(int on) {
-    if (on) g_wifi_on_at = time(NULL);
-    st_spawn(on ? "/usr/bin/wifi_on.sh >/dev/null 2>&1" : "/usr/bin/wifi_off.sh >/dev/null 2>&1");
+    g_wifi_wanted = on != 0;
+    g_wifi_set_at = time(NULL);
+    if (on) {
+        g_wifi_on_at = time(NULL);
+        int freq = 0;
+        if (g_narrow_wanted) {
+            FILE *f = fopen(WIFI_FREQ_FILE, "r");
+            if (f) { if (fscanf(f, "%d", &freq) != 1) freq = 0; fclose(f); }
+            if (freq < 2412 || freq > 5900) freq = 0;
+        }
+        /* Every turn-on, so one left behind by a crash never sticks. */
+        wpa_conf_freq_list(freq);
+        g_narrow_freq = freq;
+        g_narrow_at = freq ? time(NULL) : 0;
+    }
+    /* One at a time, in the order asked for: an off tapped while the on
+     * script was still loading the driver ran beside it, and the on script
+     * then started the supplicant after the off had finished -- Wi-Fi joined
+     * with the switch saying off. The same lock tool the USB mode scripts
+     * use; the kernel drops it if a script dies. */
+    st_spawn(on ? "flock /tmp/wifi_switch.lock /usr/bin/wifi_on.sh >/dev/null 2>&1"
+                : "flock /tmp/wifi_switch.lock /usr/bin/wifi_off.sh >/dev/null 2>&1");
+}
+
+/* On a join: the channel, for the next narrow scan. */
+void st_wifi_note_joined(void) {
+    char buf[512];
+    run_cmd("wpa_cli -i wlan0 status 2>/dev/null", buf, sizeof(buf));
+    char *q = strstr(buf, "\nfreq=");
+    int freq = q ? atoi(q + 6) : 0;
+    if (freq < 2412 || freq > 5900) return;
+    FILE *f = fopen(WIFI_FREQ_FILE, "w");
+    if (f) { fprintf(f, "%d\n", freq); fclose(f); }
+}
+
+/* Every couple of seconds while a narrow scan is in force: 1 when it was
+ * lifted after a join, 2 when it timed out and a full scan was asked for,
+ * 0 otherwise. The supplicant keeps the list it started with until it next
+ * restarts; only its config file is put back after a join. */
+int st_wifi_narrow_check(int joined) {
+    if (!g_narrow_freq) return 0;
+    if (joined) {
+        wpa_conf_freq_list(0);
+        g_narrow_freq = 0;
+        return 1;
+    }
+    if (time(NULL) - g_narrow_at < WIFI_NARROW_S) return 0;
+    wpa_conf_freq_list(0);
+    g_narrow_freq = 0;
+    st_spawn("wpa_cli -i wlan0 reconfigure >/dev/null 2>&1");
+    return 2;
 }
 
 /* Joining takes a while -- ~10 s here, up to ~40 s to an address: within

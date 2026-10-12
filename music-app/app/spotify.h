@@ -15,7 +15,12 @@ int spotify_has_key(void);
 /* Client-credentials token exchange, then a catalog search by artist+album,
  * taking the first (largest) image URL from the first result. Blocking --
  * two network round trips via a curl subprocess -- call off the UI thread
- * only. Returns 0 on success, -1 on any failure. */
+ * only. Returns 0 on success, and lastfm_fetch_cover()'s -1 (answered, no
+ * matching album) or -2 (could not ask, or no proper answer). */
+#ifndef COVER_FETCH_NONE
+#define COVER_FETCH_NONE  (-1)
+#define COVER_FETCH_ERROR (-2)
+#endif
 int spotify_fetch_cover(const char *artist, const char *album, const char *dest_jpg);
 
 /* Artist page's photo fallback, tried after Last.fm the same way
