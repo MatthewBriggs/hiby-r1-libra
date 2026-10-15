@@ -1077,6 +1077,63 @@ int st_wifi_shown(void) {
     return actual;
 }
 
+/* The Wi-Fi scripts, one at a time, ending on the latest request. An off
+ * tapped while the on script was still loading the driver used to run beside
+ * it, and the on script then started the supplicant after the off had
+ * finished -- Wi-Fi joined with the switch saying off. 0.61.6 serialised
+ * them with flock(1) instead, and wpa_supplicant, daemonised by wifi_on.sh,
+ * inherited the lock's descriptor and held it for good: every later turn-off
+ * -- the switches, Bluetooth parking, the idle timer -- queued behind it and
+ * never ran, and Wi-Fi stayed up through Bluetooth playback until a reboot.
+ * So the queue lives here: one thread runs each script to completion
+ * (st_run_argv(), which hands the script none of this process's files), then
+ * the newest request if it differs from what it last ran. wifi_on.sh is
+ * bounded by its own waits, about 22 s at worst. */
+static pthread_mutex_t wifi_q_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  wifi_q_cond = PTHREAD_COND_INITIALIZER;
+static int      wifi_q_want = -1;
+static unsigned wifi_q_seq, wifi_q_done;   /* requests made, requests dealt with */
+
+static void *wifi_q_worker(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&wifi_q_lock);
+    for (;;) {
+        while (wifi_q_done == wifi_q_seq)
+            pthread_cond_wait(&wifi_q_cond, &wifi_q_lock);
+        /* Taps that piled up meanwhile come down to the latest one. */
+        int on = wifi_q_want;
+        unsigned seq = wifi_q_seq;
+        pthread_mutex_unlock(&wifi_q_lock);
+        /* Skipped only when the interface is already that way, not on what
+         * this thread last ran: init scripts and hands at a shell change
+         * Wi-Fi too. */
+        if ((on != 0) != (st_wifi_on() != 0)) {
+            char *argv[] = { (char *)"/bin/sh",
+                             (char *)(on ? "/usr/bin/wifi_on.sh" : "/usr/bin/wifi_off.sh"), NULL };
+            st_run_argv(argv);
+        }
+        pthread_mutex_lock(&wifi_q_lock);
+        wifi_q_done = seq;
+    }
+    return NULL;
+}
+
+static void wifi_queue(int on) {
+    static int started;
+    pthread_mutex_lock(&wifi_q_lock);
+    if (!started) {
+        pthread_t t;
+        started = pthread_create(&t, NULL, wifi_q_worker, NULL) == 0;
+        if (started) pthread_detach(t);
+    }
+    wifi_q_want = on;
+    wifi_q_seq++;
+    pthread_cond_signal(&wifi_q_cond);
+    pthread_mutex_unlock(&wifi_q_lock);
+    if (!started)   /* no thread: run it the old way rather than not at all */
+        st_spawn(on ? "/usr/bin/wifi_on.sh >/dev/null 2>&1" : "/usr/bin/wifi_off.sh >/dev/null 2>&1");
+}
+
 void st_wifi_set(int on) {
     g_wifi_wanted = on != 0;
     g_wifi_set_at = time(NULL);
@@ -1093,13 +1150,7 @@ void st_wifi_set(int on) {
         g_narrow_freq = freq;
         g_narrow_at = freq ? time(NULL) : 0;
     }
-    /* One at a time, in the order asked for: an off tapped while the on
-     * script was still loading the driver ran beside it, and the on script
-     * then started the supplicant after the off had finished -- Wi-Fi joined
-     * with the switch saying off. The same lock tool the USB mode scripts
-     * use; the kernel drops it if a script dies. */
-    st_spawn(on ? "flock /tmp/wifi_switch.lock /usr/bin/wifi_on.sh >/dev/null 2>&1"
-                : "flock /tmp/wifi_switch.lock /usr/bin/wifi_off.sh >/dev/null 2>&1");
+    wifi_queue(on != 0);
 }
 
 /* On a join: the channel, for the next narrow scan. */

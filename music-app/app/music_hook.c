@@ -3107,7 +3107,7 @@ static int settings_content_rows(void) {
  * pushed by hand, not by CI against a tagged commit), so this stays a
  * literal that a human edits; the discipline is remembering to, not the
  * mechanism. */
-#define LIBRARY_VERSION "0.61.6"
+#define LIBRARY_VERSION "0.61.8"
 
 /* A custom-built kernel keeps uname()'s own release string exactly
  * "4.4.94+" on purpose -- that string is also the vermagic every one of the
@@ -3665,11 +3665,17 @@ static void pod_auto_start(int tail) {
     else { free(job); pod_auto_state = 0; }
 }
 /* A feed sync or episode downloads asked for while net_held(): started by the
- * main loop once playback over Bluetooth pauses or stops. Downloads wait in
+ * main loop once playback over Bluetooth has been stopped POD_NET_QUIET_S. Downloads wait in
  * order, each remembered by feed and episode name rather than by index -- the
  * user may be looking at a different feed by the time one starts, and it
  * must still start (pod_download_start_named()), and start the right one. */
 static int  pod_sync_deferred;
+/* Held work starts once Bluetooth playback has been stopped this long, not
+ * the moment it pauses: a feed sync started on a pause from the earbuds ran
+ * on into the next press of play, fetching every feed under the stream, and
+ * Wi-Fi traffic is what still breaks Bluetooth up (2026-10-15). The same
+ * three minutes as Wi-Fi coming back after Bluetooth playback. */
+#define POD_NET_QUIET_S 180
 #define POD_DL_WAIT_MAX 16
 static struct { char feed[POD_NAME_LEN]; char name[POD_NAME_LEN]; } pod_dl_wait[POD_DL_WAIT_MAX];
 static int  pod_dl_wait_n;
@@ -9748,7 +9754,7 @@ static void draw_screen(uint16_t *fb) {
     }
 
     if (screen == SC_POD_SYNC) {
-        draw_text(fb, 24, y + 6, pod_sync_deferred ? "Waits until Bluetooth playback pauses"
+        draw_text(fb, 24, y + 6, pod_sync_deferred ? "Waits until you stop listening"
                                 : pod_update_running() ? "Syncing every feed..."
                                 : pod_update_died()    ? "Sync stopped early."
                                                         : "Sync finished.",
@@ -10628,7 +10634,7 @@ static void draw_screen(uint16_t *fb) {
         int running = pod_update_running();
         fill_rect(fb, 0, by, FB_W, POD_SYNC_BAR_H, running ? COL_ACCENT : COL_HEADER);
         fill_rect(fb, 0, by, FB_W, 1, COL_LINE);
-        const char *lbl = running ? "Sync in progress" : pod_sync_deferred ? "Sync waits for Bluetooth" : "Sync";
+        const char *lbl = running ? "Sync in progress" : pod_sync_deferred ? "Sync waits for you to stop" : "Sync";
         int lw = text_width(lbl, TEXT_PX_BODY);
         draw_text(fb, (FB_W - lw) / 2, by + (POD_SYNC_BAR_H - TEXT_PX_BODY) / 2 - 2, lbl,
                   running ? COL_BG : pod_sync_deferred ? COL_DIM : COL_ACCENT, TEXT_PX_BODY, FB_W);
@@ -16577,7 +16583,37 @@ int music_entry(void *a0, void *a1) {
          * behind a download or sync already running, nothing on screen has
          * changed, and this used to repaint every tick for as long as that
          * lasted. */
-        if ((pod_sync_deferred || pod_dl_wait_n > 0) && !net_held() &&
+        /* Bluetooth playback stops a sync or download that is running and
+         * queues it again (a frozen curl would only time out when thawed:
+         * 30 s per feed, 15 min per episode); held work waits until playback
+         * has been stopped POD_NET_QUIET_S. */
+        static time_t net_free_since;
+        int net_quiet = 0;
+        if (net_held()) {
+            net_free_since = 0;
+            if (pod_update_running() && pod_update_stop()) {
+                pod_sync_deferred = 1;
+                mlog("[music] feed sync stopped for Bluetooth playback; it starts again "
+                     "%d s after you stop listening\n", POD_NET_QUIET_S);
+                dirty = 1;
+            }
+            char sf[POD_NAME_LEN], sn[POD_NAME_LEN];
+            if (pod_download_active() && pod_download_stop(sf, sizeof(sf), sn, sizeof(sn))) {
+                if (pod_dl_wait_n >= POD_DL_WAIT_MAX) pod_dl_wait_n = POD_DL_WAIT_MAX - 1;
+                memmove(&pod_dl_wait[1], &pod_dl_wait[0],
+                        (size_t)pod_dl_wait_n * sizeof(pod_dl_wait[0]));
+                snprintf(pod_dl_wait[0].feed, sizeof(pod_dl_wait[0].feed), "%s", sf);
+                snprintf(pod_dl_wait[0].name, sizeof(pod_dl_wait[0].name), "%s", sn);
+                pod_dl_wait_n++;
+                mlog("[music] download stopped for Bluetooth playback, queued again: %s / %s\n", sf, sn);
+                dirty = 1;
+            }
+        } else {
+            time_t tq = time(NULL);
+            if (!net_free_since) net_free_since = tq;
+            net_quiet = tq - net_free_since >= POD_NET_QUIET_S;
+        }
+        if ((pod_sync_deferred || pod_dl_wait_n > 0) && net_quiet &&
             !wifi_bt_parked && (st_wifi_has_ip() || !wifi_pref)) {
             if (pod_sync_deferred && !pod_update_running()) {
                 pod_sync_deferred = 0;

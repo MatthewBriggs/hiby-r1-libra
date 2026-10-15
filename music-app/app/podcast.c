@@ -1076,6 +1076,43 @@ void pod_update_reap(void) {
     }
 }
 
+/* Bluetooth playback has started again: stop the download for now. Its
+ * partial file goes, the same as on any cancel, and the caller queues it to
+ * start over later. Fills feed/name and returns 1 when one was running. */
+int pod_download_stop(char *feed, size_t fn, char *name, size_t nn) {
+    if (dl_pid <= 0) return 0;
+    snprintf(feed, fn, "%s", dl_feed);
+    snprintf(name, nn, "%s", dl_name);
+    kill(-dl_pid, SIGTERM);
+    (void)waitpid(dl_pid, NULL, 0);
+    dl_pid = -1;
+    unlink(dl_part_path);
+    return 1;
+}
+
+/* The same for a sync, ours or one adopted from before a restart. Not
+ * counted as dying: the caller starts it again, and a sync skips what it
+ * already fetched. Returns 1 when one was running. */
+int pod_update_stop(void) {
+    int was = 0;
+    if (update_foreign > 0) {
+        kill(-update_foreign, SIGTERM);
+        update_foreign = -1;
+        was = 1;
+    }
+    if (update_pid > 0) {
+        kill(-update_pid, SIGTERM);
+        (void)waitpid(update_pid, NULL, 0);
+        update_pid = -1;
+        was = 1;
+    }
+    if (was) {
+        update_running_flag = 0;
+        update_died_flag = 0;
+    }
+    return was;
+}
+
 void pod_cancel_io(void) {
     /* Both children write directly onto the SD card.  They must be gone
      * before that block device is handed to the USB host. */

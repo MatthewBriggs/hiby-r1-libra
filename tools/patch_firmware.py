@@ -1921,6 +1921,33 @@ _wl_power_on
 
 
 BRCM_MODULES = ("r1_wlan_up.ko", "brcmutil.ko", "brcmfmac.ko")
+
+# Bluetooth coexistence parameters from Cypress, as the Raspberry Pi's nvram
+# for this same chip (BCM43430) carries them. The stock nvram_ap6212a.txt has
+# none: cywdhd may set its own, brcmfmac only passes the file to the chip. On
+# the R1 with Wi-Fi connected, aptX logged a write stall every 2-3 minutes
+# without them and none in the first measured stretch with them (2026-10-15).
+BRCM_NVRAM_COEX = (
+    "\n# Bluetooth coexistence parameters from Cypress (as the Raspberry Pi nvram)\n"
+    "btc_mode=1\n"
+    "btc_params8=0x4e20\n"
+    "btc_params1=0x7530\n"
+)
+
+
+def brcm_nvram_add_coex(root):
+    """Append BRCM_NVRAM_COEX to the installed brcmfmac nvram unless it already
+    sets btc_mode. Returns True when it was added."""
+    path = os.path.join(root, "lib/firmware/brcm/brcmfmac43430-sdio.txt")
+    if not os.path.exists(path):
+        return False
+    with open(path) as fh:
+        text = fh.read()
+    if re.search(r"^btc_mode=", text, re.M):
+        return False
+    with open(path, "w") as fh:
+        fh.write(text.rstrip("\n") + "\n" + BRCM_NVRAM_COEX)
+    return True
 BRCM_FIRMWARE = ("brcmfmac43430-sdio.bin", "brcmfmac43430-sdio.txt")
 
 
@@ -3128,6 +3155,9 @@ def main():
                     die(f"--brcmfmac-switch: {err}")
                 print("patched module_driver (cywdhd -> mainline brcmfmac; "
                       "soc_msc wifi_reg_on=PB03)")
+                if brcm_nvram_add_coex(root):
+                    print("patched lib/firmware/brcm/brcmfmac43430-sdio.txt "
+                          "(Cypress Bluetooth coexistence: btc_mode=1, btc_params8/1)")
                 print("patched usr/bin/wifi_on.sh, usr/bin/wifi_off.sh "
                       "(rmmod/insmod brcmfmac+brcmutil on off/on, so 'WiFi "
                       "off' and R84's idle timer actually power the chip "

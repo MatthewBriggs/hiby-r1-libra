@@ -2869,6 +2869,56 @@ void audio_bt_set_robust(int mode) {
 }
 
 /* Write path, Bluetooth only: a write of `frames` that took `ms`. */
+/* A minute's Bluetooth write timing, logged while playing over Bluetooth, to
+ * compare images by numbers rather than by ear: a dropout shorter than
+ * BT_STALL_MS never shows up as a stall, because the chip's own buffers and
+ * the socket's absorb it on this side while the headset's runs dry. Late is
+ * a write taking BT_LATE_MS longer than the audio it carries. Beside it, the
+ * system's major page faults (code or data read back from flash -- a
+ * stalled encoder whatever its priority), interrupts and context switches
+ * over the same minute. */
+#define BT_LATE_MS 40
+static unsigned bt_j_writes, bt_j_late;
+static long     bt_j_max;
+static time_t   bt_j_since;
+
+static unsigned long long proc_counter(const char *path, const char *key) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char line[256];
+    unsigned long long v = 0;
+    size_t kl = strlen(key);
+    while (fgets(line, sizeof(line), f))
+        if (!strncmp(line, key, kl) && line[kl] == ' ') { v = strtoull(line + kl + 1, NULL, 10); break; }
+    fclose(f);
+    return v;
+}
+
+static void bt_jitter_note(long over) {
+    static unsigned long long pf0, irq0, cs0;
+    time_t t = time(NULL);
+    if (!bt_j_since) {
+        bt_j_since = t;
+        pf0  = proc_counter("/proc/vmstat", "pgmajfault");
+        irq0 = proc_counter("/proc/stat", "intr");
+        cs0  = proc_counter("/proc/stat", "ctxt");
+    }
+    bt_j_writes++;
+    if (over >= BT_LATE_MS) bt_j_late++;
+    if (over > bt_j_max) bt_j_max = over;
+    long span = (long)(t - bt_j_since);
+    if (span < 60) return;
+    unsigned long long pf  = proc_counter("/proc/vmstat", "pgmajfault");
+    unsigned long long irq = proc_counter("/proc/stat", "intr");
+    unsigned long long cs  = proc_counter("/proc/stat", "ctxt");
+    alog("[bt] jitter %lds: %u writes, worst %+ld ms, %u over %d ms | majflt %llu, irq/s %llu, cs/s %llu\n",
+         span, bt_j_writes, bt_j_max, bt_j_late, BT_LATE_MS,
+         pf - pf0, (irq - irq0) / (unsigned long long)span, (cs - cs0) / (unsigned long long)span);
+    bt_j_since = t; pf0 = pf; irq0 = irq; cs0 = cs;
+    bt_j_writes = bt_j_late = 0;
+    bt_j_max = 0;
+}
+
 static void bt_stall_check(unsigned long frames, long ms) {
     static struct timespec last_end;
     static long long quiet_until;
@@ -2880,9 +2930,10 @@ static void bt_stall_check(unsigned long frames, long ms) {
     last_end = now;
     /* Not writing for a while -- paused, a new stream, a seek -- and the
      * first writes after wait on A2DP starting up, not on the link. */
-    if (start_ms - last_ms > 500) quiet_until = now_ms + 3000;
+    if (start_ms - last_ms > 500) { quiet_until = now_ms + 3000; bt_j_since = 0; }
     if (now_ms < quiet_until || !g_out_rate) return;
     long over = ms - (long)(frames * 1000 / g_out_rate);
+    bt_jitter_note(over);
     if (over < BT_STALL_MS) return;
     time_t t = time(NULL);
     alog("[bt] stall %ld ms\n", over);

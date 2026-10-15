@@ -146,6 +146,11 @@ int  pod_update_tail(char out[][POD_NAME_LEN], int max_lines);
  * exited without ever writing "__DONE__" (killed, or exec failed). */
 void pod_update_reap(void);
 void pod_cancel_io(void);
+/* Stop a running download or sync because Bluetooth playback has started:
+ * each returns 1 if there was one (the download's feed and episode name in
+ * feed/name), for the caller to queue it again. */
+int  pod_download_stop(char *feed, size_t fn, char *name, size_t nn);
+int  pod_update_stop(void);
 
 /* The episode's notes sidecar (same basename, .txt), raw and unwrapped --
  * wrapping to the screen width is a drawing concern, left to the caller. 0
