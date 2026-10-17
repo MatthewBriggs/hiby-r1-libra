@@ -69,6 +69,8 @@ WIFI_SCRIPTS = ("usr/bin/wifi_on.sh", "usr/bin/wifi_off.sh",
 # vanilla base legitimately shows them all as removed. Kept as a duplicate
 # set rather than importing patch_firmware.py, matching how the other
 # constants above (SET_FUNCTIONS_FILES, BRCMFMAC_FILES) are already done.
+# patch_firmware.install_boot_logo() replaces the stock boot screens.
+BOOT_LOGOS = ("etc/logo.jpeg", "etc/logo1.jpeg", "etc/logo2.jpeg")
 STRIPPED_FONTS_AND_BINARIES = ("usr/resource/fonts/default.otf",
                                "usr/resource/fonts/Thai.ttf",
                                "usr/bin/hiby_player", "usr/bin/dmrd")
@@ -449,6 +451,7 @@ def main():
                             # when this allowlist was last updated.
                             "module_driver/soc_utils.sh"}
                 expected |= set(SET_FUNCTIONS_FILES)
+                expected |= set(BOOT_LOGOS)     # Libra's boot screen
                 expected |= set(WIFI_SCRIPTS)   # --brcmfmac-switch rewrites both
                 expected |= {"usr/bin/bt_resume"}  # --brcmfmac-switch drops --enable_lpm there too
                 # kernel_build_id: --kernel-build-id re-stamps this file, which

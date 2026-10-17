@@ -711,6 +711,15 @@ def enable_about_tile(root):
 # mod base, so only the wrapper is missing here, not any underlying support.
 S90ADB_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "S90adb")
 
+# The boot screen. S11jpeg_display_shell shows one of these as soon as
+# /dev/fb0 appears, picked by the theme byte in mtd5 (the R1 shows logo1:
+# HiBy's wordmark in white on black). Libra's is the same wordmark in its
+# accent orange, RGB(240, 138, 42), on black, made from stock logo1.jpeg: a 480x800
+# baseline JPEG, the panel's size. All three are replaced so the theme byte
+# can't bring the stock one back.
+BOOT_LOGO_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "boot_logo.jpeg")
+BOOT_LOGOS = ("etc/logo.jpeg", "etc/logo1.jpeg", "etc/logo2.jpeg")
+
 
 # RP7 follow-up (BG-none-yet, live measurement 2026-08-24): sa_hgl_dma is
 # HGL's graphics-acceleration DMA pool -- 6MB reserved at boot from a fixed
@@ -2533,6 +2542,20 @@ def install_bluealsa5(root, src):
     return sorted(set(touched))
 
 
+def install_boot_logo(root):
+    """Replace the stock boot screens with Libra's; returns the files replaced."""
+    with open(BOOT_LOGO_SRC, "rb") as fh:
+        data = fh.read()
+    done = []
+    for rel in BOOT_LOGOS:
+        path = os.path.join(root, rel)
+        if os.path.exists(path):
+            with open(path, "wb") as fh:
+                fh.write(data)
+            done.append(rel)
+    return done
+
+
 def install_boot_adb(root):
     """Add the boot-time ADB wrapper if this rootfs doesn't already have one."""
     dest = os.path.join(root, "etc/init.d/S90adb")
@@ -3102,6 +3125,11 @@ def main():
             else:
                 print("patched usr/bin/wifi_on.sh (wait for association before "
                       "requesting a DHCP lease)")
+            logos = install_boot_logo(root)
+            if logos:
+                print(f"replaced {', '.join(logos)} (Libra boot screen)")
+            else:
+                print("note: no stock boot screen found to replace")
             sn, sbytes = (0, 0) if args.no_strip else strip_unused_resources(root)
             if sn:
                 print(f"stripped {sn} unused stock file(s) "
