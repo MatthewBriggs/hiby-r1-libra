@@ -99,7 +99,8 @@ static const char *SCHEMA_SQL =
     " track integer,"
     " disc integer,"
     " title text,"
-    " dur_ms integer"
+    " dur_ms integer,"
+    " disc_title text"
     ");"
     /* `seq` is insertion order (0..N-1, already sorted by album name --
      * see the populate query below), so a page read is a plain seq range,
@@ -168,6 +169,24 @@ int index_lookup(const char *path, time_t mtime, int *track, int *disc, int *dur
         if (disc)   *disc   = sqlite3_column_int(st, 2);
         if (dur_ms) *dur_ms = sqlite3_column_int(st, 3);
         hit = 1;
+    }
+    sqlite3_finalize(st);
+    return hit;
+}
+
+/* The disc's own name for this track, from its tags ("Pop", "Club"), or an
+ * empty string. 1 when the index had one. */
+int index_disc_title(const char *path, char *out, size_t n) {
+    if (n) out[0] = '\0';
+    if (ensure_read_db() != 0) return 0;
+    static const char *sql = "select disc_title from track_index where path = ?";
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(g_read_db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_text(st, 1, path, -1, SQLITE_TRANSIENT);
+    int hit = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *v = sqlite3_column_text(st, 0);
+        if (v && v[0]) { snprintf(out, n, "%s", (const char *)v); hit = 1; }
     }
     sqlite3_finalize(st);
     return hit;
@@ -254,24 +273,27 @@ static int scan_one(sqlite3 *widb, const char *real, int bitrate_bps) {
     struct stat st;
     if (stat(real, &st) != 0) return 0;
 
-    static const char *check_sql = "select mtime from track_index where path = ?";
+    /* A row from before disc_title (NULL there, never NULL since) is read
+     * again: its Opus/Ogg or end-of-file MP4 tags were never read at all. */
+    static const char *check_sql = "select mtime, disc_title is not null from track_index where path = ?";
     sqlite3_stmt *cst;
     if (sqlite3_prepare_v2(widb, check_sql, -1, &cst, NULL) == SQLITE_OK) {
         sqlite3_bind_text(cst, 1, real, -1, SQLITE_TRANSIENT);
         int current = sqlite3_step(cst) == SQLITE_ROW &&
-                     (time_t)sqlite3_column_int64(cst, 0) == st.st_mtime;
+                     (time_t)sqlite3_column_int64(cst, 0) == st.st_mtime &&
+                     sqlite3_column_int(cst, 1);
         sqlite3_finalize(cst);
         if (current) return 0;
     }
 
     int track, disc;
-    char title[LIB_NAME_LEN];
-    tag_read(real, &track, &disc, title, sizeof(title));
+    char title[LIB_NAME_LEN], disc_title[LIB_NAME_LEN];
+    tag_read_disc(real, &track, &disc, title, sizeof(title), disc_title, sizeof(disc_title));
     int dur_ms = audio_probe_dur_ms(real, bitrate_bps);
 
     static const char *up_sql =
-        "insert or replace into track_index (path, mtime, track, disc, title, dur_ms) "
-        "values (?, ?, ?, ?, ?, ?)";
+        "insert or replace into track_index (path, mtime, track, disc, title, dur_ms, disc_title) "
+        "values (?, ?, ?, ?, ?, ?, ?)";
     sqlite3_stmt *ust;
     if (sqlite3_prepare_v2(widb, up_sql, -1, &ust, NULL) != SQLITE_OK) return 0;
     sqlite3_bind_text(ust, 1, real, -1, SQLITE_TRANSIENT);
@@ -280,6 +302,7 @@ static int scan_one(sqlite3 *widb, const char *real, int bitrate_bps) {
     sqlite3_bind_int(ust, 4, disc);
     sqlite3_bind_text(ust, 5, title, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(ust, 6, dur_ms);
+    sqlite3_bind_text(ust, 7, disc_title, -1, SQLITE_TRANSIENT);
     int rc = sqlite3_step(ust);
     sqlite3_finalize(ust);
     if (rc != SQLITE_DONE) {
@@ -414,6 +437,10 @@ static void *scan_worker(void *arg) {
         sqlite3_close(widb);
         return NULL;
     }
+    /* disc_title came later (the disc's own name, "Pop" on a box set's first
+     * disc): an older table gains the column, and its rows -- NULL there --
+     * are read again by scan_one() below, once. */
+    sqlite3_exec(widb, "alter table track_index add column disc_title text", NULL, NULL, NULL);
     ilog("[index] db opened, schema ready\n");
 
     ilog("[index] scan thread started\n");

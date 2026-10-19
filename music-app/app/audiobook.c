@@ -199,6 +199,14 @@ int ab_open_book(const char *dir, ab_book_data_t *bk) {
         at += c->dur_ms;
         bk->chap_n++;
     }
+    /* Titles come from MP3 and MP4 tags too now, not only FLAC's, and many
+     * books give every file the book's own name as its title: chapters all
+     * called the same say nothing, so those go back to the file names. */
+    int same = bk->chap_n > 1;
+    for (int i = 1; same && i < bk->chap_n; i++)
+        if (strcmp(bk->chap[i].title, bk->chap[0].title)) same = 0;
+    for (int i = 0; same && i < bk->chap_n; i++)
+        name_of(bk->files[i], bk->chap[i].title, sizeof(bk->chap[i].title));
     bk->total_ms = at;
     return bk->chap_n;
 }

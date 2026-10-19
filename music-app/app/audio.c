@@ -690,6 +690,21 @@ static int dec_open_m4a_probe(dec_t *d, const char *path) {
     } else {
         d->aac = aac_open(d->mp4.asc, d->mp4.asc_len);
         if (!d->aac) { mp4_close(&d->mp4); return -1; }
+        /* The decoder only states the rate once it has decoded a frame, so
+         * the probe decodes up to three -- into its own buffers, not the
+         * shared g_aacpcm (see the comment above). Without this every AAC
+         * .m4a was indexed at 0 Hz with no duration or bitrate, and its
+         * album read "AAC 16/0" (2026-10-19). Decoding also gets HE-AAC
+         * right, whose stated rate is half the one it plays at. */
+        unsigned char *frame = malloc(8192);
+        short *pcm = malloc(2048 * 8 * sizeof(short));
+        for (int i = 0; frame && pcm && i < 3 && aac_rate(d->aac) <= 0; i++) {
+            int n = mp4_next(&d->mp4, frame, 8192);
+            if (n <= 0) break;
+            aac_decode(d->aac, frame, (unsigned)n, pcm, 2048);
+        }
+        free(frame);
+        free(pcm);
         d->channels = aac_channels(d->aac);
         d->rate     = (unsigned)aac_rate(d->aac);
         aac_close(d->aac);

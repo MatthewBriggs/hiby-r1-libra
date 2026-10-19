@@ -250,7 +250,7 @@ static int scan_one(sqlite3 *widb, const char *real, const struct stat *st) {
      * there is copied across as it stands rather than re-read. With no
      * previous generation -- the first scan, or one moved aside as corrupt
      * -- the prepare fails and every file is read. */
-    static const char *check_sql = "select mtime, album, format from old.MEDIA_TABLE where path = ?";
+    static const char *check_sql = "select mtime, album, format, sample_rate from old.MEDIA_TABLE where path = ?";
     sqlite3_stmt *cst;
     if (g_have_old && sqlite3_prepare_v2(widb, check_sql, -1, &cst, NULL) == SQLITE_OK) {
         sqlite3_bind_text(cst, 1, path, -1, SQLITE_TRANSIENT);
@@ -261,7 +261,9 @@ static int scan_one(sqlite3 *widb, const char *real, const struct stat *st) {
             int fmt = sqlite3_column_int(cst, 2);
             const char *ext = strrchr(real, '.');
             int m4a_unresolved = fmt == 278 && ext && !strcasecmp(ext, ".m4a");
-            current = alb && alb[0] && !m4a_unresolved;
+            /* An AAC .m4a with no rate was probed before the probe decoded. */
+            int aac_unrated = fmt == LIB_FORMAT_AAC_M4A && sqlite3_column_int(cst, 3) <= 0;
+            current = alb && alb[0] && !m4a_unresolved && !aac_unrated;
         }
         sqlite3_finalize(cst);
         if (current) {
@@ -443,6 +445,37 @@ static void scan_dir(sqlite3 *widb, const char *dir, int *batch, int depth) {
  * missing card should not be able to empty the library. */
 #define SCANNER_DB_NEW SCANNER_DB_PATH ".new"
 
+/* What tag reading a database was built with, as its user_version. A
+ * library from an older reader is read again in full, once, rather than
+ * carried forward row by row: version 2 reads Ogg/Opus tags and MP4 tags at
+ * the end of the file, and probes an AAC .m4a's real rate (2026-10-19). */
+#define SCANNER_TAGS_VERSION 2
+
+static int db_user_version(sqlite3 *db, const char *schema) {
+    char sql[64];
+    snprintf(sql, sizeof(sql), "pragma %s.user_version", schema);
+    sqlite3_stmt *st;
+    int v = 0;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+        if (sqlite3_step(st) == SQLITE_ROW) v = sqlite3_column_int(st, 0);
+        sqlite3_finalize(st);
+    }
+    return v;
+}
+
+/* Whether the published library predates the current tag reading -- for
+ * music_hook.c to start the one-off re-read on its own after an update. */
+int scanner_needs_rescan(void) {
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(SCANNER_DB_PATH, &db, SQLITE_OPEN_READONLY, "unix-none") != SQLITE_OK) {
+        if (db) sqlite3_close(db);
+        return 0;                     /* no library yet: the first scan is asked for anyway */
+    }
+    int v = db_user_version(db, "main");
+    sqlite3_close(db);
+    return v < SCANNER_TAGS_VERSION;
+}
+
 static int fsync_path(const char *path, int dir) {
     int fd = open(path, dir ? O_RDONLY | O_DIRECTORY : O_RDONLY);
     if (fd < 0) return -1;
@@ -474,11 +507,22 @@ static void scan_pass(void) {
         unlink(SCANNER_DB_NEW);
         return;
     }
+    {
+        char uv[64];
+        snprintf(uv, sizeof(uv), "pragma user_version = %d", SCANNER_TAGS_VERSION);
+        sqlite3_exec(widb, uv, NULL, NULL, NULL);
+    }
     g_have_old = 0;
     if (access(SCANNER_DB_PATH, R_OK) == 0) {
         char att[160];
         snprintf(att, sizeof(att), "attach database '%s' as old", SCANNER_DB_PATH);
         g_have_old = sqlite3_exec(widb, att, NULL, NULL, NULL) == SQLITE_OK;
+        /* Built by an older tag reader: nothing in it is current. */
+        if (g_have_old && db_user_version(widb, "old") < SCANNER_TAGS_VERSION) {
+            sqlite3_exec(widb, "detach database old", NULL, NULL, NULL);
+            g_have_old = 0;
+            slog("[scanner] library from an older tag reader: reading every file again\n");
+        }
     }
 
     g_scan_running = 1;

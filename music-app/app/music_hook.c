@@ -2471,6 +2471,27 @@ static const char *track_format_name(const lib_track_t *t) {
     return ext;
 }
 
+/* Lossy: its quality is a bitrate, and its bit depth means nothing -- an
+ * AAC file "decodes to 16 bits" by convention, which is how an album came
+ * to read "AAC 16/0" (2026-10-19). */
+static int track_is_lossy(const lib_track_t *t) {
+    const char *n = track_format_name(t);
+    return !strcmp(n, "MP3") || !strcmp(n, "AAC") || !strcmp(n, "OPUS") ||
+           !strcmp(n, "OGG") || !strcmp(n, "OGA") || !strcmp(n, "M4A");
+}
+
+/* One track's format as a short label: "FLAC  24/96 kHz", "AAC  44.1 kHz",
+ * or just the name when a figure is unknown -- never a 0. */
+static void fmt_track_quality(char *out, size_t n, const lib_track_t *t) {
+    const char *name = track_format_name(t);
+    if (!track_is_lossy(t) && t->bits > 0 && t->rate > 0)
+        snprintf(out, n, "%s  %d/%g kHz", name, t->bits, t->rate / 1000.0);
+    else if (t->rate > 0)
+        snprintf(out, n, "%s  %g kHz", name, t->rate / 1000.0);
+    else
+        snprintf(out, n, "%s", name);
+}
+
 static void fill_rect_clip(uint16_t *fb, int x, int y, int w, int h, uint16_t c,
                            int clip_top, int clip_bot) {
     if (y < clip_top)  { h -= clip_top - y; y = clip_top; }
@@ -5772,6 +5793,29 @@ static lib_row_t *row_at(int absolute) {
  * playtime) inserted before each disc's first track. Height chosen to sit
  * clearly apart from a ROW_H (72) track row without dominating the list. */
 #define DISC_BANNER_H 56
+
+/* The disc's own name for the disc starting at tracks[idx] ("Pop" on
+ * Retro's first, as Symphonium shows them), from its tags via the index.
+ * Looked up once per album and disc rather than per frame: the album page
+ * redraws while it scrolls. Empty when the tags do not name it. */
+#define DISC_TITLE_MAX 16
+static const char *disc_title_for(int idx) {
+    static char key[LIB_PATH_LEN];
+    static char names[DISC_TITLE_MAX][LIB_NAME_LEN];
+    static int asked[DISC_TITLE_MAX];
+    if (idx < 0 || idx >= track_n) return "";
+    if (strcmp(key, tracks[0].path) != 0) {   /* another album */
+        snprintf(key, sizeof(key), "%s", tracks[0].path);
+        memset(asked, 0, sizeof(asked));
+    }
+    int disc = tracks[idx].disc > 0 ? tracks[idx].disc : 1;
+    if (disc >= DISC_TITLE_MAX) return "";
+    if (!asked[disc]) {
+        asked[disc] = 1;
+        index_disc_title(tracks[idx].path, names[disc], sizeof(names[disc]));
+    }
+    return names[disc];
+}
 
 static int track_disc_num(int idx) {
     return tracks[idx].disc > 0 ? tracks[idx].disc : 1;
@@ -9345,16 +9389,25 @@ static void draw_screen(uint16_t *fb) {
              * that has to walk every track regardless, so it costs nothing. */
             int64_t total_ms = 0;
             int uniform = t0 != NULL;
+            /* A lossy album is one format at varying bitrates: its label is
+             * the average bitrate ("AAC  256 kbps"), and only the format has
+             * to agree. A lossless one has to agree on depth and rate too. */
+            int lossy = t0 && track_is_lossy(t0);
+            int64_t kbps_sum = 0;
+            int kbps_n = 0;
             for (int i = 0; i < track_n; i++) {
                 total_ms += tracks[i].dur_ms;
-                if (tracks[i].format != t0->format || tracks[i].bits != t0->bits ||
-                    tracks[i].rate != t0->rate)
+                if (tracks[i].format != t0->format ||
+                    (!lossy && (tracks[i].bits != t0->bits || tracks[i].rate != t0->rate)))
                     uniform = 0;
+                if (tracks[i].bitrate > 0) { kbps_sum += tracks[i].bitrate / 1000; kbps_n++; }
             }
             fbuf[0] = '\0';
-            if (uniform)
-                snprintf(fbuf, sizeof(fbuf), "%s  %d/%g kHz",
-                         track_format_name(t0), t0->bits, t0->rate / 1000.0);
+            if (uniform && lossy && kbps_n)
+                snprintf(fbuf, sizeof(fbuf), "%s  %d kbps", track_format_name(t0),
+                         (int)(kbps_sum / kbps_n));
+            else if (uniform)
+                fmt_track_quality(fbuf, sizeof(fbuf), t0);
             fmt_dur(dbuf, sizeof(dbuf), total_ms);
 
             int ix = 24;
@@ -9398,8 +9451,10 @@ static void draw_screen(uint16_t *fb) {
                     int64_t disc_ms = 0;
                     for (int j = idx; j < track_n && track_disc_num(j) == disc; j++)
                         disc_ms += tracks[j].dur_ms;
-                    char discbuf[24], dbuf[16];
-                    snprintf(discbuf, sizeof(discbuf), "Disc %d", disc);
+                    char discbuf[LIB_NAME_LEN + 16], dbuf[16];
+                    const char *dname = disc_title_for(idx);
+                    if (dname[0]) snprintf(discbuf, sizeof(discbuf), "Disc %d \xc2\xb7 %s", disc, dname);
+                    else          snprintf(discbuf, sizeof(discbuf), "Disc %d", disc);
                     fmt_dur(dbuf, sizeof(dbuf), disc_ms);
                     fill_rect_clip(fb, 0, by, FB_W, DISC_BANNER_H, COL_HEADER, 0, clip_bot);
                     draw_disc_icon(fb, 20, by + (DISC_BANNER_H - 28) / 2, np_view_col_dim());
@@ -9775,9 +9830,7 @@ static void draw_screen(uint16_t *fb) {
              * index -- t->format/bits/rate are never populated for them (see
              * audiobook.h), so this line would show a meaningless "FLAC
              * 0/0 kHz" rather than nothing. */
-            lib_track_t *t = &tracks[0];
-            snprintf(buf, sizeof(buf), "%s  %d/%g kHz",
-                     track_format_name(t), t->bits, t->rate / 1000.0);
+            fmt_track_quality(buf, sizeof(buf), &tracks[0]);
             draw_text(fb, 24, FB_H - 34, buf, pc_acc, TEXT_PX_SMALL, FB_W - 24);
         }
         return;
@@ -12144,12 +12197,12 @@ static void qs_format_info(char *line1, size_t line1sz, char *line2, size_t line
         int dur = audio_dur_ms();
         if (dur <= 0) dur = t->dur_ms;
         int kbps = ab_file_bitrate_kbps(t->path, dur);
-        snprintf(line1, line1sz, "%s  %d/%g kHz", track_format_name(t), t->bits, t->rate / 1000.0);
+        fmt_track_quality(line1, line1sz, t);
         if (kbps > 0) snprintf(line2, line2sz, "VBR (avg %d kbps)", kbps);
         else          snprintf(line2, line2sz, "VBR");
     } else {
-        snprintf(line1, line1sz, "%s  %d/%g kHz", track_format_name(t), t->bits, t->rate / 1000.0);
-        snprintf(line2, line2sz, "%d kbps", t->bitrate / 1000);
+        fmt_track_quality(line1, line1sz, t);
+        if (t->bitrate > 0) snprintf(line2, line2sz, "%d kbps", t->bitrate / 1000);
     }
 }
 
@@ -14605,6 +14658,13 @@ int music_entry(void *a0, void *a1) {
     ent_fb = us_now();
     if (lib_open() != 0 && !card_changed) mlog("[music] library open failed\n");
     if (card_changed) scanner_rescan_now();
+    /* A library indexed by an older tag reader is read again, once, without
+     * waiting for Scan library: Opus/Ogg tags, MP4 tags at the end of the
+     * file, AAC rates and disc names were all missed before. */
+    else if (st_usb_mode() != 1 && scanner_needs_rescan()) {
+        mlog("[music] library from an older tag reader: rescanning\n");
+        scanner_rescan_now();
+    }
     ent_lib = us_now();
     /* Whether the frame loop should hold the bridge splash up rather than
      * paint the real (still cover-less) Now Playing screen on its first

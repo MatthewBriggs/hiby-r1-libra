@@ -5,15 +5,16 @@
  * It matters more than a missing column suggests: it drives the sort order, so
  * a wrong guess does not leave an album unnumbered, it leaves it out of order.
  *
- * Three formats, all read from the head of the file:
+ * Four containers, each read in one pass for every field at once:
  *
  *   FLAC  metadata block type 4, VORBIS_COMMENT, "TRACKNUMBER=7" (or "7/12")
- *   MP4   a 'trkn'/'disk' atom inside ilst, the number in a 16-bit field
- *   MP3   an ID3v2 TRCK/TPOS frame, text, likewise possibly "7/12"
+ *   Ogg   Opus and Vorbis: the same comments, in the stream's second packet
+ *   MP4   moov/udta/meta/ilst items (trkn, disk, (c)nam...), wherever moov is
+ *   MP3   ID3v2 frames, TRCK/TPOS text likewise possibly "7/12"
  *
- * Only the first few hundred KB are ever touched; none of these formats put
- * their tags at the end in practice, and reading a whole 13 MB FLAC to find a
- * two-digit number would cost more than the ordering is worth.
+ * Besides track, disc and title: the disc's own name (DISCSUBTITLE, ID3
+ * TSST), and artist/album/album artist/genre for the scanner. Never the
+ * audio: a picture or other long value is skipped, not read.
  *
  * tag_read() reads track, disc and (FLAC only) title in one file open and one
  * pass over the tag data, rather than three separate opens each re-scanning
@@ -60,9 +61,62 @@ static uint32_t rd32le(const unsigned char *p) {
            ((uint32_t)p[1] << 8) | p[0];
 }
 
-/* One pass over the VORBIS_COMMENT block, checking every entry against all
- * three keys instead of one -- the whole reason to combine these calls. */
-static void flac_all(FILE *f, int *track, int *disc, char *title, unsigned title_n) {
+static uint32_t syncsafe(const unsigned char *p) {
+    return ((uint32_t)(p[0] & 0x7F) << 21) | ((uint32_t)(p[1] & 0x7F) << 14) |
+           ((uint32_t)(p[2] & 0x7F) << 7) | (p[3] & 0x7F);
+}
+
+/* Everything one pass can fill. Any pointer may be NULL (or its size 0) to
+ * leave that field alone; numbers start at -1 and strings empty, and the
+ * first value a file states for each wins. */
+typedef struct {
+    int *track, *disc;
+    char *title;      unsigned title_n;
+    char *disc_title; unsigned dt_n;
+    char *artist;     unsigned an;
+    char *album;      unsigned bn;
+    char *aartist;    unsigned aan;
+    char *genre;      unsigned gn;
+} tagset_t;
+
+static void set_field(char *out, unsigned n, const char *s, int len) {
+    if (!out || n < 2 || len <= 0 || out[0]) return;
+    unsigned take = (unsigned)len < n - 1 ? (unsigned)len : n - 1;
+    memcpy(out, s, take);
+    out[take] = '\0';
+}
+
+static int key_is(const char *e, uint32_t len, const char *key) {
+    size_t k = strlen(key);
+    return len > k && !strncasecmp(e, key, k);
+}
+
+/* One "KEY=value" comment -- FLAC's VORBIS_COMMENT block and Ogg's comment
+ * packet (Vorbis, Opus) share the format. The '=' in each key keeps ALBUM
+ * from matching ALBUMARTIST. DISCSUBTITLE names a disc ("Pop", "Club"),
+ * as Symphonium and foobar2000 show it. */
+static void vc_entry(tagset_t *ts, const char *e, uint32_t len) {
+    if (ts->track && *ts->track < 0 && key_is(e, len, "TRACKNUMBER="))
+        *ts->track = parse_num(e + 12, (int)len - 12);
+    else if (ts->disc && *ts->disc < 0 && key_is(e, len, "DISCNUMBER="))
+        *ts->disc = parse_num(e + 11, (int)len - 11);
+    else if (key_is(e, len, "TITLE="))
+        set_field(ts->title, ts->title_n, e + 6, (int)len - 6);
+    else if (key_is(e, len, "DISCSUBTITLE="))
+        set_field(ts->disc_title, ts->dt_n, e + 13, (int)len - 13);
+    else if (key_is(e, len, "ARTIST="))
+        set_field(ts->artist, ts->an, e + 7, (int)len - 7);
+    else if (key_is(e, len, "ALBUM="))
+        set_field(ts->album, ts->bn, e + 6, (int)len - 6);
+    else if (key_is(e, len, "ALBUMARTIST="))
+        set_field(ts->aartist, ts->aan, e + 12, (int)len - 12);
+    else if (key_is(e, len, "ALBUM ARTIST="))
+        set_field(ts->aartist, ts->aan, e + 13, (int)len - 13);
+    else if (key_is(e, len, "GENRE="))
+        set_field(ts->genre, ts->gn, e + 6, (int)len - 6);
+}
+
+static void flac_all(FILE *f, tagset_t *ts) {
     unsigned char h[4];
     if (fread(h, 1, 4, f) != 4 || memcmp(h, "fLaC", 4)) return;
     for (int guard = 0; guard < 64; guard++) {
@@ -71,32 +125,21 @@ static void flac_all(FILE *f, int *track, int *disc, char *title, unsigned title
         int last = b[0] & 0x80, type = b[0] & 0x7F;
         uint32_t len = ((uint32_t)b[1] << 16) | ((uint32_t)b[2] << 8) | b[3];
         if (type == 4) {                       /* VORBIS_COMMENT */
-            if (len > 1 << 20) return;
+            if (len > 1 << 20 || len < 4) return;
             unsigned char *v = malloc(len);
             if (!v) return;
             if (fread(v, 1, len, f) != len) { free(v); return; }
-            /* vendor string, then a count, then "KEY=value" entries */
-            if (len < 4) { free(v); return; }
-            uint32_t off = 4 + rd32le(v);
-            if (off + 4 > len) { free(v); return; }
-            uint32_t n = rd32le(v + off);
-            off += 4;
-            for (uint32_t i = 0; i < n && off + 4 <= len; i++) {
-                uint32_t clen = rd32le(v + off);
+            uint32_t off = 4 + rd32le(v);      /* vendor string, then a count */
+            if (off + 4 <= len) {
+                uint32_t n = rd32le(v + off);
                 off += 4;
-                if (off + clen > len) break;
-                const char *entry = (char *)v + off;
-                if (track && *track < 0 && clen > 12 && !strncasecmp(entry, "TRACKNUMBER=", 12))
-                    *track = parse_num(entry + 12, (int)clen - 12);
-                else if (disc && *disc < 0 && clen > 11 && !strncasecmp(entry, "DISCNUMBER=", 11))
-                    *disc = parse_num(entry + 11, (int)clen - 11);
-                else if (title && title[0] == '\0' && clen > 6 && !strncasecmp(entry, "TITLE=", 6)) {
-                    unsigned take = (unsigned)clen - 6;
-                    if (take >= title_n) take = title_n - 1;
-                    memcpy(title, entry + 6, take);
-                    title[take] = '\0';
+                for (uint32_t i = 0; i < n && off + 4 <= len; i++) {
+                    uint32_t clen = rd32le(v + off);
+                    off += 4;
+                    if (clen > len - off) break;
+                    vc_entry(ts, (char *)v + off, clen);
+                    off += clen;
                 }
-                off += clen;
             }
             free(v);
             return;
@@ -106,199 +149,184 @@ static void flac_all(FILE *f, int *track, int *disc, char *title, unsigned title
     }
 }
 
-/* Scan the head of the file for both atoms in one buffered read, rather than
- * reading the same 256 KB twice for 'trkn' then 'disk'. */
-static void mp4_all(FILE *f, int *track, int *disc) {
-    static unsigned char buf[256 * 1024];
-    size_t n = fread(buf, 1, sizeof(buf), f);
-    if (n < 32) return;
-    for (size_t i = 0; i + 32 < n; i++) {
-        const char *atom = track && *track < 0 && !memcmp(buf + i, "trkn", 4) ? "trkn"
-                          : disc  && *disc  < 0 && !memcmp(buf + i, "disk", 4) ? "disk" : NULL;
-        if (!atom) continue;
-        const unsigned char *d = buf + i + 4;
-        if (memcmp(d + 4, "data", 4)) continue;
-        uint32_t dsize = rd32be(d);
-        if (dsize < 16 || i + 4 + dsize > n) continue;
-        /* 16 bytes of data-box header, then 2 reserved, then the number. */
-        const unsigned char *p = d + 16;
-        int v = (p[2] << 8) | p[3];
-        if (v > 0) { if (atom[0] == 't') *track = v; else *disc = v; }
-    }
-}
+/* ---- Ogg: Opus and Vorbis ----------------------------------------------
+ * The comment header is the stream's second packet, starting on its second
+ * page and running on across as many pages as it needs -- an embedded
+ * picture (METADATA_BLOCK_PICTURE) can make it hundreds of KB. Read as a
+ * byte stream over the pages' payloads, so the short comments are read and
+ * a long one is skipped without ever being held. Opus and Vorbis files were
+ * not read at all before (2026-10-19): a box set's disc numbers and titles
+ * all came back unknown. */
+typedef struct {
+    FILE *f;
+    uint32_t serial;
+    unsigned char buf[255 * 255];
+    unsigned len, pos;
+    int pages;
+} ogg_rd_t;
 
-static uint32_t syncsafe(const unsigned char *p) {
-    return ((uint32_t)(p[0] & 0x7F) << 21) | ((uint32_t)(p[1] & 0x7F) << 14) |
-           ((uint32_t)(p[2] & 0x7F) << 7) | (p[3] & 0x7F);
-}
-
-/* One frame walk, checking each frame against both TRCK and TPOS. */
-static void id3_all(FILE *f, int *track, int *disc) {
-    unsigned char h[10];
-    if (fread(h, 1, 10, f) != 10 || memcmp(h, "ID3", 3)) return;
-    int ver = h[3];
-    uint32_t tag_size = syncsafe(h + 6), pos = 0;
-    while (pos + 10 < tag_size) {
-        unsigned char fh[10];
-        if (fread(fh, 1, 10, f) != 10) return;
-        if (fh[0] == 0) return;                    /* padding */
-        uint32_t fsize = (ver >= 4) ? syncsafe(fh + 4) : rd32be(fh + 4);
-        /* A frame body that runs past the end of the tag is a corrupt size and
-         * there is no safe way to keep walking, so that still gives up. A
-         * merely *large* frame does not: this used to bail on anything over
-         * 64 KB, which is almost every APIC, so an MP3 whose embedded art
-         * happens to sit before its text frames lost its track and disc
-         * numbers entirely. The skip below handles any size. */
-        if (fsize == 0 || fsize > tag_size - pos - 10) return;
-        int *out = track && *track < 0 && !memcmp(fh, "TRCK", 4) ? track
-                 : disc  && *disc  < 0 && !memcmp(fh, "TPOS", 4) ? disc : NULL;
-        if (out) {
-            char v[64];
-            uint32_t want = fsize < sizeof(v) ? fsize : sizeof(v) - 1;
-            if (fread(v, 1, want, f) != want) return;
-            v[want] = '\0';
-            *out = parse_num(v + 1, (int)want - 1);   /* first byte is text encoding */
-            /* pos advances by the whole frame, so the file position has to as
-             * well -- reading only the first `want` bytes and then trusting
-             * pos would desynchronise the walk for the rest of the tag.
-             * Unreachable while the 64 KB bail above existed and TRCK/TPOS are
-             * short in practice, which is exactly why it needs to be explicit
-             * now that any frame size can get here. */
-            if (want < fsize && fseek(f, (long)(fsize - want), SEEK_CUR)) return;
-        } else if (fseek(f, (long)fsize, SEEK_CUR)) {
-            return;
+static int ogg_page(ogg_rd_t *o) {
+    for (;;) {
+        unsigned char h[27];
+        if (++o->pages > 4096 || fread(h, 1, 27, o->f) != 27 || memcmp(h, "OggS", 4)) return -1;
+        int nseg = h[26];
+        unsigned char seg[255];
+        if (fread(seg, 1, (size_t)nseg, o->f) != (size_t)nseg) return -1;
+        unsigned len = 0;
+        for (int i = 0; i < nseg; i++) len += seg[i];
+        uint32_t serial = rd32le(h + 14);
+        if (o->pages > 1 && serial != o->serial) {     /* another stream's page */
+            if (fseek(o->f, (long)len, SEEK_CUR)) return -1;
+            continue;
         }
-        pos += 10 + fsize;
+        o->serial = serial;
+        if (fread(o->buf, 1, len, o->f) != len) return -1;
+        o->len = len;
+        o->pos = 0;
+        return 0;
     }
 }
 
-/* Track, disc and (FLAC only -- see the header comment on flac_text's old
- * callers) title, in one open. Any output pointer may be NULL to skip it;
- * track/disc are left at -1 and title untouched when not found or not
- * applicable to the container. title may be NULL/title_n 0 to skip it
- * outright. */
-void tag_read(const char *path, int *track, int *disc, char *title, unsigned title_n) {
-    if (track) *track = -1;
-    if (disc)  *disc  = -1;
-    if (title && title_n) title[0] = '\0';
-    FILE *f = fopen(path, "rb");
-    if (!f) return;
-    unsigned char m[12];
-    if (fread(m, 1, sizeof(m), f) != sizeof(m)) { fclose(f); return; }
-    rewind(f);
-    if (!memcmp(m, "fLaC", 4))
-        flac_all(f, track, disc, (title && title_n) ? title : NULL, title_n);
-    else if (!memcmp(m + 4, "ftyp", 4))
-        mp4_all(f, track, disc);
-    else if (!memcmp(m, "ID3", 3))
-        id3_all(f, track, disc);
-    fclose(f);
+/* n bytes of the stream into dst, or skipped when dst is NULL. */
+static int ogg_take(ogg_rd_t *o, unsigned char *dst, uint32_t n) {
+    while (n) {
+        if (o->pos == o->len && ogg_page(o) != 0) return -1;
+        unsigned k = o->len - o->pos;
+        if (k > n) k = n;
+        if (dst) { memcpy(dst, o->buf + o->pos, k); dst += k; }
+        o->pos += k;
+        n -= k;
+    }
+    return 0;
 }
 
-int tag_track_number(const char *path) {
-    int v; tag_read(path, &v, NULL, NULL, 0); return v;
-}
-
-int tag_disc_number(const char *path) {
-    int v; tag_read(path, NULL, &v, NULL, 0); return v;
-}
-
-int tag_title(const char *path, char *out, unsigned n) {
-    if (!out || n < 2) return -1;
-    out[0] = '\0';
-    /* Only FLAC ever gets a title from tag_read() (see flac_all) -- MP4/MP3
-     * never populate it, matching this function's pre-existing behaviour. */
-    tag_read(path, NULL, NULL, out, n);
-    return out[0] ? 0 : -1;
-}
-
-/* ---- artist/album/album_artist/genre, for scanner.c -------------------- */
-
-static void set_field(char *out, unsigned n, const char *s, int len) {
-    if (!out || n < 2 || len <= 0) return;
-    unsigned take = (unsigned)len < n - 1 ? (unsigned)len : n - 1;
-    memcpy(out, s, take);
-    out[take] = '\0';
-}
-
-static void flac_meta(FILE *f, char *artist, unsigned an, char *album, unsigned bn,
-                      char *aartist, unsigned aan, char *genre, unsigned gn) {
-    unsigned char h[4];
-    if (fread(h, 1, 4, f) != 4 || memcmp(h, "fLaC", 4)) return;
-    for (int guard = 0; guard < 64; guard++) {
-        unsigned char b[4];
-        if (fread(b, 1, 4, f) != 4) return;
-        int last = b[0] & 0x80, type = b[0] & 0x7F;
-        uint32_t len = ((uint32_t)b[1] << 16) | ((uint32_t)b[2] << 8) | b[3];
-        if (type == 4) {
-            if (len > 1 << 20) return;
-            unsigned char *v = malloc(len);
-            if (!v) return;
-            if (fread(v, 1, len, f) != len) { free(v); return; }
-            if (len < 4) { free(v); return; }
-            uint32_t off = 4 + rd32le(v);
-            if (off + 4 > len) { free(v); return; }
-            uint32_t cnt = rd32le(v + off);
-            off += 4;
-            for (uint32_t i = 0; i < cnt && off + 4 <= len; i++) {
-                uint32_t clen = rd32le(v + off);
-                off += 4;
-                if (off + clen > len) break;
-                const char *entry = (char *)v + off;
-                /* Exact-prefix checks ("ALBUM=" not "ALBUMARTIST=") -- the
-                 * '=' in each prefix is what keeps ALBUM and ALBUMARTIST
-                 * from colliding, same trick TRACKNUMBER=/DISCNUMBER= above
-                 * already relies on against no real ambiguity risk. */
-                if (artist && !artist[0] && clen > 7 && !strncasecmp(entry, "ARTIST=", 7))
-                    set_field(artist, an, entry + 7, (int)clen - 7);
-                else if (album && !album[0] && clen > 6 && !strncasecmp(entry, "ALBUM=", 6))
-                    set_field(album, bn, entry + 6, (int)clen - 6);
-                else if (aartist && !aartist[0] && clen > 12 && !strncasecmp(entry, "ALBUMARTIST=", 12))
-                    set_field(aartist, aan, entry + 12, (int)clen - 12);
-                else if (genre && !genre[0] && clen > 6 && !strncasecmp(entry, "GENRE=", 6))
-                    set_field(genre, gn, entry + 6, (int)clen - 6);
-                off += clen;
+static void ogg_all(FILE *f, tagset_t *ts) {
+    ogg_rd_t *o = calloc(1, sizeof(*o));
+    if (!o) return;
+    o->f = f;
+    /* Page one is the identification header and nothing else. */
+    if (ogg_page(o) != 0) { free(o); return; }
+    o->pos = o->len;
+    unsigned char m[8];
+    if (ogg_take(o, m, 7) != 0) { free(o); return; }
+    int ok = 0;
+    if (!memcmp(m, "\x03vorbis", 7)) ok = 1;
+    else if (!memcmp(m, "OpusTag", 7) && ogg_take(o, m + 7, 1) == 0 && m[7] == 's') ok = 1;
+    unsigned char b4[4];
+    if (ok && ogg_take(o, b4, 4) == 0 && ogg_take(o, NULL, rd32le(b4)) == 0 &&
+        ogg_take(o, b4, 4) == 0) {
+        uint32_t n = rd32le(b4);
+        char e[1024];
+        for (uint32_t i = 0; i < n && i < 10000; i++) {
+            if (ogg_take(o, b4, 4) != 0) break;
+            uint32_t clen = rd32le(b4);
+            if (clen < sizeof(e)) {
+                if (ogg_take(o, (unsigned char *)e, clen) != 0) break;
+                vc_entry(ts, e, clen);
+            } else if (ogg_take(o, NULL, clen) != 0) {   /* a picture, or the like */
+                break;
             }
-            free(v);
+        }
+    }
+    free(o);
+}
+
+/* ---- MP4 ------------------------------------------------------------------
+ * Tags live in moov/udta/meta/ilst, and moov is often at the END of the file
+ * -- after the audio, as most encoders write it unless asked for
+ * "faststart". This used to search only the first 256 KB, so such a file
+ * gave no artist, album, track or disc at all (Joy Division's Heart & Soul,
+ * listed under its folder's name, 2026-10-19). Now the atoms are walked,
+ * seeking past the audio, and only ilst's small items are read. */
+static int mp4_child(FILE *f, long from, long to, const char *want, long *body, long *end) {
+    long at = from;
+    while (at + 8 <= to) {
+        unsigned char h[16];
+        if (fseek(f, at, SEEK_SET) || fread(h, 1, 8, f) != 8) return -1;
+        uint64_t size = rd32be(h);
+        long hdr = 8;
+        if (size == 1) {
+            if (fread(h + 8, 1, 8, f) != 8) return -1;
+            size = ((uint64_t)rd32be(h + 8) << 32) | rd32be(h + 12);
+            hdr = 16;
+        } else if (size == 0) {
+            size = (uint64_t)(to - at);
+        }
+        if (size < (uint64_t)hdr || at + (long)size > to || at + (long)size < at) return -1;
+        if (!memcmp(h + 4, want, 4)) {
+            *body = at + hdr;
+            *end = at + (long)size;
+            return 0;
+        }
+        at += (long)size;
+    }
+    return -1;
+}
+
+static void mp4_item(FILE *f, tagset_t *ts, const unsigned char *name, long body, long end) {
+    static const unsigned char T_NAM[4] = { 0xA9, 'n', 'a', 'm' };
+    static const unsigned char T_ART[4] = { 0xA9, 'A', 'R', 'T' };
+    static const unsigned char T_ALB[4] = { 0xA9, 'a', 'l', 'b' };
+    static const unsigned char T_GEN[4] = { 0xA9, 'g', 'e', 'n' };
+    long len = end - body;
+    if (len <= 0 || len > 4096) return;         /* covr and the like: not wanted */
+    unsigned char v[4096];
+    if (fseek(f, body, SEEK_SET) || fread(v, 1, (size_t)len, f) != (size_t)len) return;
+    /* The value: a 'data' box (8 header, 4 type, 4 locale, then the payload).
+     * A freeform '----' item names itself first in 'mean' and 'name' boxes. */
+    char fname[64] = "";
+    long off = 0;
+    while (off + 8 <= len) {
+        uint32_t bs = rd32be(v + off);
+        if (bs < 8 || off + (long)bs > len) return;
+        if (!memcmp(v + off + 4, "name", 4) && bs > 12) {
+            uint32_t n = bs - 12;
+            if (n >= sizeof(fname)) n = sizeof(fname) - 1;
+            memcpy(fname, v + off + 12, n);
+            fname[n] = '\0';
+        } else if (!memcmp(v + off + 4, "data", 4) && bs >= 16) {
+            const char *p = (const char *)v + off + 16;
+            int plen = (int)bs - 16;
+            if (!memcmp(name, "trkn", 4) || !memcmp(name, "disk", 4)) {
+                if (plen >= 4) {
+                    int num = ((unsigned char)p[2] << 8) | (unsigned char)p[3];
+                    int *out = name[0] == 't' ? ts->track : ts->disc;
+                    if (out && *out < 0 && num > 0) *out = num;
+                }
+            } else if (!memcmp(name, T_NAM, 4)) set_field(ts->title, ts->title_n, p, plen);
+            else if (!memcmp(name, T_ART, 4))   set_field(ts->artist, ts->an, p, plen);
+            else if (!memcmp(name, T_ALB, 4))   set_field(ts->album, ts->bn, p, plen);
+            else if (!memcmp(name, "aART", 4))  set_field(ts->aartist, ts->aan, p, plen);
+            else if (!memcmp(name, T_GEN, 4))   set_field(ts->genre, ts->gn, p, plen);
+            else if (!memcmp(name, "----", 4) && !strcasecmp(fname, "DISCSUBTITLE"))
+                set_field(ts->disc_title, ts->dt_n, p, plen);
             return;
         }
-        if (last) return;
-        if (fseek(f, (long)len, SEEK_CUR)) return;
+        off += bs;
     }
 }
 
-/* Same four atoms, ASCII-unsafe first byte (0xA9, "copyright sign" reused by
- * MP4 as a marker for iTunes' own freeform text atoms) so they're spelled as
- * byte arrays rather than string literals -- a string literal's 0xA9 byte is
- * fine in memory but not guaranteed portable source text. aART (album
- * artist) has no such marker; it is a plain iTunes extension atom. */
-static void mp4_meta(FILE *f, char *artist, unsigned an, char *album, unsigned bn,
-                     char *aartist, unsigned aan, char *genre, unsigned gn) {
-    static unsigned char buf[256 * 1024];
-    size_t n = fread(buf, 1, sizeof(buf), f);
-    if (n < 32) return;
-    static const unsigned char T_ART[4]  = { 0xA9, 'A', 'R', 'T' };
-    static const unsigned char T_ALB[4]  = { 0xA9, 'a', 'l', 'b' };
-    static const unsigned char T_AART[4] = { 'a', 'A', 'R', 'T' };
-    static const unsigned char T_GEN[4]  = { 0xA9, 'g', 'e', 'n' };
-    for (size_t i = 0; i + 32 < n; i++) {
-        char *out = NULL; unsigned outn = 0;
-        if (artist && !artist[0] && !memcmp(buf + i, T_ART, 4)) { out = artist; outn = an; }
-        else if (album && !album[0] && !memcmp(buf + i, T_ALB, 4)) { out = album; outn = bn; }
-        else if (aartist && !aartist[0] && !memcmp(buf + i, T_AART, 4)) { out = aartist; outn = aan; }
-        else if (genre && !genre[0] && !memcmp(buf + i, T_GEN, 4)) { out = genre; outn = gn; }
-        else continue;
-        if (outn < 2) continue;
-        const unsigned char *d = buf + i + 4;
-        if (i + 8 + 4 > n || memcmp(d + 4, "data", 4)) continue;
-        uint32_t dsize = rd32be(d);
-        if (dsize < 16 || i + 4 + dsize > n) continue;
-        uint32_t tlen = dsize - 16;
-        if (tlen >= outn) tlen = outn - 1;
-        memcpy(out, d + 16, tlen);
-        out[tlen] = '\0';
+static void mp4_all(FILE *f, tagset_t *ts) {
+    if (fseek(f, 0, SEEK_END)) return;
+    long size = ftell(f);
+    long mb, me, ub, ue, eb, ee, ib, ie;
+    if (mp4_child(f, 0, size, "moov", &mb, &me) != 0) return;
+    if (mp4_child(f, mb, me, "udta", &ub, &ue) != 0) return;
+    if (mp4_child(f, ub, ue, "meta", &eb, &ee) != 0) return;
+    eb += 4;                                    /* a full box: version and flags */
+    if (mp4_child(f, eb, ee, "ilst", &ib, &ie) != 0) return;
+    long at = ib;
+    for (int guard = 0; guard < 512 && at + 8 <= ie; guard++) {
+        unsigned char h[8];
+        if (fseek(f, at, SEEK_SET) || fread(h, 1, 8, f) != 8) return;
+        uint32_t s = rd32be(h);
+        if (s < 8 || at + (long)s > ie) return;
+        mp4_item(f, ts, h + 4, at + 8, at + (long)s);
+        at += s;
     }
 }
+
+/* ---- MP3: ID3v2 ------------------------------------------------------------ */
 
 /* ID3v2 text frames carry an encoding byte (0=ISO-8859-1, 1=UTF-16+BOM,
  * 2=UTF-16BE no BOM, 3=UTF-8) ahead of the text itself -- unlike the numeric
@@ -347,8 +375,7 @@ static void id3_text_out(const unsigned char *v, uint32_t len, char *out, unsign
     out[o] = '\0';
 }
 
-static void id3_meta(FILE *f, char *artist, unsigned an, char *album, unsigned bn,
-                     char *aartist, unsigned aan, char *genre, unsigned gn) {
+static void id3_all(FILE *f, tagset_t *ts) {
     unsigned char h[10];
     if (fread(h, 1, 10, f) != 10 || memcmp(h, "ID3", 3)) return;
     int ver = h[3];
@@ -356,23 +383,39 @@ static void id3_meta(FILE *f, char *artist, unsigned an, char *album, unsigned b
     while (pos + 10 < tag_size) {
         unsigned char fh[10];
         if (fread(fh, 1, 10, f) != 10) return;
-        if (fh[0] == 0) return;
+        if (fh[0] == 0) return;                    /* padding */
         uint32_t fsize = (ver >= 4) ? syncsafe(fh + 4) : rd32be(fh + 4);
-        /* See id3_all()'s own comment: only a size that runs past the end of
-         * the tag is unrecoverable. Bailing on anything over 64 KB meant an
-         * APIC before the text frames cost this file its artist, album, album
-         * artist and genre -- the fseek() below skips a body of any size. */
+        /* A frame body running past the end of the tag is a corrupt size:
+         * give up. A merely large one (any APIC) is skipped by the seek. */
         if (fsize == 0 || fsize > tag_size - pos - 10) return;
+        int *num = ts->track && *ts->track < 0 && !memcmp(fh, "TRCK", 4) ? ts->track
+                 : ts->disc  && *ts->disc  < 0 && !memcmp(fh, "TPOS", 4) ? ts->disc : NULL;
         char *out = NULL; unsigned outn = 0;
-        if (artist && !artist[0] && !memcmp(fh, "TPE1", 4)) { out = artist; outn = an; }
-        else if (album && !album[0] && !memcmp(fh, "TALB", 4)) { out = album; outn = bn; }
-        else if (aartist && !aartist[0] && !memcmp(fh, "TPE2", 4)) { out = aartist; outn = aan; }
-        else if (genre && !genre[0] && !memcmp(fh, "TCON", 4)) { out = genre; outn = gn; }
-        if (out && outn > 1) {
-            unsigned char v[256];
-            uint32_t want = fsize < sizeof(v) ? fsize : sizeof(v);
+        if (!memcmp(fh, "TIT2", 4))      { out = ts->title;      outn = ts->title_n; }
+        else if (!memcmp(fh, "TSST", 4)) { out = ts->disc_title; outn = ts->dt_n; }
+        else if (!memcmp(fh, "TPE1", 4)) { out = ts->artist;     outn = ts->an; }
+        else if (!memcmp(fh, "TALB", 4)) { out = ts->album;      outn = ts->bn; }
+        else if (!memcmp(fh, "TPE2", 4)) { out = ts->aartist;    outn = ts->aan; }
+        else if (!memcmp(fh, "TCON", 4)) { out = ts->genre;      outn = ts->gn; }
+        int txxx = !memcmp(fh, "TXXX", 4) && ts->disc_title && ts->dt_n > 1 && !ts->disc_title[0];
+        if (num || (out && outn > 1 && !out[0]) || txxx) {
+            unsigned char v[512];
+            uint32_t want = fsize < sizeof(v) - 1 ? fsize : sizeof(v) - 1;
             if (fread(v, 1, want, f) != want) return;
-            id3_text_out(v, want, out, outn);
+            v[want] = 0;
+            if (num) *num = parse_num((char *)v + 1, (int)want - 1);   /* first byte: encoding */
+            else if (out) id3_text_out(v, want, out, outn);
+            else if (txxx && (v[0] == 0 || v[0] == 3) && !strcasecmp((char *)v + 1, "DISCSUBTITLE")) {
+                /* TXXX: encoding, a description, NUL, the value. Latin-1 or
+                 * UTF-8 only; a UTF-16 TXXX is left alone. */
+                size_t dl = strlen((char *)v + 1);
+                if (2 + dl < want) {
+                    unsigned char tmp[512];
+                    tmp[0] = v[0];
+                    memcpy(tmp + 1, v + 2 + dl, want - 2 - dl);
+                    id3_text_out(tmp, (uint32_t)(want - 1 - dl), ts->disc_title, ts->dt_n);
+                }
+            }
             if (want < fsize && fseek(f, (long)(fsize - want), SEEK_CUR)) return;
         } else if (fseek(f, (long)fsize, SEEK_CUR)) {
             return;
@@ -381,24 +424,57 @@ static void id3_meta(FILE *f, char *artist, unsigned an, char *album, unsigned b
     }
 }
 
-void tag_read_meta(const char *path, char *artist, unsigned artist_n,
-                   char *album, unsigned album_n,
-                   char *album_artist, unsigned aa_n,
-                   char *genre, unsigned genre_n) {
-    if (artist && artist_n) artist[0] = '\0';
-    if (album && album_n) album[0] = '\0';
-    if (album_artist && aa_n) album_artist[0] = '\0';
-    if (genre && genre_n) genre[0] = '\0';
+static void tags_read(const char *path, tagset_t *ts) {
+    if (ts->track) *ts->track = -1;
+    if (ts->disc)  *ts->disc  = -1;
+    char *strs[] = { ts->title, ts->disc_title, ts->artist, ts->album, ts->aartist, ts->genre };
+    unsigned ns[] = { ts->title_n, ts->dt_n, ts->an, ts->bn, ts->aan, ts->gn };
+    for (int i = 0; i < 6; i++) if (strs[i] && ns[i]) strs[i][0] = '\0';
     FILE *f = fopen(path, "rb");
     if (!f) return;
     unsigned char m[12];
     if (fread(m, 1, sizeof(m), f) != sizeof(m)) { fclose(f); return; }
     rewind(f);
-    if (!memcmp(m, "fLaC", 4))
-        flac_meta(f, artist, artist_n, album, album_n, album_artist, aa_n, genre, genre_n);
-    else if (!memcmp(m + 4, "ftyp", 4))
-        mp4_meta(f, artist, artist_n, album, album_n, album_artist, aa_n, genre, genre_n);
-    else if (!memcmp(m, "ID3", 3))
-        id3_meta(f, artist, artist_n, album, album_n, album_artist, aa_n, genre, genre_n);
+    if (!memcmp(m, "fLaC", 4))            flac_all(f, ts);
+    else if (!memcmp(m, "OggS", 4))       ogg_all(f, ts);
+    else if (!memcmp(m + 4, "ftyp", 4))   mp4_all(f, ts);
+    else if (!memcmp(m, "ID3", 3))        id3_all(f, ts);
     fclose(f);
+}
+
+void tag_read(const char *path, int *track, int *disc, char *title, unsigned title_n) {
+    tagset_t ts = { .track = track, .disc = disc, .title = title, .title_n = title ? title_n : 0 };
+    tags_read(path, &ts);
+}
+
+void tag_read_disc(const char *path, int *track, int *disc, char *title, unsigned title_n,
+                   char *disc_title, unsigned dt_n) {
+    tagset_t ts = { .track = track, .disc = disc, .title = title, .title_n = title ? title_n : 0,
+                    .disc_title = disc_title, .dt_n = disc_title ? dt_n : 0 };
+    tags_read(path, &ts);
+}
+
+int tag_track_number(const char *path) {
+    int v; tag_read(path, &v, NULL, NULL, 0); return v;
+}
+
+int tag_disc_number(const char *path) {
+    int v; tag_read(path, NULL, &v, NULL, 0); return v;
+}
+
+int tag_title(const char *path, char *out, unsigned n) {
+    if (!out || n < 2) return -1;
+    tag_read(path, NULL, NULL, out, n);
+    return out[0] ? 0 : -1;
+}
+
+void tag_read_meta(const char *path, char *artist, unsigned artist_n,
+                   char *album, unsigned album_n,
+                   char *album_artist, unsigned aa_n,
+                   char *genre, unsigned genre_n) {
+    tagset_t ts = { .artist = artist, .an = artist ? artist_n : 0,
+                    .album = album, .bn = album ? album_n : 0,
+                    .aartist = album_artist, .aan = album_artist ? aa_n : 0,
+                    .genre = genre, .gn = genre ? genre_n : 0 };
+    tags_read(path, &ts);
 }

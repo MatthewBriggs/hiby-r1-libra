@@ -3,6 +3,7 @@
  * See index.c for why and the scan model. */
 #ifndef INDEX_H
 #define INDEX_H
+#include <stddef.h>
 
 #include <time.h>
 #include "library.h"   /* lib_row_t, for index_albums() below */
@@ -35,6 +36,9 @@ void index_pause_for_usb(int paused);
  * untouched on a miss, so the caller's existing fallback path is unchanged.
  * UI-thread only, like every other database access in this app. */
 int index_lookup(const char *path, time_t mtime, int *track, int *disc, int *dur_ms);
+/* The disc's own name for this track (DISCSUBTITLE: "Pop", "Club"), or "".
+ * Keyed as index_lookup() is, by the real path. 1 when there is one. */
+int index_disc_title(const char *path, char *out, size_t n);
 
 /* Whole-library album list, cached during the last scan pass -- entering
  * Albums unfiltered used to re-run MEDIA_TABLE's own GROUP BY/ORDER BY on
