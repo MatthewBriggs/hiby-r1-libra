@@ -801,17 +801,35 @@ static int bt_mac_ok(const char *mac) {
     return 1;
 }
 
+/* Pairing a new device: `pair` returns at once and the pairing completes
+ * seconds later, so bluetoothctl's stdin is held open (polling bluez's own
+ * Paired property, up to 20 s) before `trust` and `quit`. Piping the three
+ * commands in one go -- as this did -- quit before the headset had finished,
+ * and a never-paired device never paired (2026-10-19, a new WH-1000XM4C;
+ * the same command typed with the session left open paired first time).
+ * Skipped for a device bluez already has paired.
+ *
+ * /tmp/bt_pair.mac names the device the newest tap asked for: a loop whose
+ * device it no longer is stops at its next pass, so taps on two devices do
+ * not leave two loops fighting over the radio. */
 void bt_pair(const char *mac) {
     if (!bt_mac_ok(mac)) return;
-    char cmd[1024];
+    char cmd[2048];
     snprintf(cmd, sizeof(cmd),
         "("
         "_mac=%s; "
-        "printf 'agent NoInputNoOutput\\ndefault-agent\\npair '$_mac'\\ntrust '$_mac'\\nquit\\n' | bluetoothctl >/dev/null 2>&1; "
+        "echo $_mac > /tmp/bt_pair.mac; "
+        "_paired() { bluetoothctl info $_mac 2>/dev/null | grep -q 'Paired: yes'; }; "
+        "if ! _paired; then "
+        "(printf 'agent NoInputNoOutput\\ndefault-agent\\npair '$_mac'\\n'; "
+        "_i=0; while [ $_i -lt 20 ]; do sleep 1; _paired && break; _i=$((_i + 1)); done; "
+        "printf 'trust '$_mac'\\nquit\\n') | bluetoothctl >/dev/null 2>&1; "
+        "else printf 'trust '$_mac'\\nquit\\n' | bluetoothctl >/dev/null 2>&1; fi; "
         "_path=/org/bluez/hci0/dev_$(echo $_mac | tr ':' '_'); "
         "_pcm_up() { %s list-pcms 2>/dev/null | grep -qi \"$(echo $_mac | tr ':' '_').*a2dp\"; }; "
         "_ok=0; "
         "for _gap in 1 2 3 5 5 5 10 10 10 10; do "
+        "[ \"$(cat /tmp/bt_pair.mac 2>/dev/null)\" = $_mac ] || break; "
         "_pcm_up && { _ok=1; break; }; "
         "dbus-send --system --reply-timeout=8000 --dest=org.bluez \"$_path\" org.bluez.Device1.ConnectProfile string:0000110b-0000-1000-8000-00805f9b34fb >/dev/null 2>&1; "
         "_pcm_up && { _ok=1; break; }; "

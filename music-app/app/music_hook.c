@@ -15878,7 +15878,12 @@ int music_entry(void *a0, void *a1) {
                      * than the one under the finger. Same defect the Wi-Fi
                      * handler above just had, for the same reason. */
                     int idx = -1;
-                    if (bt_row_kind(row - BT_FIXED_ROWS, &idx) == BT_ROW_DEVICE) {
+                    /* Tapped again while that device is still connecting: one
+                     * attempt at a time (three overlapping loops is how a
+                     * WH-1000XM4C failed to pair, 2026-10-19). */
+                    if (bt_row_kind(row - BT_FIXED_ROWS, &idx) == BT_ROW_DEVICE &&
+                        !(!strcmp(bt_connecting_mac, bt_devs[idx].mac) &&
+                          time(NULL) - bt_connecting_since < BT_CONNECT_TIMEOUT_SEC)) {
                         snprintf(bt_connecting_mac, sizeof(bt_connecting_mac), "%s", bt_devs[idx].mac);
                         bt_connecting_since = time(NULL);
                         bt_pair(bt_devs[idx].mac);
