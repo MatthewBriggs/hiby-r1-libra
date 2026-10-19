@@ -5340,15 +5340,22 @@ static void bt_sort_range(bt_found_dev_t *devs, int *order, int lo, int hi) {
  * too. Reported live as devices in the Paired section that had never been
  * paired with -- passing strangers picked up by a scan, listed alongside the
  * real headsets. bt_fill_details() reads bluez's own Paired property instead. */
+/* Nameless devices go below the named ones in the other section, each group
+ * nearest first: a headset in pairing mode says its name, so the nameless
+ * are almost never the thing being looked for. */
 static int bt_partition(bt_found_dev_t *devs, int dev_n, int *order) {
     int paired_n = 0;
     for (int i = 0; i < dev_n; i++)
         if (devs[i].paired) order[paired_n++] = i;
     int oi = paired_n;
     for (int i = 0; i < dev_n; i++)
-        if (!devs[i].paired) order[oi++] = i;
+        if (!devs[i].paired && devs[i].name[0]) order[oi++] = i;
+    int named_end = oi;
+    for (int i = 0; i < dev_n; i++)
+        if (!devs[i].paired && !devs[i].name[0]) order[oi++] = i;
     bt_sort_range(devs, order, 0, paired_n);
-    bt_sort_range(devs, order, paired_n, dev_n);
+    bt_sort_range(devs, order, paired_n, named_end);
+    bt_sort_range(devs, order, named_end, dev_n);
     return paired_n;
 }
 
@@ -10439,8 +10446,13 @@ static void draw_screen(uint16_t *fb) {
                     /* R-reconnect: visual feedback for the tap -- see
                      * bt_connecting_mac's own comment above kb_commit(). */
                     int connecting = bt_connecting_mac[0] && !strcmp(bt_devs[idx].mac, bt_connecting_mac);
-                    draw_text_clip(fb, 24, ry + 20, bt_devs[idx].name[0] ? bt_devs[idx].name : bt_devs[idx].mac,
-                                  connecting ? COL_ACCENT : COL_TEXT, TEXT_PX_BODY, FB_W - 48, CONTENT_Y, clip_bot);
+                    /* Nameless: said so, dimmed, with the address's tail to
+                     * tell two apart. */
+                    char unnamed[40];
+                    snprintf(unnamed, sizeof(unnamed), "Unnamed device \xc2\xb7 %s", bt_devs[idx].mac + 9);
+                    draw_text_clip(fb, 24, ry + 20, bt_devs[idx].name[0] ? bt_devs[idx].name : unnamed,
+                                  connecting ? COL_ACCENT : bt_devs[idx].name[0] ? COL_TEXT : COL_DIM,
+                                  TEXT_PX_BODY, FB_W - 48, CONTENT_Y, clip_bot);
                     /* The MAC was what the right-hand column showed, which is
                      * the least useful thing about a row whose name is already
                      * on the left. Now that the list is ordered by proximity,

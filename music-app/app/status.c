@@ -529,8 +529,14 @@ void bt_scan_start(void) {
      * "quit" keeps the pipe's write end open for that whole window instead,
      * holding bluetoothctl's own stdin off EOF (and its scan running) for
      * as long as timeout 8 was meant to. */
-    st_spawn("(printf 'agent NoInputNoOutput\\ndefault-agent\\nscan on\\n'; "
-             "sleep 8; printf 'quit\\n') | bluetoothctl >/dev/null 2>&1");
+    /* Classic Bluetooth only ("scan bredr"): headphones and speakers play
+     * over it, and it carries their names. A mixed scan also gathered every
+     * Bluetooth LE phone, watch and tracker in range -- dozens on a street,
+     * almost all nameless, listed as their addresses -- which buried the
+     * headset being paired (2026-10-19). 12 s: a full classic inquiry is
+     * 10.24 s. */
+    st_spawn("(printf 'agent NoInputNoOutput\\ndefault-agent\\nscan bredr\\n'; "
+             "sleep 12; printf 'quit\\n') | bluetoothctl >/dev/null 2>&1");
 }
 
 /* Every device bluetoothd currently knows about -- already-paired and
@@ -591,6 +597,13 @@ int bt_scan_devices(bt_found_dev_t *out, int max) {
             if (*name == ' ') name++;
             memcpy(out[n].mac, mac, 17); out[n].mac[17] = '\0';
             snprintf(out[n].name, sizeof(out[n].name), "%s", name);
+            /* No name heard: bluez gives the address, dashed, as the alias.
+             * Left empty, so the list can say "Unnamed device" and sort it
+             * below the named ones. */
+            char dashed[18];
+            snprintf(dashed, sizeof(dashed), "%s", out[n].mac);
+            for (char *c = dashed; *c; c++) if (*c == ':') *c = '-';
+            if (!strcasecmp(out[n].name, dashed)) out[n].name[0] = '\0';
             /* Cleared, not left alone: the caller's array is reused across
              * refreshes, so a reading from a previous scan would otherwise
              * stick to whatever device now lands in this slot. */
