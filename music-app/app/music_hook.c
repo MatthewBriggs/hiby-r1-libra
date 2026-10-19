@@ -4226,6 +4226,16 @@ static void wifi_link_tick(void) {
         mlog("[music] wifi: joined, asking for an address\n");
         if (!was_up) st_wifi_note_joined();
     }
+    /* Every join and every loss, logged: whether Wi-Fi was on a network is
+     * what tells a scanning Wi-Fi (no network: a full scan every 30 s) from
+     * a quiet one when Bluetooth broke up (2026-10-19, unanswerable from the
+     * log until now). */
+    if (up != was_up) {
+        char ssid[64] = "";
+        if (up) st_wifi_ssid(ssid, sizeof(ssid));
+        if (up) mlog("[music] wifi: on a network (%s)\n", ssid[0] ? ssid : "?");
+        else if (st_wifi_on()) mlog("[music] wifi: lost the network; scanning for one\n");
+    }
     int lifted = st_wifi_narrow_check(up);
     if (lifted) {
         narrow_logged = 0;
@@ -4258,15 +4268,28 @@ static void wifi_link_tick(void) {
      * progress. */
     int held = net_held();
     if (!held) wifi_bt_override = 0;
+    /* Wi-Fi with no network to be on, during Bluetooth playback: off, setting
+     * or no setting. Out and about, an unjoined supplicant scans every
+     * channel for the saved networks, each scan taking the shared radio from
+     * Bluetooth -- aptX broke up every half minute on the move (2026-10-19)
+     * while at home, joined and idle, it plays clean. With no network there
+     * is nothing to lose. 10 s unjoined first, so a join in progress (the
+     * narrowed scan finds the last network in ~3 s) is not cut short. */
+    static time_t unjoined_since;
+    if (on && !up && held) { if (!unjoined_since) unjoined_since = now; }
+    else unjoined_since = 0;
+    int unjoined = unjoined_since && now - unjoined_since >= 10;
     if (!wifi_bt_parked) {
         wifi_free_since = 0;
-        if (held && wifi_bt_off_enabled && !wifi_bt_override && wifi_pref && on &&
+        if (held && (wifi_bt_off_enabled || unjoined) && !wifi_bt_override && wifi_pref && on &&
             !pod_download_active() && !pod_update_running() &&
             !wifi_connecting_ssid[0] && screen != SC_SETTINGS_WIFI) {
             wifi_bt_parked = 1;
             scan_slowed = 0;
+            unjoined_since = 0;
             st_wifi_set(0);
-            mlog("[music] wifi: off for Bluetooth playback\n");
+            mlog("[music] wifi: off for Bluetooth playback%s\n",
+                 wifi_bt_off_enabled ? "" : " (not on a network: its scans break Bluetooth up)");
         }
     } else if (held) {
         wifi_free_since = 0;
