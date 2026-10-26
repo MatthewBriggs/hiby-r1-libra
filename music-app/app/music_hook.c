@@ -5805,9 +5805,10 @@ static lib_row_t *row_at(int absolute) {
  * smoothness this was chasing — not a cheaper redraw, just far fewer of
  * them: one per 72px of travel instead of one on nearly every tick. */
 /* Reported live: replaces the old inline disc-number-next-to-track-number
- * column with a full-width banner (icon, "Disc N", that disc's own total
- * playtime) inserted before each disc's first track. Height chosen to sit
- * clearly apart from a ROW_H (72) track row without dominating the list. */
+ * column with a full-width banner (icon, the disc's name or "Disc N", that
+ * disc's own total playtime) inserted before each disc's first track. Height
+ * chosen to sit clearly apart from a ROW_H (72) track row without dominating
+ * the list. */
 #define DISC_BANNER_H 56
 
 /* The disc's own name for the disc starting at tracks[idx] ("Pop" on
@@ -9441,8 +9442,9 @@ static void draw_screen(uint16_t *fb) {
         }
         fill_rect_clip(fb, 0, header_h - off - 1, FB_W, 1, np_view_col_line(), 0, clip_bot);
 
-        /* Reported live: a full-width banner (icon, "Disc N", that disc's
-         * own total playtime) before each disc's first track, replacing
+        /* Reported live: a full-width banner (icon, the disc's name or
+         * "Disc N", that disc's own total playtime) before each disc's first
+         * track, replacing
          * the old inline number next to the track number. Walks from
          * idx == 0 every draw rather than starting from a first_idx shortcut
          * the way this loop used to -- banners make a row's position
@@ -9469,7 +9471,9 @@ static void draw_screen(uint16_t *fb) {
                         disc_ms += tracks[j].dur_ms;
                     char discbuf[LIB_NAME_LEN + 16], dbuf[16];
                     const char *dname = disc_title_for(idx);
-                    if (dname[0]) snprintf(discbuf, sizeof(discbuf), "Disc %d \xc2\xb7 %s", disc, dname);
+                    /* The disc's name when its tags give one, in place of
+                     * the number, as Symphonium shows them. */
+                    if (dname[0]) snprintf(discbuf, sizeof(discbuf), "%s", dname);
                     else          snprintf(discbuf, sizeof(discbuf), "Disc %d", disc);
                     fmt_dur(dbuf, sizeof(dbuf), disc_ms);
                     fill_rect_clip(fb, 0, by, FB_W, DISC_BANNER_H, COL_HEADER, 0, clip_bot);
