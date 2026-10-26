@@ -32,9 +32,17 @@ void st_bt_codec(char *out, unsigned n);
 int  st_bt_battery(void);    /* percent, -1 unknown */
 /* The headset link's RSSI and link quality from the controller (hcitool);
  * 0 when nothing is connected or it could not be read. See status.c for
- * what the RSSI is relative to. st_bt_signal_bars() maps it to 1-4. */
-int  st_bt_signal(int *rssi, int *lq);
+ * what the RSSI is relative to. st_bt_signal_bars() maps it to 1-4.
+ * mac_out (18 bytes, or NULL) gets the headset's address. */
+int  st_bt_signal(int *rssi, int *lq, char *mac_out);
 int  st_bt_signal_bars(int rssi);
+/* Bytes handed to the Bluetooth controller so far (a wrapping counter);
+ * while audio streams, its rate is the headset link's throughput. */
+int  st_bt_tx_bytes(unsigned *bytes);
+/* The Broadcom A2DP priority Android gives a streaming headset link (see
+ * status.c): high for the headset at mac while it streams, back to normal
+ * when called with high 0. 1 when it sent a command, described in note. */
+int  st_bt_acl_priority(const char *mac, int high, char *note, unsigned n);
 /* What each radio is attached to, for the quick-settings panel. Empty when
  * nothing is. */
 void st_wifi_ssid(char *out, unsigned n);

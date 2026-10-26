@@ -853,9 +853,15 @@ static void *bt_poll(void *arg) {
             st_bt_codec(c, sizeof(c));
             int b = st_bt_battery();
             int rssi = 0, lq = -1;
-            int sig = st_bt_signal(&rssi, &lq);
+            char mac[18] = "";
+            int sig = st_bt_signal(&rssi, &lq, mac);
             if (on_bt) audio_bt_volume_service();
             if (sig && on_bt) bt_signal_log(rssi, lq, c);
+            /* The A2DP priority Android gives a streaming link; looked at
+             * every pass, since a reconnect or a role switch drops it. */
+            char note[128];
+            if (sig && on_bt && st_bt_acl_priority(mac, 1, note, sizeof(note)))
+                mlog("[bt] %s\n", note);
             pthread_mutex_lock(&bt_lock);
             snprintf(bt_codec_cached, sizeof(bt_codec_cached), "%s", c);
             bt_batt_cached = b;
@@ -867,6 +873,12 @@ static void *bt_poll(void *arg) {
             bt_batt_cached = -1;
             bt_sig_at = 0;
             pthread_mutex_unlock(&bt_lock);
+        }
+        /* Not streaming any more: back to normal, as Android does when a
+         * stream stops. Nothing to do, and no syscall, when it was not set. */
+        if (!on_bt) {
+            char note[128];
+            if (st_bt_acl_priority(NULL, 0, note, sizeof(note))) mlog("[bt] %s\n", note);
         }
         /* BG38 (part 2): connection-based, not audio_using_bt()'s
          * playback-based -- reconnecting a headset with nothing actively

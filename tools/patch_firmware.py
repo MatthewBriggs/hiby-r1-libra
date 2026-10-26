@@ -2438,8 +2438,10 @@ def hasten_bt_init(root):
 # (github.com/Starnished66/compas-player, scripts/base_image): BlueALSA 5.0.0,
 # BlueZ 5.87's bluetoothd and tools, and the D-Bus/GLib/ALSA/codec libraries
 # they need, built by ~/Git/r1-bt-stack with compas-player's own scripts and
-# patches. DIR is that build's out/: overlay/ (their runtime overlay) and
-# bluez/ (bluetoothd, bluetoothctl, hciconfig, hcitool, btmon).
+# patches, plus Libra's BlueALSA patches (tools/bt-stack/patches: aptX packets
+# sized to one 2-DH5 baseband packet). DIR is that build's out/: overlay/
+# (their runtime overlay) and bluez/ (bluetoothd, bluetoothctl, hciconfig,
+# hcitool, btmon).
 #
 # Three things are deliberately not taken from their overlay:
 #  - libldacdec.so.1, their rebuilt LDAC *decoder*. Upstream publishes no

@@ -1,0 +1,77 @@
+--- a/src/a2dp-aptx.c	2026-08-27 06:46:51
++++ b/src/a2dp-aptx.c	2026-10-26 07:53:25
+@@ -16,6 +16,7 @@
+ #include <stddef.h>
+ #include <stdint.h>
+ #include <string.h>
++#include <sys/param.h>
+ #include <sys/types.h>
+ 
+ #include "a2dp.h"
+@@ -32,6 +33,10 @@
+ #include "shared/log.h"
+ #include "shared/rt.h"
+ 
++/* The 2-DH5 baseband packet's 679 bytes of payload, less the 4-byte L2CAP
++ * basic header. */
++#define A2DP_2DH5_PAYLOAD_MAX (679 - 4)
++
+ static const struct a2dp_bit_mapping a2dp_aptx_channels[] = {
+ 	{ APTX_CHANNEL_MODE_MONO, .ch = { 1, a2dp_channel_map_mono } },
+ 	{ APTX_CHANNEL_MODE_STEREO, .ch = { 2, a2dp_channel_map_stereo } },
+@@ -127,9 +132,17 @@
+ 	const size_t aptx_frame_len = 2 * sizeof(uint16_t);
+ 	const size_t aptx_frame_pcm_samples = 4 * channels;
+ 
+-	const size_t mtu_write_aptx_frames = t->mtu_write / aptx_frame_len;
++	/* No bigger than one 2-DH5 baseband packet carries, as Android sends
++	 * apt-X (about 600 bytes), rather than as big as the link MTU allows.
++	 * A link that has fallen back from 3 Mbps to 2 Mbps -- a weak one, which
++	 * is when airtime runs short -- needs a 2-DH5 and a 2-DH3 for an 892-byte
++	 * packet, and a single 2-DH5 for this one: a fifth less airtime for the
++	 * same audio, with retransmissions on top costing the same per packet.
++	 * apt-X has no RTP header, so the packet is the whole L2CAP payload. */
++	const size_t mtu_write = MIN(t->mtu_write, A2DP_2DH5_PAYLOAD_MAX);
++	const size_t mtu_write_aptx_frames = mtu_write / aptx_frame_len;
+ 	if (ffb_init_int16_t(&pcm, aptx_frame_pcm_samples * mtu_write_aptx_frames) == -1 ||
+-			ffb_init_uint8_t(&bt, t->mtu_write) == -1) {
++			ffb_init_uint8_t(&bt, mtu_write_aptx_frames * aptx_frame_len) == -1) {
+ 		error("Couldn't create data buffers: %s", strerror(errno));
+ 		goto fail_ffb;
+ 	}
+--- a/src/a2dp-aptx-hd.c	2026-08-27 06:46:51
++++ b/src/a2dp-aptx-hd.c	2026-10-26 07:53:25
+@@ -16,6 +16,7 @@
+ #include <stddef.h>
+ #include <stdint.h>
+ #include <string.h>
++#include <sys/param.h>
+ #include <sys/types.h>
+ 
+ #include "a2dp.h"
+@@ -33,6 +34,10 @@
+ #include "shared/log.h"
+ #include "shared/rt.h"
+ 
++/* The 2-DH5 baseband packet's 679 bytes of payload, less the 4-byte L2CAP
++ * basic header. */
++#define A2DP_2DH5_PAYLOAD_MAX (679 - 4)
++
+ static const struct a2dp_bit_mapping a2dp_aptx_channels[] = {
+ 	{ APTX_CHANNEL_MODE_MONO, .ch = { 1, a2dp_channel_map_mono } },
+ 	{ APTX_CHANNEL_MODE_STEREO, .ch = { 2, a2dp_channel_map_stereo } },
+@@ -129,9 +134,12 @@
+ 	const size_t aptx_frame_len = 2 * 3 * sizeof(uint8_t);
+ 	const size_t aptx_frame_pcm_samples = 4 * channels;
+ 
+-	const size_t mtu_write_aptx_frames = (t->mtu_write - RTP_HEADER_LEN) / aptx_frame_len;
++	/* No bigger than one 2-DH5 baseband packet carries, as for apt-X (see
++	 * a2dp-aptx.c), the RTP header included. */
++	const size_t mtu_write = MIN(t->mtu_write, A2DP_2DH5_PAYLOAD_MAX);
++	const size_t mtu_write_aptx_frames = (mtu_write - RTP_HEADER_LEN) / aptx_frame_len;
+ 	if (ffb_init_int32_t(&pcm, aptx_frame_pcm_samples * mtu_write_aptx_frames) == -1 ||
+-			ffb_init_uint8_t(&bt, t->mtu_write) == -1) {
++			ffb_init_uint8_t(&bt, RTP_HEADER_LEN + mtu_write_aptx_frames * aptx_frame_len) == -1) {
+ 		error("Couldn't create data buffers: %s", strerror(errno));
+ 		goto fail_ffb;
+ 	}

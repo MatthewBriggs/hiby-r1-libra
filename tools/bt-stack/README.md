@@ -16,6 +16,17 @@ fetched at the commit or checksum those scripts pin. `build.sh` lists the Git
 checkouts; the release tarballs are pinned by SHA-256 inside compas-player's
 own scripts.
 
+On top of theirs, Libra adds its own BlueALSA patches from `patches/`
+(`bluealsa-libra-*.patch`), which `build.sh` puts beside compas-player's so
+their build script applies them the same way:
+
+- `bluealsa-libra-aptx-2dh5.patch`: aptX and aptX HD packets no bigger than
+  one 2-DH5 baseband packet carries (675 bytes of L2CAP payload), as Android
+  sends aptX, instead of as big as the link MTU allows. On a 895-byte MTU
+  BlueALSA sent 892-byte aptX packets, which a link that has dropped to
+  2 Mbps carries as a 2-DH5 plus a 2-DH3; at 672 bytes each needs a single
+  2-DH5, about a fifth less airtime for the same audio.
+
 Deliberately left out of what Libra installs:
 
 - **libldacdec** (compas-player's rebuilt LDAC decoder). Upstream
@@ -37,8 +48,10 @@ Licence notices for everything installed ship in the image under
 docker build --platform linux/amd64 -t r1-bt-stack .
 docker volume create r1-bt-build
 docker run --platform linux/amd64 --rm \
+  -e COMPAS_COMMIT=a7b2b0014438f5cca0241dce13e7b5cd7d36af22 \
   -v /path/to/compas-player:/src:ro -v $PWD/stock:/stock:ro \
-  -v $PWD/build.sh:/build.sh:ro -v r1-bt-build:/build \
+  -v $PWD/build.sh:/build.sh:ro -v $PWD/patches:/patches:ro \
+  -v r1-bt-build:/build \
   r1-bt-stack bash /build.sh                 # all nine components
 # then: bash /build.sh overlay test          # overlay + qemu smoke test
 ```

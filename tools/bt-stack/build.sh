@@ -4,7 +4,15 @@
 set -euo pipefail
 cd /build
 if [[ ! -d cp/.git ]]; then git clone -q /src cp; fi
-git -C cp fetch -q /src HEAD && git -C cp checkout -q FETCH_HEAD
+# COMPAS_COMMIT pins their scripts (the overlay Libra ships was built at
+# a7b2b0014438f5cca0241dce13e7b5cd7d36af22); unset, whatever /src has checked out.
+git -C cp fetch -q /src HEAD && git -C cp checkout -q "${COMPAS_COMMIT:-FETCH_HEAD}"
+# Libra's own BlueALSA patches (patches/, mounted at /patches). Their
+# build_base_bluealsa.sh applies every scripts/base_image/bluealsa-*.patch in
+# byte order, so these go in beside theirs; stale copies are cleared first.
+rm -f cp/scripts/base_image/bluealsa-libra-*.patch
+ls /patches/bluealsa-libra-*.patch >/dev/null 2>&1 || { echo "no patches at /patches" >&2; exit 1; }
+cp /patches/bluealsa-libra-*.patch cp/scripts/base_image/
 R=/build/cp
 S=$R/scratch
 B=$S/base-upgrade

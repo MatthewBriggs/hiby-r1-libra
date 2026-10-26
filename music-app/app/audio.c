@@ -2897,6 +2897,37 @@ static unsigned bt_j_writes, bt_j_late;
 static long     bt_j_max;
 static time_t   bt_j_since;
 
+/* And the link's own throughput over the same minute: what the kernel has
+ * handed the controller (st_bt_tx_bytes()), which it takes only as the
+ * headset acknowledges, in BT_AIR_WINDOW_MS windows -- the minute's average
+ * and its lowest and highest window. A link falling behind the codec shows
+ * as low windows and then high ones, the backlog going out; a dropout heard
+ * while every window holds steady is not the link's. Read from the write
+ * path, once a window has passed. */
+#define BT_AIR_WINDOW_MS 250
+static unsigned           bt_air_lo, bt_air_hi, bt_air_n;   /* kbps; windows */
+static unsigned long long bt_air_bytes;
+static long long          bt_air_ms;
+
+static void bt_air_note(long long now_ms, int restart) {
+    static long long t0;
+    static unsigned b0;
+    if (!restart && t0 && now_ms - t0 < BT_AIR_WINDOW_MS) return;
+    unsigned b;
+    if (!st_bt_tx_bytes(&b)) { t0 = 0; return; }
+    long long dt = now_ms - t0;
+    if (!restart && t0 && dt < 2000) {
+        unsigned kbps = (unsigned)((unsigned long long)(b - b0) * 8 / (unsigned long long)dt);
+        if (!bt_air_n || kbps < bt_air_lo) bt_air_lo = kbps;
+        if (kbps > bt_air_hi) bt_air_hi = kbps;
+        bt_air_bytes += b - b0;
+        bt_air_ms += dt;
+        bt_air_n++;
+    }
+    t0 = now_ms;
+    b0 = b;
+}
+
 static unsigned long long proc_counter(const char *path, const char *key) {
     FILE *f = fopen(path, "r");
     if (!f) return 0;
@@ -2909,7 +2940,7 @@ static unsigned long long proc_counter(const char *path, const char *key) {
     return v;
 }
 
-static void bt_jitter_note(long over) {
+static void bt_jitter_note(long over, long long now_ms) {
     static unsigned long long pf0, irq0, cs0;
     time_t t = time(NULL);
     if (!bt_j_since) {
@@ -2917,7 +2948,12 @@ static void bt_jitter_note(long over) {
         pf0  = proc_counter("/proc/vmstat", "pgmajfault");
         irq0 = proc_counter("/proc/stat", "intr");
         cs0  = proc_counter("/proc/stat", "ctxt");
+        bt_air_lo = bt_air_hi = bt_air_n = 0;
+        bt_air_bytes = 0;
+        bt_air_ms = 0;
+        bt_air_note(now_ms, 1);
     }
+    bt_air_note(now_ms, 0);
     bt_j_writes++;
     if (over >= BT_LATE_MS) bt_j_late++;
     if (over > bt_j_max) bt_j_max = over;
@@ -2926,12 +2962,18 @@ static void bt_jitter_note(long over) {
     unsigned long long pf  = proc_counter("/proc/vmstat", "pgmajfault");
     unsigned long long irq = proc_counter("/proc/stat", "intr");
     unsigned long long cs  = proc_counter("/proc/stat", "ctxt");
-    alog("[bt] jitter %lds: %u writes, worst %+ld ms, %u over %d ms | majflt %llu, irq/s %llu, cs/s %llu\n",
+    unsigned air = bt_air_ms > 0 ? (unsigned)(bt_air_bytes * 8 / (unsigned long long)bt_air_ms) : 0;
+    alog("[bt] jitter %lds: %u writes, worst %+ld ms, %u over %d ms | majflt %llu, irq/s %llu, cs/s %llu"
+         " | air %u kbps, %d ms windows %u-%u\n",
          span, bt_j_writes, bt_j_max, bt_j_late, BT_LATE_MS,
-         pf - pf0, (irq - irq0) / (unsigned long long)span, (cs - cs0) / (unsigned long long)span);
+         pf - pf0, (irq - irq0) / (unsigned long long)span, (cs - cs0) / (unsigned long long)span,
+         air, BT_AIR_WINDOW_MS, bt_air_lo, bt_air_hi);
     bt_j_since = t; pf0 = pf; irq0 = irq; cs0 = cs;
     bt_j_writes = bt_j_late = 0;
     bt_j_max = 0;
+    bt_air_lo = bt_air_hi = bt_air_n = 0;
+    bt_air_bytes = 0;
+    bt_air_ms = 0;
 }
 
 static void bt_stall_check(unsigned long frames, long ms) {
@@ -2948,7 +2990,7 @@ static void bt_stall_check(unsigned long frames, long ms) {
     if (start_ms - last_ms > 500) { quiet_until = now_ms + 3000; bt_j_since = 0; }
     if (now_ms < quiet_until || !g_out_rate) return;
     long over = ms - (long)(frames * 1000 / g_out_rate);
-    bt_jitter_note(over);
+    bt_jitter_note(over, now_ms);
     if (over < BT_STALL_MS) return;
     time_t t = time(NULL);
     alog("[bt] stall %ld ms\n", over);

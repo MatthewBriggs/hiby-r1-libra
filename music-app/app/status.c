@@ -9,6 +9,7 @@
  */
 
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 #include <strings.h>
 #include <ctype.h>
@@ -401,7 +402,7 @@ int st_bt_battery(void) {
  * below, positive above -- rather than dBm, though some controllers report
  * dBm anyway; st_bt_signal_bars() takes both. Link quality is 0-255, vendor
  * defined. Uncached: the caller decides how often. */
-int st_bt_signal(int *rssi, int *lq) {
+int st_bt_signal(int *rssi, int *lq, char *mac_out) {
     char path[256], mac[18];
     if (!bt_pcm_path(path, sizeof(path)) || !bt_mac_from_path(path, mac)) return 0;
     char cmd[128], buf[256];
@@ -412,6 +413,167 @@ int st_bt_signal(int *rssi, int *lq) {
     if (!r) return 0;
     *rssi = atoi(r + 18);
     *lq = q ? atoi(q + 13) : -1;
+    if (mac_out) snprintf(mac_out, 18, "%s", mac);
+    return 1;
+}
+
+/* hci0 over the kernel's own HCI socket, for the two things below that are
+ * asked often enough that spawning hcitool for them would cost: the kernel's
+ * definitions, as BlueZ's hci.h has them. */
+#ifndef AF_BLUETOOTH
+#define AF_BLUETOOTH 31
+#endif
+#define HCI_PROTO       1                      /* BTPROTO_HCI */
+#define HCI_SOL         0                      /* SOL_HCI */
+#define HCI_SOCK_FILTER 2                      /* HCI_FILTER */
+#define HCI_DEVINFO     _IOR('H', 211, int)    /* HCIGETDEVINFO */
+#define HCI_CONNLIST    _IOR('H', 212, int)    /* HCIGETCONNLIST */
+
+struct hci_devinfo {
+    uint16_t dev_id;
+    char     name[8];
+    uint8_t  bdaddr[6];
+    uint32_t flags;
+    uint8_t  type;
+    uint8_t  features[8];
+    uint32_t pkt_type, link_policy, link_mode;
+    uint16_t acl_mtu, acl_pkts, sco_mtu, sco_pkts;
+    uint32_t err_rx, err_tx, cmd_tx, evt_rx, acl_tx, acl_rx, sco_tx, sco_rx, byte_rx, byte_tx;
+};
+struct hci_conninfo {
+    uint16_t handle;
+    uint8_t  bdaddr[6];         /* least significant byte first */
+    uint8_t  type;              /* 1: ACL */
+    uint8_t  out;
+    uint16_t state;
+    uint32_t link_mode;         /* bit 0: this end is the central */
+};
+struct hci_connlist {
+    uint16_t dev_id, conn_num;
+    struct hci_conninfo ci[8];
+};
+struct hci_evfilter {
+    uint32_t type_mask, event_mask[2];
+    uint16_t opcode;
+};
+struct hci_sockaddr {
+    sa_family_t    family;
+    unsigned short dev, channel;
+};
+
+static int hci_open(void) {
+    return socket(AF_BLUETOOTH, SOCK_RAW | SOCK_CLOEXEC, HCI_PROTO);
+}
+
+/* Bytes the kernel has handed hci0: commands and ACL data. ACL data goes to
+ * the chip only as its buffers free up, which is as the headset acknowledges
+ * them, so while audio streams the rate of this is the link's throughput. */
+int st_bt_tx_bytes(unsigned *bytes) {
+    int fd = hci_open();
+    if (fd < 0) return 0;
+    struct hci_devinfo di;
+    memset(&di, 0, sizeof(di));
+    int ok = ioctl(fd, HCI_DEVINFO, &di) == 0;
+    close(fd);
+    if (ok) *bytes = di.byte_tx;
+    return ok;
+}
+
+/* The ACL link to `mac`: its handle, and whether this end is the central. */
+static int hci_link(int fd, const char *mac, int *handle, int *central) {
+    unsigned v[6];
+    if (sscanf(mac, "%2x:%2x:%2x:%2x:%2x:%2x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6)
+        return 0;
+    uint8_t want[6];
+    for (int i = 0; i < 6; i++) want[5 - i] = (uint8_t)v[i];
+    struct hci_connlist cl;
+    memset(&cl, 0, sizeof(cl));
+    cl.conn_num = 8;
+    if (ioctl(fd, HCI_CONNLIST, &cl) != 0) return 0;
+    for (int i = 0; i < cl.conn_num && i < 8; i++) {
+        if (cl.ci[i].type != 1 || memcmp(cl.ci[i].bdaddr, want, 6) != 0) continue;
+        *handle = cl.ci[i].handle;
+        *central = (int)(cl.ci[i].link_mode & 1);
+        return 1;
+    }
+    return 0;
+}
+
+/* Sends vendor command `ocf` to hci0 and waits up to a second for its
+ * Command Complete (or Command Status). 1 when it answered, with its status
+ * byte in *status. Vendor commands bypass the kernel's command queue, as
+ * hcitool cmd's do. */
+static int hci_vendor_cmd(int fd, uint16_t ocf, const uint8_t *param, int n, int *status) {
+    struct hci_sockaddr a = { AF_BLUETOOTH, 0, 0 };   /* hci0, raw channel */
+    if (bind(fd, (struct sockaddr *)&a, sizeof(a)) != 0) return 0;
+    uint16_t op = (uint16_t)(0x3f << 10 | ocf);
+    struct hci_evfilter f = { 1u << 4, { 1u << 0x0e | 1u << 0x0f, 0 }, op };
+    if (setsockopt(fd, HCI_SOL, HCI_SOCK_FILTER, &f, sizeof(f)) != 0) return 0;
+    uint8_t pkt[4 + 16] = { 0x01, (uint8_t)op, (uint8_t)(op >> 8), (uint8_t)n };
+    if (n > 16) return 0;
+    memcpy(pkt + 4, param, (size_t)n);
+    if (write(fd, pkt, (size_t)(4 + n)) != 4 + n) return 0;
+    long long until = mono_ms() + 1000;
+    for (;;) {
+        int left = (int)(until - mono_ms());
+        struct pollfd p = { fd, POLLIN, 0 };
+        if (left <= 0 || poll(&p, 1, left) <= 0) return 0;
+        uint8_t ev[260];
+        ssize_t got = read(fd, ev, sizeof(ev));
+        if (got < 7 || ev[0] != 0x04) continue;
+        /* Command Complete: 0e plen ncmd op op status; Command Status:
+         * 0f plen status ncmd op op. */
+        if (ev[1] == 0x0e && (ev[4] | ev[5] << 8) == op) { *status = ev[6]; return 1; }
+        if (ev[1] == 0x0f && (ev[5] | ev[6] << 8) == op) { *status = ev[3]; return 1; }
+    }
+}
+
+/* Android's A2DP priority on a Broadcom controller: vendor command 0x0057
+ * (HCI_BRCM_SET_ACL_PRIORITY) with the link's handle and 0xFF, sent when a
+ * stream starts, and 0x00 when it stops. The controller then serves that
+ * link's traffic first. BlueZ never sends it. The controller forgets it on a
+ * role switch (Android sends it again after one) and on a reconnect, which
+ * brings a new handle, so the link is looked up on every call and the
+ * command sent again whenever it is not the link last set.
+ *
+ * high: the headset at `mac` is streaming; 0: nothing is, so take back
+ * whatever was set. 1 when a command went out, with what happened in note. */
+static char acl_prio_mac[18];
+static int  acl_prio_handle = -1, acl_prio_central = -1;
+static int  acl_prio_state;     /* 0 nothing set, 1 high, -1 refused for this link */
+
+int st_bt_acl_priority(const char *mac, int high, char *note, unsigned n) {
+    note[0] = '\0';
+    if (!high && acl_prio_state != 1) return 0;
+    const char *m = high ? mac : acl_prio_mac;
+    if (!m || !m[0]) return 0;
+    int fd = hci_open();
+    if (fd < 0) return 0;
+    int handle, central;
+    if (!hci_link(fd, m, &handle, &central)) {
+        close(fd);
+        acl_prio_state = 0;     /* the link has gone, and its priority with it */
+        return 0;
+    }
+    if (high && acl_prio_state != 0 && !strcmp(acl_prio_mac, m) &&
+        acl_prio_handle == handle && acl_prio_central == central) {
+        close(fd);
+        return 0;
+    }
+    uint8_t param[3] = { (uint8_t)handle, (uint8_t)(handle >> 8), (uint8_t)(high ? 0xff : 0x00) };
+    int status = -1;
+    int answered = hci_vendor_cmd(fd, 0x0057, param, 3, &status);
+    close(fd);
+    snprintf(acl_prio_mac, sizeof(acl_prio_mac), "%s", m);
+    acl_prio_handle = handle;
+    acl_prio_central = central;
+    acl_prio_state = !high ? 0 : answered && status == 0 ? 1 : -1;
+    char how[32];
+    if (!answered) snprintf(how, sizeof(how), "no answer");
+    else if (status) snprintf(how, sizeof(how), "refused (status 0x%02x)", status);
+    else snprintf(how, sizeof(how), "ok");
+    snprintf(note, n, "link priority %s for %s (handle %d, R1 %s): %s",
+             high ? "high" : "normal", m, handle, central ? "central" : "peripheral", how);
     return 1;
 }
 
