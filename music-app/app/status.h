@@ -43,6 +43,10 @@ int  st_bt_tx_bytes(unsigned *bytes);
  * status.c): high for the headset at mac while it streams, back to normal
  * when called with high 0. 1 when it sent a command, described in note. */
 int  st_bt_acl_priority(const char *mac, int high, char *note, unsigned n);
+/* Fast connectable (160 ms page scanning, from stock's main.conf) off while a
+ * stream plays and back on after (see status.c). 1 when it sent a change,
+ * described in note. */
+int  st_bt_fast_connectable(int on, char *note, unsigned n);
 /* What each radio is attached to, for the quick-settings panel. Empty when
  * nothing is. */
 void st_wifi_ssid(char *out, unsigned n);

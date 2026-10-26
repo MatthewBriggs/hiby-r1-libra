@@ -862,6 +862,8 @@ static void *bt_poll(void *arg) {
             char note[128];
             if (sig && on_bt && st_bt_acl_priority(mac, 1, note, sizeof(note)))
                 mlog("[bt] %s\n", note);
+            if (on_bt && st_bt_fast_connectable(0, note, sizeof(note)))
+                mlog("[bt] %s\n", note);
             pthread_mutex_lock(&bt_lock);
             snprintf(bt_codec_cached, sizeof(bt_codec_cached), "%s", c);
             bt_batt_cached = b;
@@ -874,11 +876,13 @@ static void *bt_poll(void *arg) {
             bt_sig_at = 0;
             pthread_mutex_unlock(&bt_lock);
         }
-        /* Not streaming any more: back to normal, as Android does when a
-         * stream stops. Nothing to do, and no syscall, when it was not set. */
+        /* Not streaming any more: priority back to normal, as Android does
+         * when a stream stops, and fast connectable back on. Nothing to do,
+         * and no syscall, when neither was changed. */
         if (!on_bt) {
             char note[128];
             if (st_bt_acl_priority(NULL, 0, note, sizeof(note))) mlog("[bt] %s\n", note);
+            if (st_bt_fast_connectable(1, note, sizeof(note))) mlog("[bt] %s\n", note);
         }
         /* BG38 (part 2): connection-based, not audio_using_bt()'s
          * playback-based -- reconnecting a headset with nothing actively

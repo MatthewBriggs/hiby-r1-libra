@@ -577,6 +577,88 @@ int st_bt_acl_priority(const char *mac, int high, char *note, unsigned n) {
     return 1;
 }
 
+/* A command on the kernel's Bluetooth management channel, the one bluetoothd
+ * itself uses, for hci0. 1 when it answered, with its status in *status and
+ * up to rn bytes of what it returned in rsp. */
+static int mgmt_cmd(uint16_t op, const uint8_t *param, uint16_t len, int *status,
+                    uint8_t *rsp, size_t rn) {
+    int fd = hci_open();
+    if (fd < 0) return 0;
+    struct hci_sockaddr a = { AF_BLUETOOTH, 0xffff, 3 };   /* no device; HCI_CHANNEL_CONTROL */
+    uint8_t pkt[6 + 8] = { (uint8_t)op, (uint8_t)(op >> 8), 0, 0, (uint8_t)len, (uint8_t)(len >> 8) };
+    if (len > 8 || bind(fd, (struct sockaddr *)&a, sizeof(a)) != 0) { close(fd); return 0; }
+    if (len) memcpy(pkt + 6, param, len);
+    /* 4.4 answers the write with 0 rather than its length: only an error
+     * counts as a failure. */
+    if (write(fd, pkt, (size_t)(6 + len)) < 0) { close(fd); return 0; }
+    long long until = mono_ms() + 1000;
+    int answered = 0;
+    while (!answered) {
+        int left = (int)(until - mono_ms());
+        struct pollfd p = { fd, POLLIN, 0 };
+        if (left <= 0 || poll(&p, 1, left) <= 0) break;
+        uint8_t ev[320];
+        ssize_t got = read(fd, ev, sizeof(ev));
+        /* Command Complete (0x0001) or Command Status (0x0002), for hci0:
+         * event, index, length, then the opcode it answers, a status and
+         * (Complete) what the command returns. */
+        if (got < 9 || (ev[0] != 1 && ev[0] != 2) || ev[1] || ev[2] || ev[3]) continue;
+        if ((ev[6] | ev[7] << 8) != op) continue;
+        *status = ev[8];
+        if (rsp) {
+            size_t have = (size_t)got - 9;
+            memset(rsp, 0, rn);
+            memcpy(rsp, ev + 9, have < rn ? have : rn);
+        }
+        answered = 1;
+    }
+    close(fd);
+    return answered;
+}
+
+/* Stock HiBy's /etc/bluetooth/main.conf has FastConnectable = true, which
+ * keeps the controller page scanning -- listening for a device connecting
+ * to it -- for 11.25 ms every 160 ms, interlaced (two windows back to back),
+ * instead of every 1.28 s: about a seventh of the radio's time, read back
+ * from the controller, and it stays that way while a headset streams. Phones
+ * scan at 1.28 s. So it is switched off for as long as a stream plays (the
+ * kernel then writes standard 1.28 s scanning) and back on when it stops, so
+ * a headset still reconnects quickly to an idle R1.
+ *
+ * on: whether fast connectable should be on. 1 when it sent the change,
+ * described in note. */
+static int fastconn_state;   /* 0 untouched, 1 switched off here, -1 found off already */
+
+int st_bt_fast_connectable(int on, char *note, unsigned n) {
+    note[0] = '\0';
+    if (on) {
+        if (fastconn_state != 1) { fastconn_state = 0; return 0; }
+    } else if (fastconn_state) {
+        return 0;
+    }
+    int status = -1;
+    if (!on) {
+        /* Only what is on gets switched off, and so later back on. Read
+         * Controller Information: current settings at byte 13, fast
+         * connectable being bit 2. */
+        uint8_t info[17];
+        if (!mgmt_cmd(0x0004, NULL, 0, &status, info, sizeof(info)) || status)   /* Read Controller Information */
+            return 0;
+        uint32_t cur = info[13] | info[14] << 8 | (uint32_t)info[15] << 16 | (uint32_t)info[16] << 24;
+        if (!(cur & 0x4)) { fastconn_state = -1; return 0; }
+    }
+    uint8_t val = on ? 1 : 0;
+    int answered = mgmt_cmd(0x0008, &val, 1, &status, NULL, 0);   /* Set Fast Connectable */
+    fastconn_state = on ? 0 : 1;
+    char how[32];
+    if (!answered) snprintf(how, sizeof(how), "no answer");
+    else if (status) snprintf(how, sizeof(how), "refused (status 0x%02x)", status);
+    else snprintf(how, sizeof(how), "ok");
+    snprintf(note, n, "fast connectable %s (page scan every %s): %s",
+             on ? "back on" : "off while streaming", on ? "160 ms" : "1.28 s", how);
+    return 1;
+}
+
 int st_bt_signal_bars(int rssi) {
     /* Relative readings sit within a few tens of dB of 0; the golden range's
      * lower edge is about -56 dBm, so -6 is roughly -62 dBm. An earbud link
