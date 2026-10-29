@@ -3832,6 +3832,7 @@ static void *worker(void *arg) {
 
     dec_t *d = &g_dec_slot[0];
     int slot = 0;
+    char skip_path[sizeof(g_path)];   /* a skip's target, taken with the skip itself */
     /* Discard any pending seek table a previous, since-abandoned session
      * left behind (e.g. a track whose pcm_open() below failed after its
      * table had already started building) -- nothing will ever consume it
@@ -4220,13 +4221,25 @@ static void *worker(void *arg) {
          * So a skip now sets the next path and raises this flag, and the
          * worker treats it exactly as the natural boundary it already
          * handles well: same decoder handover, same device kept open, same
-         * reopen only if the format genuinely changes. */
+         * reopen only if the format genuinely changes.
+         *
+         * The target is copied out in the same locked step that takes the
+         * skip: straight after a skip the UI queues the track after it for
+         * gapless (queue_follower() -> audio_set_next()), into this same
+         * g_next_path, and reading it later at the boundary below could
+         * hand over to that one instead. audio_skip_to() waits for this
+         * take, and restarts the full way if it does not come. */
+        int skipped = 0;
         if (got > 0) {
             pthread_mutex_lock(&g_lock);
-            int skip = g_skip_now && g_next_path[0];
-            if (skip) g_skip_now = 0;
+            if (g_skip_now && g_next_path[0]) {
+                g_skip_now = 0;
+                snprintf(skip_path, sizeof(skip_path), "%s", g_next_path);
+                g_next_path[0] = '\0';
+                skipped = 1;
+            }
             pthread_mutex_unlock(&g_lock);
-            if (skip) got = 0;
+            if (skipped) got = 0;
         }
         /* done/g_pos_ms track source frames throughout -- captured before
          * decimation below can shrink `got`, so position and duration (both
@@ -4303,8 +4316,15 @@ static void *worker(void *arg) {
              * tail of one track runs straight into the head of the next. */
             char nextp[sizeof(g_path)];
             pthread_mutex_lock(&g_lock);
-            snprintf(nextp, sizeof(nextp), "%s", g_next_path);
-            g_next_path[0] = '\0';
+            if (skipped) {
+                snprintf(nextp, sizeof(nextp), "%s", skip_path);
+            } else {
+                snprintf(nextp, sizeof(nextp), "%s", g_next_path);
+                g_next_path[0] = '\0';
+                /* A skip raised as the track ran out has just been taken
+                 * here, with its path: nothing is left for it to do. */
+                g_skip_now = 0;
+            }
             pthread_mutex_unlock(&g_lock);
             if (!nextp[0]) break;
 
@@ -4361,7 +4381,9 @@ static void *worker(void *arg) {
             pthread_mutex_lock(&g_lock);
             g_dur_ms = d->frames ? (int)(d->frames * 1000 / rate) : 0;
             g_pos_ms = 0;
-            g_advance++;
+            /* A natural roll-on is for the UI to follow; a skip is the UI's
+             * own doing, already shown. */
+            if (!skipped) g_advance++;
             snprintf(g_path, sizeof(g_path), "%s", nextp);
             pthread_mutex_unlock(&g_lock);
             continue;
@@ -4497,26 +4519,46 @@ int audio_play(const char *path) {
     return 0;
 }
 
-/* Skip straight to `path`, keeping the output device open if the worker is
- * already running and the format allows it. Returns 0 if the running worker
- * took it, or falls back to a full audio_play() when there is nothing to
- * hand over to (stopped, paused into a dead worker, or no worker at all).
+/* Skip straight to `path`, keeping the output device open while the worker
+ * plays: it takes the skip as an early end of track and hands over to
+ * `path` exactly as at a natural boundary (see the skip handling in
+ * worker()) -- no Bluetooth teardown, so none of the 250-400 ms hole and
+ * restart a full audio_play() costs at every track change.
  *
- * The caller does not need to know which happened: both end with `path`
- * playing. The difference is only whether the Bluetooth link had to be torn
- * down to get there -- see the skip handling in worker(). */
+ * R104 did this once and was reverted (2026-09-10): the worker only looks
+ * for a skip after decoding a chunk, so one raised while it was paused,
+ * waiting for a lost output or already past its last track was never taken
+ * -- tracks that would not start until tapped again, the old one playing on.
+ * So only a worker that is playing is asked, and it must take the skip
+ * within SKIP_TAKE_MS. If it has not, the request is withdrawn under the
+ * same lock the worker takes it under and the full audio_play() runs as
+ * before: either the handover happens or the restart does, never neither.
+ * Returns 0 once `path` is playing either way. */
+#define SKIP_TAKE_MS 600
 int audio_skip_to(const char *path) {
     if (!path || !path[0]) return -1;
     pthread_mutex_lock(&g_lock);
-    int live = g_running && g_active && g_thread_valid;
+    int live = g_running && g_active && g_thread_valid && !g_paused && !g_out_lost;
     if (live) {
         snprintf(g_next_path, sizeof(g_next_path), "%s", path);
         g_skip_now = 1;
         g_seek_to_ms = -1;
-        g_paused = 0;
     }
     pthread_mutex_unlock(&g_lock);
-    if (live) return 0;
+    if (!live) return audio_play(path);
+    for (int waited = 0;; waited += 5) {
+        pthread_mutex_lock(&g_lock);
+        int pending = g_skip_now;
+        if (pending && waited >= SKIP_TAKE_MS) {
+            g_skip_now = 0;
+            g_next_path[0] = '\0';
+        }
+        pthread_mutex_unlock(&g_lock);
+        if (!pending) return 0;
+        if (waited >= SKIP_TAKE_MS) break;
+        usleep(5000);
+    }
+    alog("[audio] skip not taken in %d ms; restarting the full way\n", SKIP_TAKE_MS);
     return audio_play(path);
 }
 

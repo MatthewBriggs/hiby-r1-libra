@@ -6732,16 +6732,14 @@ static void play_index(int i) {
     if (i < 0 || i >= queue_n) return;
     cur_track = i;
     queue_apply_pending();   /* BG85 */
-    /* REVERTED, 2026-09-10: this briefly used audio_skip_to() to avoid the
-     * 250-400 ms Bluetooth dropout at every track change (R104). Reported
-     * live within the hour: tracks that would not start until tapped several
-     * times, and a skip that left the previous track playing. The handover
-     * flag is only read inside the `got > 0` branch of worker(), so any
-     * moment the worker is not actively decoding -- paused, output lost, or
-     * already between tracks -- swallows the request silently, with nothing
-     * logged and no fallback. Correctness first: back on audio_play() until
-     * the handover is driven from a point in the loop that always runs. */
-    audio_play(queue[i].path);
+    /* R104 again: the device stays open across Next, Previous and a tap in
+     * the queue, so Bluetooth keeps streaming instead of a 250-400 ms hole
+     * and a fresh A2DP start at every track change. Reverted once
+     * (2026-09-10) because a skip raised while the worker was not decoding
+     * was silently lost; audio_skip_to() now only hands over to a playing
+     * worker, waits for it to take the skip, and otherwise restarts with
+     * audio_play() as before -- see its comment. */
+    audio_skip_to(queue[i].path);
     /* R29: finish whatever the previous track's own capture was, then
      * decide what this one shows -- a cache if one already exists (every
      * playthrough after the one that built it), nothing yet while this
