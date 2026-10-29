@@ -1,0 +1,8 @@
+lvgl/
+build-r1/
+build-sim/
+libra_lvgl
+libra_lvgl_sim
+build-app/
+library_standalone
+library_standalone.debug

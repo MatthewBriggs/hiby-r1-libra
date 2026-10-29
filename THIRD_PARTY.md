@@ -14,6 +14,7 @@
 | `music-app/app/vendor/jpeg9/*.h` | [libjpeg 9](https://ijg.org/) by the Independent JPEG Group | IJG licence |
 | `music-app/tools/icons/*.svg` (except below) | [Font Awesome Free](https://fontawesome.com) by Fonticons, Inc. | CC BY 4.0 (icons) |
 | `music-app/tools/icons/home-*.svg`, `lucide-*.svg` | [Lucide](https://lucide.dev) by Lucide Contributors | ISC |
+| `libra-lvgl` builds: LVGL v9.5.0, fetched by `make lvgl` (not vendored), including its `tiny_ttf` font engine (stb_truetype) | [LVGL](https://lvgl.io) by LVGL Kft | MIT |
 
 (This app used to share the device with a separate standalone Podcasts app,
 retired once Podcasts was absorbed into this one directly — it vendored its
@@ -117,3 +118,29 @@ the firmware itself — are not redistributed here. The tile icon is drawn from
 scratch (`music-app/icon/make_icon.py`), and its label is produced at runtime
 by rewriting a single string in whatever `settings.ini` the installed
 firmware provides. Nothing in this repository is HiBy's.
+
+## LVGL (libra-lvgl only)
+
+`libra-lvgl`'s `library_standalone` is linked with LVGL v9.5.0. Its licence,
+which applies to those builds:
+
+> MIT licence
+> Copyright (c) 2025 LVGL Kft
+>
+> Permission is hereby granted, free of charge, to any person obtaining a copy
+> of this software and associated documentation files (the "Software"), to
+> deal in the Software without restriction, including without limitation the
+> rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+> sell copies of the Software, and to permit persons to whom the Software is
+> furnished to do so, subject to the following conditions:
+>
+> The above copyright notice and this permission notice shall be included in
+> all copies or substantial portions of the Software.
+>
+> THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+> IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+> FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+> AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+> LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+> FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+> IN THE SOFTWARE.
